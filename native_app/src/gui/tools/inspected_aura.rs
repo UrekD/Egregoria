@@ -22,6 +22,8 @@ pub fn inspected_aura(sim: &Simulation, uiworld: &UiWorld) {
             match *loc {
                 Location::Outside => {}
                 Location::Vehicle(v) | Location::Transit(v) => pos = sim.pos(v),
+                Location::RailTransit(train) => pos = sim.pos(train),
+                Location::TransitHeld => {}
                 Location::Building(b) => pos = map.buildings().get(b).map(|b| b.door_pos),
             }
         }

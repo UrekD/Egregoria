@@ -43,6 +43,8 @@ use crate::{
 
 pub(crate) const MAX_TILED_COMMANDS: usize = 256;
 pub(crate) const MAX_WIRE_COMMANDS: usize = 65_536;
+use crate::map_dynamic::transit::{RailPlatformSpec, RailSchedule, MAX_PASSENGER_STOCK};
+
 const MAX_WAGONS: usize = 256;
 const MAX_LINE_STOPS: usize = 30;
 const MAX_ZONE_VERTICES: usize = 256;
@@ -331,6 +333,21 @@ macro_rules! define_world_command {
                 depot: Endpoint,
                 expected_revision: u64,
                 limits: DepotRestock,
+            },
+            TransitAddRailPlatform {
+                platform: RailPlatformSpec,
+            },
+            TransitCreateRailLine {
+                #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
+                calls: Vec<StopID>,
+                #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_PASSENGER_STOCK>")]
+                consist: Vec<RollingStockID>,
+                schedule: RailSchedule,
+            },
+            TransitSetRailSchedule {
+                line: LineID,
+                expected_pattern: u64,
+                schedule: RailSchedule,
             },
         }
     };
@@ -1092,6 +1109,9 @@ impl WorldCommand {
                 | ZonePaint { .. }
                 | SetTaxRate { .. }
                 | TransitAddStop { .. }
+                | TransitAddRailPlatform { .. }
+                | TransitCreateRailLine { .. }
+                | TransitSetRailSchedule { .. }
                 | TransitRemoveStop { .. }
                 | TransitCreateLine { .. }
                 | TransitEditLine { .. }
@@ -1228,6 +1248,9 @@ impl WorldCommand {
             | UpdateZone { zone, .. } => zone.poly.len(),
             SpawnTrain { wagons, .. } => wagons.len(),
             TransitCreateLine { stops } | TransitEditLine { stops, .. } => stops.len(),
+            TransitCreateRailLine { calls, consist, .. } => {
+                calls.len().saturating_add(consist.len())
+            }
             EditWater(WaterEdit::CarveRiver { polyline, .. }) => polyline.points().len(),
             EditWater(WaterEdit::FillLake { basin, .. }) => basin.points().len(),
             _ => 0,
@@ -1348,6 +1371,13 @@ impl WorldCommand {
             AddTrain { dist, .. } => dist.is_finite(),
             SpawnTrain { dist, wagons, .. } => dist.is_finite() && wagons.len() <= MAX_WAGONS,
             TransitAddStop { pos, dir } => pos.is_finite() && dir.is_finite(),
+            TransitAddRailPlatform { platform } => {
+                platform.offset.is_finite() && platform.length.is_finite()
+            }
+            TransitSetRailSchedule { .. } => true,
+            TransitCreateRailLine { calls, consist, .. } => {
+                calls.len() <= MAX_LINE_STOPS && consist.len() <= MAX_PASSENGER_STOCK
+            }
             TransitCreateLine { stops } | TransitEditLine { stops, .. } => {
                 stops.len() <= MAX_LINE_STOPS
             }
@@ -1506,6 +1536,9 @@ impl WorldCommand {
             ZonePaint { .. } => "ZonePaint",
             SetTaxRate { .. } => "SetTaxRate",
             TransitAddStop { .. } => "TransitAddStop",
+            TransitAddRailPlatform { .. } => "TransitAddRailPlatform",
+            TransitCreateRailLine { .. } => "TransitCreateRailLine",
+            TransitSetRailSchedule { .. } => "TransitSetRailSchedule",
             TransitRemoveStop { .. } => "TransitRemoveStop",
             TransitCreateLine { .. } => "TransitCreateLine",
             TransitEditLine { .. } => "TransitEditLine",
@@ -1539,8 +1572,18 @@ impl WorldCommand {
                 BuildCapability::Prototype(*id)
             }
             // Rail freight connectors are available at the start.
-            ZonePaint { kind: Some(_), density, .. } if *density != Density::Low => {
-                BuildCapability::ZoneDensity(*density)
+            ZonePaint {
+                kind: Some(_),
+                density,
+                ..
+            } if *density != Density::Low => BuildCapability::ZoneDensity(*density),
+            TransitSetVehicles { line, .. }
+                if sim
+                    .read::<crate::map_dynamic::transit::RailTransit>()
+                    .lines
+                    .contains_key(line) =>
+            {
+                return Ok(());
             }
             TransitCreateLine { .. } | TransitSetVehicles { n: 1.., .. } => {
                 BuildCapability::BusService
@@ -1711,9 +1754,20 @@ impl WorldCommand {
                         try_prototype(id).ok_or(Rejection::MissingReference)?;
                         false
                     }
-                    BuildingKind::House
-                    | BuildingKind::ExternalTrading
-                    | BuildingKind::TrainStation => {
+                    BuildingKind::TrainStation => {
+                        let road = connected_road
+                            .and_then(|id| map.get(id))
+                            .filter(|road| {
+                                road.lanes_iter().any(|(_, kind)| kind == LaneKind::Walking)
+                            })
+                            .ok_or(Rejection::InvalidBuilding)?;
+                        let door = Building::door_position(pos, *gen, map.environment());
+                        if road.points().project(door).distance(door) > 40.0 {
+                            return Err(Rejection::InvalidBuilding);
+                        }
+                        false
+                    }
+                    BuildingKind::House | BuildingKind::ExternalTrading => {
                         return Err(Rejection::InvalidBuilding);
                     }
                 };
@@ -1771,6 +1825,9 @@ impl WorldCommand {
             | SetGameTime(_)
             | SetLotLayout(_)
             | TransitAddStop { .. }
+            | TransitAddRailPlatform { .. }
+            | TransitCreateRailLine { .. }
+            | TransitSetRailSchedule { .. }
             | TransitRemoveStop { .. }
             | TransitCreateLine { .. }
             | TransitEditLine { .. }
@@ -2023,6 +2080,14 @@ impl WorldCommand {
                 )?;
             }
             _ => {}
+        }
+        if let MapRemoveBuilding(id) = self {
+            let rail = sim.read::<crate::map_dynamic::transit::RailTransit>();
+            if !rail.runs.is_empty()
+                && rail.protects_station(&sim.read::<crate::map_dynamic::Transit>(), *id)
+            {
+                return Err(Rejection::OccupiedTrack);
+            }
         }
         if let MapBuildSpecialBuilding {
             pos,
@@ -2353,6 +2418,9 @@ impl WorldCommand {
                 rate_permille,
             } => sim.write::<Budget>().set_tax_rate(zone, rate_permille),
             TransitAddStop { .. }
+            | TransitAddRailPlatform { .. }
+            | TransitCreateRailLine { .. }
+            | TransitSetRailSchedule { .. }
             | TransitRemoveStop { .. }
             | TransitCreateLine { .. }
             | TransitEditLine { .. }

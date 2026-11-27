@@ -26,9 +26,9 @@ fn apply(sim: &mut Simulation, commands: &[WorldCommand]) {
     assert_eq!(outcomes.accepted.len(), commands.len());
 }
 
-fn line(ctx: &mut ScenarioCtx, edges: &[([u8; 2], [u8; 2])]) -> LineID {
+fn line(ctx: &mut ScenarioCtx, edges: &[([u8; 2], [u8; 2])], first_offset: f32) -> LineID {
     let mut stops = Vec::new();
-    for &(from, to) in edges {
+    for (index, &(from, to)) in edges.iter().enumerate() {
         let command = {
             let map = ctx.sim.map();
             let point = |[x, y]: [u8; 2]| ORIGIN + vec2(f32::from(x), f32::from(y)) * SPACING;
@@ -47,7 +47,10 @@ fn line(ctx: &mut ScenarioCtx, edges: &[([u8; 2], [u8; 2])]) -> LineID {
                             .is_close(point(to), 1.0)
                 })
                 .unwrap();
-            let (pos, dir) = lane.points.point_dir_along(lane.points.length() / 2.0);
+            let offset = if index == 0 { first_offset } else { 0.0 };
+            let (pos, dir) = lane
+                .points
+                .point_dir_along(lane.points.length() / 2.0 + offset);
             WorldCommand::TransitAddStop { pos, dir: dir.xy() }
         };
         let before = ctx.sim.read::<Transit>().stops.keys().collect::<Vec<_>>();
@@ -126,10 +129,12 @@ fn bus_offer(cross_line: bool, with_service: bool) -> BusOfferTrace {
     let west = line(
         &mut ctx,
         &[([0, 0], [1, 0]), ([2, 0], [2, 1]), ([1, 1], [0, 1])],
+        0.0,
     );
     let east = line(
         &mut ctx,
-        &[([2, 1], [2, 0]), ([3, 0], [4, 0]), ([4, 1], [3, 1])],
+        &[([2, 0], [2, 1]), ([3, 0], [4, 0]), ([4, 1], [3, 1])],
+        10.0,
     );
     if !with_service {
         apply(
@@ -232,7 +237,6 @@ fn p8_bus_stock_reduction_controls() {
 }
 
 #[test]
-#[ignore = "P8 T: the fixed cross-line offer must complete two physical rides"]
 fn p8_bus_stock_reduction() {
     let trace = bus_offer(true, true);
     assert!(
@@ -309,4 +313,245 @@ fn p8_stock_warehouse_policy_control() {
         command(0, limits).preview(&ctx.sim).unwrap_err(),
         Rejection::StaleFreightPolicy
     );
+}
+
+#[test]
+fn p8_rail_passenger_station_can_be_built_through_commands() {
+    use geom::OBB;
+    use prototypes::BuildingGen;
+    use simulation::map::BuildingKind;
+
+    let mut ctx = ScenarioCtx::new(SimulationOptions::LEGACY);
+    ctx.sim = Simulation::new_authored_flat(10, 0).unwrap();
+    grid_city(&mut ctx, ORIGIN, 2, 2, SPACING);
+    let road = ctx
+        .sim
+        .map()
+        .nearest_lane(
+            (ORIGIN + vec2(60.0, 0.0)).z0(),
+            LaneKind::Walking,
+            Some(30.0),
+        )
+        .map(|lane| ctx.sim.map().lanes()[lane].parent)
+        .unwrap();
+    apply(
+        &mut ctx.sim,
+        &[WorldCommand::MapBuildSpecialBuilding {
+            pos: OBB::new(ORIGIN + vec2(60.0, -16.0), -Vec2::Y, 12.0, 20.0),
+            kind: BuildingKind::TrainStation,
+            gen: BuildingGen::House,
+            zone: None,
+            connected_road: Some(road),
+        }],
+    );
+    assert!(ctx
+        .sim
+        .map()
+        .buildings()
+        .values()
+        .any(|building| building.kind == BuildingKind::TrainStation));
+}
+
+#[test]
+fn p8_rail_out_and_back_with_deterministic_resume() {
+    use geom::OBB;
+    use prototypes::{BuildingGen, Money, RollingStockID};
+    use simulation::economy::{Budget, BudgetCategory};
+    use simulation::map::{BuildingKind, LanePatternBuilder, ProjectFilter};
+    use simulation::map_dynamic::transit::{
+        JourneyStats, RailPlatformSpec, RailSchedule, RailTransit,
+    };
+    use simulation::world_command::Rejection;
+
+    let mut ctx = ScenarioCtx::new(SimulationOptions::LEGACY);
+    ctx.sim = Simulation::new_authored_flat(10, 0).unwrap();
+    let (west, east, south, north) = (550.0, 1_150.0, 600.0, 1_000.0);
+    let road_pattern = LanePatternBuilder::new().build();
+    let rail_pattern = LanePatternBuilder::new().rail(true).one_way(true).build();
+    let mut connect = |from: Vec2, to: Vec2, rail: bool| {
+        let endpoint = |pos: Vec2| ctx.sim.map().project(pos.z0(), 1.0, ProjectFilter::INTER);
+        let (from, to) = (endpoint(from), endpoint(to));
+        let command = WorldCommand::MapMakeConnection {
+            from,
+            to,
+            inter: None,
+            pat: if rail {
+                rail_pattern.clone()
+            } else {
+                road_pattern.clone()
+            },
+        };
+        apply(&mut ctx.sim, &[command]);
+    };
+    for y in [south, north] {
+        connect(vec2(west + 25.0, y), vec2(east - 25.0, y), false);
+    }
+    let corners = [
+        vec2(west, south + 30.0),
+        vec2(east, south + 30.0),
+        vec2(east, north - 30.0),
+        vec2(west, north - 30.0),
+    ];
+    for (&from, &to) in corners.iter().zip(corners.iter().cycle().skip(1)) {
+        connect(from, to, true);
+    }
+
+    let mut platforms = Vec::new();
+    for (road_y, track_y, side) in [(south, south + 30.0, -1.0), (north, north - 30.0, 1.0)] {
+        let x = 850.0;
+        let road = ctx
+            .sim
+            .map()
+            .nearest_lane(vec2(x, road_y).z0(), LaneKind::Walking, Some(30.0))
+            .map(|lane| ctx.sim.map().lanes()[lane].parent)
+            .unwrap();
+        apply(
+            &mut ctx.sim,
+            &[WorldCommand::MapBuildSpecialBuilding {
+                pos: OBB::new(vec2(x, road_y + side * 16.0), Vec2::Y * side, 12.0, 20.0),
+                kind: BuildingKind::TrainStation,
+                gen: BuildingGen::House,
+                zone: None,
+                connected_road: Some(road),
+            }],
+        );
+        let spec = {
+            let map = ctx.sim.map();
+            let station = map
+                .buildings()
+                .values()
+                .filter(|b| b.kind == BuildingKind::TrainStation)
+                .min_by_key(|b| ((b.door_pos.y - road_y).abs() as u32, b.id))
+                .unwrap()
+                .id;
+            let lane = map
+                .nearest_lane(vec2(x, track_y).z0(), LaneKind::Rail, Some(30.0))
+                .unwrap();
+            let track = &map.lanes()[lane];
+            RailPlatformSpec {
+                station,
+                lane,
+                length: 50.0,
+                offset: track
+                    .points
+                    .length_at_proj(track.points.project(vec2(x, track_y).z0())),
+            }
+        };
+        assert_eq!(
+            WorldCommand::TransitAddRailPlatform {
+                platform: RailPlatformSpec {
+                    offset: 20.0,
+                    ..spec
+                }
+            }
+            .preview(&ctx.sim)
+            .unwrap_err(),
+            Rejection::InvalidConnection,
+        );
+        apply(
+            &mut ctx.sim,
+            &[WorldCommand::TransitAddRailPlatform { platform: spec }],
+        );
+        platforms.push(
+            *ctx.sim
+                .read::<RailTransit>()
+                .platforms
+                .keys()
+                .last()
+                .unwrap(),
+        );
+    }
+
+    let schedule = RailSchedule {
+        headway_ticks: 1_000,
+        ..RailSchedule::default()
+    };
+    let consist = vec![RollingStockID::new("passenger-emu-front")];
+    apply(
+        &mut ctx.sim,
+        &[WorldCommand::TransitCreateRailLine {
+            calls: platforms,
+            consist,
+            schedule,
+        }],
+    );
+    let line = *ctx.sim.read::<RailTransit>().lines.keys().next().unwrap();
+    apply(
+        &mut ctx.sim,
+        &[WorldCommand::TransitSetFare {
+            line,
+            fare: Money::new_bucks(2),
+        }],
+    );
+    let from = house(&mut ctx.sim, vec2(800.0, south + 20.0));
+    let to = house(&mut ctx.sim, vec2(900.0, north - 20.0));
+    let human = spawn_human(&mut ctx.sim, from).unwrap();
+    let offer = |sim: &mut Simulation, to| {
+        let h = sim.world_mut_unchecked().humans.get_mut(human).unwrap();
+        h.pedestrian.walking_speed = 1.25;
+        h.router = Router::new(None);
+        let destination = Destination::Building(to);
+        h.router.go_to(destination);
+        h.decision.kind = HumanDecisionKind::GoTo(destination);
+    };
+    for _ in 0..2_000 {
+        ctx.run_ticks(1);
+        if !ctx.sim.read::<RailTransit>().runs.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(ctx.sim.read::<RailTransit>().runs.len(), 1);
+    offer(&mut ctx.sim, to);
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if matches!(
+            ctx.sim.get(human).unwrap().location,
+            Location::RailTransit(_)
+        ) {
+            break;
+        }
+    }
+    let rider = ctx.sim.get(human).unwrap();
+    assert!(
+        matches!(rider.location, Location::RailTransit(_)),
+        "{:?} {:?}",
+        rider.location,
+        rider.router.cur_step()
+    );
+    assert!(rider.collider.is_none());
+    let bytes = ctx
+        .sim
+        .encode_slot(simulation::SnapshotRevision::new(1))
+        .unwrap()
+        .into_snapshot_bytes();
+    let mut resumed = Simulation::load_compressed_snapshot(&bytes, 32 * 1024 * 1024).unwrap();
+    assert_eq!(ctx.sim.hashes(), resumed.hashes());
+    let mut resume_schedule = Simulation::schedule();
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        resumed.tick(&mut resume_schedule, &[]);
+        if ctx.sim.get(human).unwrap().location == Location::Building(to) {
+            break;
+        }
+    }
+    assert_eq!(ctx.sim.get(human).unwrap().location, Location::Building(to));
+    assert_eq!(ctx.sim.hashes(), resumed.hashes());
+    // The return is a new door-to-door offer with a fresh trip state.
+    offer(&mut ctx.sim, from);
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if ctx.sim.get(human).unwrap().location == Location::Building(from) {
+            break;
+        }
+    }
+    assert_eq!(
+        ctx.sim.get(human).unwrap().location,
+        Location::Building(from)
+    );
+    let stats = ctx.sim.read::<JourneyStats>().line(line);
+    assert_eq!(
+        (stats.boardings, stats.alightings, stats.transfers),
+        (2, 2, 0)
+    );
+    assert!(ctx.sim.read::<Budget>().total(BudgetCategory::TransitFares) > 0);
 }

@@ -303,7 +303,7 @@ fn sample_workload(
             Location::Outside => 0,
             Location::Building(_) => 1,
             Location::Vehicle(_) => 2,
-            Location::Transit(_) => 3,
+            Location::Transit(_) | Location::RailTransit(_) | Location::TransitHeld => 3,
         };
         locations[index] += 1;
         human_colliders += usize::from(human.collider.is_some());

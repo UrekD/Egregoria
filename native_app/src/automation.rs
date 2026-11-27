@@ -318,7 +318,9 @@ impl FollowedLocation {
         match location {
             Location::Outside => Self::Outside,
             Location::Vehicle(_) => Self::Vehicle,
-            Location::Transit(_) => Self::Transit,
+            Location::Transit(_) | Location::RailTransit(_) | Location::TransitHeld => {
+                Self::Transit
+            }
             Location::Building(_) => Self::Building,
         }
     }

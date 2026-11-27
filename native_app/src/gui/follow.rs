@@ -49,6 +49,9 @@ pub(crate) fn follow_pos(sim: &Simulation, e: AnyEntity) -> Option<Vec3> {
         return sim.pos_any(e);
     };
     let human = sim.get(id)?;
+    if let Location::RailTransit(train) = human.location {
+        return sim.pos(train).or(Some(human.trans.pos));
+    }
     Some(human_follow_pos(
         human.trans.pos,
         &human.location,
@@ -65,7 +68,7 @@ pub(crate) fn human_follow_pos(
     door_pos: impl FnOnce(BuildingID) -> Option<Vec3>,
 ) -> Vec3 {
     match *location {
-        Location::Outside => Some(human_pos),
+        Location::Outside | Location::RailTransit(_) | Location::TransitHeld => Some(human_pos),
         Location::Vehicle(v) | Location::Transit(v) => vehicle_pos(v),
         Location::Building(b) => door_pos(b),
     }

@@ -131,13 +131,14 @@ const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
+const PRE_PASSENGER_VERSION: &str = "0.12.0";
 const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
 
 fn compatible_save_version(version: &str) -> bool {
     matches!(
         version,
-        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
+        VERSION | PRE_PASSENGER_VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
     )
 }
 
@@ -1421,7 +1422,7 @@ pub struct SnapshotHeader {
 impl SnapshotHeader {
     pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
         self.check_version()?;
-        check_prototype_registry(self.registry)
+        check_prototype_registry(self.registry, &self.version)
     }
 
     fn check_load_compatibility(&self) -> Result<(), SaveLoadError> {
@@ -1442,10 +1443,11 @@ impl SnapshotHeader {
     }
 }
 
-fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadError> {
-    if !prototypes::try_prototypes()
-        .is_some_and(|current| fingerprint == Some(current.fingerprint()))
-    {
+fn check_prototype_registry(fingerprint: Option<u64>, version: &str) -> Result<(), SaveLoadError> {
+    if !prototypes::try_prototypes().is_some_and(|current| {
+        fingerprint == Some(current.fingerprint())
+            || (version != VERSION && fingerprint == Some(current.pre_passenger_fingerprint()))
+    }) {
         return Err(SaveLoadError::PrototypeRegistry);
     }
     Ok(())
@@ -2004,7 +2006,7 @@ impl SimulationDeser {
             .map(|bytes| Bincode::decode(bytes))
             .transpose()
             .map_err(|error| corrupt(error.to_string()))?;
-        check_prototype_registry(registry)?;
+        check_prototype_registry(registry, &self._header.version)?;
         let mut sim = Simulation {
             // Resource initializers can rebuild derived indexes from the loaded world.
             world: self.world,
@@ -2032,9 +2034,14 @@ impl SimulationDeser {
 
         let options = *sim.read::<SimulationOptions>();
         let origin: MapOrigin = match self.res.get("map_origin") {
-            Some(bytes) => Bincode::decode(bytes)
-                .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
+            Some(bytes) => Bincode::decode(bytes).map_err(|error| {
+                corrupt(format!("Could not decode snapshot map origin: {error}"))
+            })?,
+            None if matches!(
+                self._header.version.as_str(),
+                VERSION | PRE_PASSENGER_VERSION | PRE_P7_VERSION
+            ) =>
+            {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2080,6 +2087,7 @@ impl SimulationDeser {
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.map_mut().migrated_roundabout_paths.clear();
         sim.write::<transit::Transit>().rebuild_berth_index();
+        transit::validate_rail_snapshot(&sim).map_err(|reason| corrupt(reason.into()))?;
         if sim
             .map()
             .lane_scoring_pilot()

@@ -13,6 +13,8 @@ mod transit_stop;
 pub(crate) struct TransitTools {
     line: transit_line::LineDraft,
     remove_stops: bool,
+    rail_platforms: bool,
+    platform_length: f64,
 }
 
 impl TransitTools {
@@ -20,6 +22,7 @@ impl TransitTools {
     pub(super) fn reset(&mut self) {
         self.line.cancel();
         self.remove_stops = false;
+        self.rail_platforms = false;
     }
 }
 
@@ -37,10 +40,39 @@ pub(super) fn update_lines(uiworld: &UiWorld, sim: &Simulation) {
 pub(super) fn properties(uiworld: &UiWorld, tool: Tool) {
     let mut state = uiworld.write::<TransitTools>();
     padxy(12.0, 8.0, || {
+        if tool == Tool::TransitStop {
+            minrow(8.0, || {
+                if button_secondary(if state.rail_platforms {
+                    "Bus stop"
+                } else {
+                    "Rail platform"
+                })
+                .show()
+                .clicked
+                {
+                    state.rail_platforms = !state.rail_platforms;
+                    state.remove_stops = false;
+                }
+                if state.rail_platforms {
+                    let length = state.platform_length.max(45.0);
+                    textc(
+                        on_secondary_container(),
+                        format!("Platform length · {length:.0} m"),
+                    );
+                    let mut slider = yakui::widgets::Slider::new(length, 45.0, 250.0);
+                    slider.step = Some(1.0);
+                    if let Some(value) = slider.show().value {
+                        state.platform_length = value;
+                    }
+                }
+            });
+        }
         minrow(10.0, || {
             if tool == Tool::TransitStop {
                 let hint = if state.remove_stops {
                     "Click a stop to remove it."
+                } else if state.rail_platforms {
+                    "Click a track beside a passenger station."
                 } else {
                     "Click a lane beside a sidewalk, away from junctions."
                 };
@@ -58,6 +90,22 @@ pub(super) fn properties(uiworld: &UiWorld, tool: Tool) {
                     state.remove_stops = !state.remove_stops;
                 }
             } else {
+                if !state.line.editing()
+                    && button_secondary(if state.line.is_rail() {
+                        "New bus line"
+                    } else {
+                        "New rail line"
+                    })
+                    .show()
+                    .clicked
+                {
+                    state.line.toggle_rail(
+                        uiworld
+                            .read::<crate::gui::addtrain::TrainSpawnResource>()
+                            .wagons
+                            .clone(),
+                    );
+                }
                 let action = if state.line.editing() {
                     "Edit loop"
                 } else {
@@ -93,6 +141,9 @@ pub(crate) fn update_tool(uiworld: &UiWorld, sim: &Simulation) {
         state.remove_stops = false;
     }
     match tool {
+        Tool::TransitStop if state.rail_platforms && !state.remove_stops => {
+            transit_stop::update_rail(sim, uiworld, state.platform_length.max(45.0) as f32)
+        }
         Tool::TransitStop => transit_stop::update(sim, uiworld, state.remove_stops),
         Tool::TransitLine => transit_line::update(sim, uiworld, &mut state.line),
         _ => {}

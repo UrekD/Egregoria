@@ -662,6 +662,8 @@ fn gameplay_projection(sim: &Simulation) -> u64 {
             Location::Vehicle(id) => write_tagged_id(&mut hash, 1, entity_ffi(id)),
             Location::Building(id) => write_tagged_id(&mut hash, 2, slot_ffi(&id)),
             Location::Transit(id) => write_tagged_id(&mut hash, 3, entity_ffi(id)),
+            Location::RailTransit(id) => write_tagged_id(&mut hash, 4, entity_ffi(id)),
+            Location::TransitHeld => write_tagged_id(&mut hash, 5, 0),
         }
 
         let router: RouterView = serde_view(&human.router);

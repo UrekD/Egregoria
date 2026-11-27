@@ -635,6 +635,52 @@ fn bus_trip(sim: &Simulation, map: &Map, id: VehicleID, details: bool, view: &mu
 
 fn rail_trip(sim: &Simulation, map: &Map, id: TrainID, details: bool) -> Option<TripView> {
     let train = sim.get(id)?;
+    let rail = sim.read::<simulation::map_dynamic::transit::RailTransit>();
+    if let Some(run) = rail.runs.get(&id) {
+        let transit = sim.read::<simulation::map_dynamic::Transit>();
+        let line = transit.lines.get(run.line)?;
+        let config = rail.lines.get(&run.line)?;
+        let passengers = details.then(|| {
+            let ids: Vec<_> = rail.riders(id).collect();
+            let scale = sim.population_scale();
+            (
+                format!(
+                    "{} / {}",
+                    scale.persons(ids.len()),
+                    scale.persons(config.capacity)
+                ),
+                ids,
+            )
+        });
+        let destination = line
+            .stops
+            .get(run.next_platform_index())
+            .and_then(|stop| rail.platforms.get(stop))
+            .and_then(|platform| building_place(map, platform.station));
+        let state = if line.suspended {
+            "Service suspended".into()
+        } else if run.dwell_until().is_some() {
+            "At platform".into()
+        } else if train.speed.0 > 0.2 {
+            speed_label(train.speed.0)
+        } else {
+            "Waiting for rail clearance".into()
+        };
+        return Some(TripView {
+            kind: "Passenger train",
+            operator: None,
+            operator_link: None,
+            purpose: Some(format!("{:?} · fare {}", line.id, line.fare)),
+            destination,
+            state,
+            passengers,
+            remaining: None,
+            origin: None,
+            cargo: None,
+            reserved_cargo: false,
+            buyer_line: None,
+        });
+    }
     let assignment = sim.world().freight_stations.values().find_map(|station| {
         station
             .f

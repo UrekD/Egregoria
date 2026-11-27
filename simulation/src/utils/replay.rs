@@ -206,15 +206,15 @@ impl Replay {
         self.obsolete_recording_discarded
     }
 
-    fn validate_embedded_registry(&self) -> io::Result<()> {
+    fn validate_embedded_registry(&self, version: &str) -> io::Result<()> {
         if self.enabled || self.registry.is_some() {
-            self.check_registry()?;
+            crate::check_prototype_registry(self.registry, version).map_err(replay_decode_error)?;
         }
         Ok(())
     }
 
     pub(crate) fn check_registry(&self) -> io::Result<()> {
-        crate::check_prototype_registry(self.registry).map_err(replay_decode_error)
+        crate::check_prototype_registry(self.registry, crate::VERSION).map_err(replay_decode_error)
     }
 
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
@@ -493,17 +493,22 @@ impl ReplayJson {
         match ReplayHeader::decode(bytes) {
             Ok(header) => {
                 if header.enabled || header.registry.is_some() {
-                    crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
+                    crate::check_prototype_registry(header.registry, crate::VERSION)
+                        .map_err(replay_decode_error)?;
                 }
                 JSON::decode(bytes)
             }
-            Err(SaveLoadError::IncompatibleReplay { version }) if crate::compatible_save_version(&version) => {
+            Err(SaveLoadError::IncompatibleReplay { version })
+                if crate::compatible_save_version(&version)
+                    || replay_release(&version) == crate::PRE_PASSENGER_VERSION =>
+            {
                 // The city has its own schema and registry checks. Inspect the
                 // recording envelope without decoding obsolete commands.
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
                 let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
                 if discarded || legacy.registry.is_some() {
-                    crate::check_prototype_registry(legacy.registry).map_err(replay_decode_error)?;
+                    crate::check_prototype_registry(legacy.registry, replay_release(&version))
+                        .map_err(replay_decode_error)?;
                 }
                 Ok(Replay {
                     obsolete_recording_discarded: discarded,
@@ -518,8 +523,11 @@ impl ReplayJson {
             {
                 // Earlier P7 command envelopes can still be read inside a compatible city.
                 let mut replay: Replay = JSON::decode(bytes)?;
-                replay.validate_embedded_registry()?;
+                replay.validate_embedded_registry(replay_release(&version))?;
                 replay.recorded_population_scale()?;
+                replay.registry = replay
+                    .registry
+                    .map(|_| prototypes::prototypes().fingerprint());
                 replay.version = replay_version();
                 Ok(replay)
             }
@@ -563,7 +571,7 @@ impl ReplayJson {
         revision: Option<SnapshotRevision>,
     ) -> Result<Replay, SaveLoadError> {
         let header = ReplayHeader::decode(bytes)?;
-        crate::check_prototype_registry(header.registry)?;
+        crate::check_prototype_registry(header.registry, crate::VERSION)?;
         if header.revision != revision.map(SnapshotRevision::get) {
             return Err(replay_corrupt(invalid_replay(
                 "Replay revision does not match the snapshot",
@@ -620,7 +628,8 @@ impl Encoder for ReplayJson {
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
         let header = ReplayHeader::decode(bytes).map_err(replay_decode_error)?;
         if header.enabled || header.registry.is_some() {
-            crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
+            crate::check_prototype_registry(header.registry, crate::VERSION)
+                .map_err(replay_decode_error)?;
         }
         JSON::decode(bytes)
     }

@@ -34,6 +34,17 @@ pub enum Location {
     Vehicle(VehicleID),
     Building(BuildingID),
     Transit(VehicleID),
+    RailTransit(TrainID),
+    TransitHeld,
+}
+
+impl Location {
+    pub fn is_transit(&self) -> bool {
+        matches!(
+            self,
+            Self::Transit(_) | Self::RailTransit(_) | Self::TransitHeld
+        )
+    }
 }
 debug_inspect_impl!(Location);
 

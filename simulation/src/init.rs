@@ -215,7 +215,11 @@ fn register_systems_and_resources() {
     register_system("vehicle_state_update_system", vehicle_state_update_system);
     register_system("transit_stop_update", transit_stop_update);
     register_system("transit_dispatch_update", transit_dispatch_update);
-    register_system("transit_board_update", transit_board_update);
+    register_system_sim("transit_board_update", |sim| {
+        let (world, resources) = sim.world_res();
+        transit_board_update(world, resources);
+        crate::map_dynamic::transit::rail_service_update(sim);
+    });
     register_system("routing_changed_system", routing_changed_system);
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
@@ -317,6 +321,10 @@ fn register_systems_and_resources() {
     register_cargo_progress();
     register_rail_trips();
     register_trip_origins();
+    register_optional_resource::<crate::map_dynamic::transit::JourneyStats>(
+        "passenger_journey_stats",
+    );
+    register_optional_resource::<crate::map_dynamic::transit::RailTransit>("passenger_rail");
 }
 
 fn register_utility_water_sample() {
@@ -764,6 +772,25 @@ fn register_system_sim(name: &'static str, s: fn(&mut Simulation)) {
     unsafe {
         GSYSTEMS.push(GSystem {
             s: Box::new(move || Box::new(utils::scheduler::RunnableFn { f: s, name })),
+        });
+    }
+}
+
+fn register_optional_resource<T: 'static + Default + Send + Sync + Serialize + DeserializeOwned>(
+    name: &'static str,
+) {
+    unsafe {
+        INIT_FUNCS.push(InitFunc {
+            f: Box::new(|sim| sim.insert(T::default())),
+        });
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name,
+            optional: true,
+            save: Box::new(|sim, output| Bincode::encode_writer(&*sim.read::<T>(), output)),
+            load: Box::new(|sim, data| {
+                sim.resources.insert(Bincode::decode::<T>(data)?);
+                Ok(())
+            }),
         });
     }
 }

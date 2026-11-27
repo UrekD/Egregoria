@@ -241,7 +241,10 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
         Location::Vehicle(id) => sim
             .get(id)
             .and_then(|vehicle| vehicle.it.is_wait_for_reroute()),
-        Location::Building(_) | Location::Transit(_) => None,
+        Location::Building(_)
+        | Location::Transit(_)
+        | Location::RailTransit(_)
+        | Location::TransitHeld => None,
     };
     let blocker = citizen
         .router

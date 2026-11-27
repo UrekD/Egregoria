@@ -233,6 +233,8 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                 let human = world.humans.get(buyer)?;
                 let pos = match human.location {
                     Location::Outside => human.trans.pos,
+                    Location::RailTransit(id) => world.trains.get(id)?.trans.pos,
+                    Location::TransitHeld => return None,
                     Location::Building(id) => map.get(id)?.door_pos,
                     Location::Vehicle(id) | Location::Transit(id) => {
                         world.vehicles.get(id)?.trans.pos

@@ -6,6 +6,7 @@ use goryak::{
 };
 use prototypes::Money;
 use simulation::economy::TransitStats;
+use simulation::map_dynamic::transit::{JourneyStats, LineJourneyStats, PassengerRailLine, RailTransit};
 use simulation::map_dynamic::{LineID, Transit, TransitLine};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
@@ -26,6 +27,10 @@ struct LineDetails {
     line: TransitLine,
     running: usize,
     boardings: u64,
+    journeys: LineJourneyStats,
+    rail: Option<PassengerRailLine>,
+    rail_aboard: usize,
+    rail_full: usize,
 }
 
 impl super::GUIWindows {
@@ -48,7 +53,21 @@ impl super::GUIWindows {
         if self.transit_lines_open {
             let transit = sim.read::<Transit>();
             let stats = sim.read::<TransitStats>();
+            let journeys = sim.read::<JourneyStats>();
+            let rail = sim.read::<RailTransit>();
             let mut running = BTreeMap::<_, usize>::new();
+            let mut rail_loads = BTreeMap::<_, (usize, usize)>::new();
+            for (&id, run) in &rail.runs {
+                *running.entry(run.line).or_default() += 1;
+                let riders = rail.riders(id).count();
+                let (aboard, full) = rail_loads.entry(run.line).or_default();
+                *aboard += riders;
+                *full += usize::from(
+                    rail.lines
+                        .get(&run.line)
+                        .is_some_and(|line| riders >= line.capacity),
+                );
+            }
             for (&bus, run) in &transit.runs {
                 if sim.get(bus).is_some() {
                     *running.entry(run.line).or_default() += 1;
@@ -60,6 +79,10 @@ impl super::GUIWindows {
                     line: line.clone(),
                     running: running.get(&line.id).copied().unwrap_or_default(),
                     boardings: stats.boardings.get(&line.id).copied().unwrap_or_default(),
+                    journeys: journeys.line(line.id),
+                    rail: rail.lines.get(&line.id).cloned(),
+                    rail_aboard: rail_loads.get(&line.id).map_or(0, |load| load.0),
+                    rail_full: rail_loads.get(&line.id).map_or(0, |load| load.1),
                 }));
         }
         edit
@@ -118,7 +141,15 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>, can_auth
         colored_box_container(Color::from_linear(Vec4::new(r, g, b, a)), || {
             fixed_spacer((13.0, 13.0));
         });
-        titlec(color, format!("Line {}", line.id.data().as_ffi() as u32));
+        let kind = if details.rail.is_some() {
+            "Rail"
+        } else {
+            "Bus"
+        };
+        titlec(
+            color,
+            format!("{kind} line {}", line.id.data().as_ffi() as u32),
+        );
         if line.suspended {
             textc(error(), "Suspended");
         }
@@ -132,6 +163,62 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>, can_auth
             details.boardings
         ),
     );
+    let rides = &details.journeys;
+    if rides.boardings > 0 {
+        let minute = prototypes::TICKS_PER_MINUTE as f64;
+        let average = rides.wait_ticks as f64 / rides.boardings as f64 / minute;
+        let longest = rides.max_wait_ticks as f64 / minute;
+        textc(
+            color,
+            format!(
+                "{} transfers · {average:.1} min average wait",
+                rides.transfers
+            ),
+        );
+        textc(
+            color,
+            format!(
+                "{longest:.1} min longest wait · {} alightings",
+                rides.alightings
+            ),
+        );
+    }
+    if let Some(rail) = &details.rail {
+        let minute = prototypes::TICKS_PER_MINUTE as f64;
+        textc(
+            color,
+            format!(
+                "{} seats per train · {} aboard · {} full",
+                rail.capacity, details.rail_aboard, details.rail_full
+            ),
+        );
+        textc(color, format!("{} missed starts", rail.missed_slots));
+        if rail.is_retiring() {
+            textc(color, "Retiring at the next available platform");
+        } else {
+            let headway = rail.schedule.headway_ticks;
+            textc(
+                color,
+                format!("Scheduled headway · {:.1} min", headway as f64 / minute),
+            );
+            let mut slider = Slider::new(headway as f64, 300.0, 6_000.0);
+            slider.step = Some(50.0);
+            if let Some(value) = slider.show().value.filter(|_| can_author) {
+                let headway_ticks = value as u64;
+                if headway_ticks != headway {
+                    commands.push(WorldCommand::TransitSetRailSchedule {
+                        line: line.id,
+                        expected_pattern: rail.pattern_revision,
+                        schedule: simulation::map_dynamic::transit::RailSchedule {
+                            headway_ticks,
+                            max_late_ticks: rail.schedule.max_late_ticks.min(headway_ticks - 1),
+                            ..rail.schedule
+                        },
+                    });
+                }
+            }
+        }
+    }
     for row in line.stops.chunks(8) {
         let stops = row
             .iter()
@@ -143,7 +230,12 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>, can_auth
 
     minrow(18.0, || {
         mincolumn(0.0, || {
-            textc(color, format!("Target buses  {}", line.target_vehicles));
+            let fleet = if details.rail.is_some() {
+                "trains"
+            } else {
+                "buses"
+            };
+            textc(color, format!("Target {fleet}  {}", line.target_vehicles));
             let mut slider = Slider::new(f64::from(line.target_vehicles), 0.0, 10.0);
             slider.step = Some(1.0);
             if let Some(value) = slider.show().value.filter(|_| can_author) {
@@ -174,7 +266,9 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>, can_auth
 
     let mut edit = false;
     minrow(8.0, || {
-        edit = button_primary("Edit route").show().clicked && can_author;
+        if details.rail.is_none() || details.running == 0 {
+            edit = button_primary("Edit route").show().clicked && can_author;
+        }
         if button_secondary("Remove line").show().clicked && can_author {
             commands.push(WorldCommand::TransitRemoveLine { line: line.id });
         }
@@ -189,6 +283,10 @@ impl PanelState {
             line: line.clone(),
             running: 0,
             boardings: 0,
+            journeys: LineJourneyStats::default(),
+            rail: None,
+            rail_aboard: 0,
+            rail_full: 0,
         });
         self.edit = Some(line.id);
         self.commands.push(WorldCommand::TransitRemoveLine { line: line.id });

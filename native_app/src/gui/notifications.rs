@@ -675,6 +675,9 @@ fn command_label(command: &str) -> &'static str {
         "ZonePaint" => "Paint zoning",
         "SetTaxRate" => "Set tax rate",
         "TransitAddStop" => "Add bus stop",
+        "TransitAddRailPlatform" => "Add rail platform",
+        "TransitCreateRailLine" => "Create passenger rail line",
+        "TransitSetRailSchedule" => "Set rail schedule",
         "TransitRemoveStop" => "Remove bus stop",
         "TransitCreateLine" => "Create bus line",
         "TransitEditLine" => "Edit bus line",
@@ -701,6 +704,18 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, Rejection::BuildingOverlap) => "Another building already occupies this site.",
         ("TransitAddStop", MissingReference | InvalidConnection) => {
             "Choose a driving lane beside a sidewalk and away from junctions"
+        }
+        ("TransitAddRailPlatform", MissingReference | InvalidConnection) => {
+            "Platform needs a dry station entrance on the same level and room along the track"
+        }
+        ("TransitCreateRailLine", InvalidConnection | MissingReference) => {
+            "Connect the platforms in a directed rail loop and check the schedule"
+        }
+        ("TransitCreateRailLine", InvalidTrain) => {
+            "Choose powered passenger stock that fits every platform"
+        }
+        ("TransitSetRailSchedule", InvalidConnection) => {
+            "The rail schedule or line revision is invalid"
         }
         ("TransitCreateLine" | "TransitEditLine", InvalidConnection) => {
             "The stops must form a drivable loop"

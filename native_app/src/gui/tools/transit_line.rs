@@ -1,4 +1,6 @@
 use geom::Color;
+use prototypes::RollingStockID;
+use simulation::map_dynamic::transit::{RailSchedule, RailTransit};
 use simulation::map_dynamic::{LineID, StopID, Transit};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
@@ -8,7 +10,7 @@ use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 
-use super::transit_stop::{draw_stops, stop_at};
+use super::transit_stop::draw_stops;
 
 const MAX_STOPS: usize = 30;
 
@@ -16,6 +18,7 @@ const MAX_STOPS: usize = 30;
 pub(super) struct LineDraft {
     editing: Option<LineID>,
     stops: Vec<StopID>,
+    rail: Option<Vec<RollingStockID>>,
 }
 
 impl LineDraft {
@@ -27,6 +30,21 @@ impl LineDraft {
     pub(super) fn cancel(&mut self) {
         self.editing = None;
         self.stops.clear();
+        self.rail = None;
+    }
+
+    pub(super) fn is_rail(&self) -> bool {
+        self.rail.is_some()
+    }
+
+    pub(super) fn toggle_rail(&mut self, mut consist: Vec<RollingStockID>) {
+        self.stops.clear();
+        if self.rail.take().is_none() {
+            if consist.is_empty() {
+                consist.push(RollingStockID::new("passenger-emu-front"));
+            }
+            self.rail = Some(consist);
+        }
     }
 
     pub(super) fn editing(&self) -> bool {
@@ -53,7 +71,14 @@ impl LineDraft {
         let stops = self.stops.clone();
         Some(match self.editing {
             Some(line) => WorldCommand::TransitEditLine { line, stops },
-            None => WorldCommand::TransitCreateLine { stops },
+            None => match &self.rail {
+                Some(consist) => WorldCommand::TransitCreateRailLine {
+                    calls: stops,
+                    consist: consist.clone(),
+                    schedule: RailSchedule::default(),
+                },
+                None => WorldCommand::TransitCreateLine { stops },
+            },
         })
     }
 }
@@ -72,7 +97,16 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, draft: &mut LineDraft)
     }
 
     let input = uiworld.read::<InputMap>();
-    let hovered = input.unprojected.and_then(|pos| stop_at(&transit, pos));
+    let rail = sim.read::<RailTransit>();
+    let rail_draft = draft.is_rail()
+        || draft
+            .editing
+            .is_some_and(|line| rail.lines.contains_key(&line));
+    let hovered = input.unprojected.and_then(|pos| {
+        super::transit_stop::stop_at_where(&transit, pos, |stop| {
+            rail.platforms.contains_key(&stop) == rail_draft
+        })
+    });
 
     let closing = hovered.and_then(|stop| draft.close_command(stop));
     let colors = simulation::colors();

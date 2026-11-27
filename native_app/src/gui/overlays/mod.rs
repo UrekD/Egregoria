@@ -333,7 +333,12 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             OverlayMode::Transit => {
                 if rebuild {
                     draw.clear_persistent();
-                    transit::draw(&map, &sim.read::<Transit>(), &mut draw);
+                    transit::draw(
+                        &map,
+                        &sim.read::<Transit>(),
+                        &sim.read::<simulation::map_dynamic::transit::RailTransit>(),
+                        &mut draw,
+                    );
                 }
                 return;
             }

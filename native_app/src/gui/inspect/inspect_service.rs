@@ -124,12 +124,19 @@ fn service_staff(sim: &Simulation, building: &Building, slots: u32) -> ServiceSt
                         });
                     position_label(label, vehicle.map_or(human.trans.pos, |v| v.trans.pos))
                 }
+                Location::RailTransit(train) => position_label(
+                    "On a passenger train",
+                    sim.pos(train).unwrap_or(human.trans.pos),
+                ),
+                Location::TransitHeld => {
+                    position_label("Waiting for safe rail egress", human.trans.pos)
+                }
                 Location::Outside => {
                     let label = if matches!(
                         human.router.cur_step(),
                         Some(RoutingStep::WaitAtStop { .. })
                     ) {
-                        "Waiting at a bus stop"
+                        "Waiting for transit"
                     } else {
                         "Outdoors"
                     };
@@ -162,7 +169,8 @@ fn staff_state(
         Location::Vehicle(_) | Location::Transit(_) => {
             vehicle_itinerary.is_none_or(|itinerary| itinerary.is_wait_for_reroute().is_some())
         }
-        Location::Building(_) => false,
+        Location::Building(_) | Location::RailTransit(_) => false,
+        Location::TransitHeld => true,
     };
     match human.location {
         Location::Building(at) if at == workplace => StaffState::AtWork,

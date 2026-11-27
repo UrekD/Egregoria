@@ -7,7 +7,7 @@ use super::{
     detach_for_replan, elapsed_ticks, walkable_egress, Berth, BusRun, Transit, TransitStop,
     GIVE_UP_TICKS,
 };
-use crate::economy::{on_wait_timeout, transit_stats, TripProgress};
+use crate::economy::{on_wait_timeout, TripProgress};
 use crate::map::Map;
 use crate::map_dynamic::{Itinerary, LineID, Router, RoutingStep, StopID};
 use crate::transportation::{spawn_driving_vehicle, Location, TransportGrid, VehicleKind};
@@ -131,6 +131,7 @@ fn arrived(vehicle: &VehicleEnt, stop: &TransitStop) -> bool {
 
 pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
     let mut transit = resources.write::<Transit>();
+    let rail = resources.read::<super::RailTransit>();
     if transit.runs.is_empty()
         && !transit
             .lines
@@ -263,6 +264,7 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
         .iter()
         .filter_map(|(id, line)| {
             (!line.suspended
+                && !rail.lines.contains_key(&id)
                 && counts.get(&id).copied().unwrap_or(0) < line.target_vehicles as usize)
                 .then_some(id)
         })
@@ -330,26 +332,46 @@ fn spawn_bus(sim: &mut Simulation, line: LineID, now: Tick) {
     );
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ServiceVehicle {
+    Bus(VehicleID),
+    Rail(crate::world::TrainID),
+}
+
+impl ServiceVehicle {
+    fn location(self) -> Location {
+        match self {
+            Self::Bus(id) => Location::Transit(id),
+            Self::Rail(id) => Location::RailTransit(id),
+        }
+    }
+}
+
 struct StopService {
     line: LineID,
     stop: StopID,
     retiring: bool,
     force_alight: bool,
     remaining: usize,
+    capacity: usize,
+    boarding: bool,
 }
 
 pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
     let mut transit = resources.write::<Transit>();
+    let rail = resources.read::<super::RailTransit>();
     if transit.runs.is_empty()
+        && rail.runs.is_empty()
         && transit.trip_exclusions.is_empty()
         && !transit.lines.values().any(|line| line.target_vehicles > 0)
+        && !world.humans.has_active(HumanWork::Transit)
     {
         return;
     }
     let now = elapsed_ticks(resources);
     let map = resources.read::<Map>();
     let vehicles = resources.read::<ParCommandBuffer<VehicleEnt>>();
-    let mut service = BTreeMap::<VehicleID, StopService>::new();
+    let mut service = BTreeMap::<ServiceVehicle, StopService>::new();
     let mut queues = BTreeMap::<(LineID, StopID), Vec<(Tick, HumanID)>>::new();
     let mut fleet = BTreeMap::<LineID, usize>::new();
 
@@ -378,13 +400,15 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         let force_alight = line.suspended || line.target_vehicles == 0;
         let retiring = force_alight || *count > line.target_vehicles as usize;
         service.insert(
-            bus,
+            ServiceVehicle::Bus(bus),
             StopService {
                 line: run.line,
                 stop: stop.id,
                 retiring,
                 force_alight,
                 remaining: 0,
+                capacity: BUS_CAPACITY,
+                boarding: !retiring,
             },
         );
         if !retiring {
@@ -392,6 +416,46 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         }
     }
 
+    for (&id, run) in &rail.runs {
+        let (Some(line), Some(config), Some(train)) = (
+            transit.lines.get(run.line),
+            rail.lines.get(&run.line),
+            world.trains.get(id),
+        ) else {
+            continue;
+        };
+        let count = fleet.entry(run.line).or_default();
+        *count += 1;
+        let Some(stop) = line
+            .stops
+            .get(run.next_call)
+            .and_then(|&stop| transit.stops.get(stop))
+        else {
+            continue;
+        };
+        if !super::rail::can_serve(&map, train, run, &rail, line, stop) {
+            continue;
+        }
+        let retiring = config.is_retiring() || *count > usize::from(line.target_vehicles);
+        let boarding = !retiring && !line.suspended && run.boarding_open(now);
+        service.insert(
+            ServiceVehicle::Rail(id),
+            StopService {
+                line: run.line,
+                stop: stop.id,
+                retiring,
+                force_alight: retiring || line.suspended,
+                remaining: 0,
+                capacity: config.capacity,
+                boarding,
+            },
+        );
+        if boarding {
+            queues.entry((run.line, stop.id)).or_default();
+        }
+    }
+
+    drop(rail);
     transit.trip_exclusions.retain(|&id, exclusions| {
         let Some(human) = world
             .humans
@@ -404,11 +468,19 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         exclusions.started = human.router.trip_start;
         true
     });
-    world.humans.edit_active(HumanWork::Outside, |id, human| {
+    if now.0 % 256 == 0 {
+        resources.write::<super::JourneyStats>().expire(now);
+    }
+    world.humans.edit_active(HumanWork::Transit, |id, human| {
         let human: &mut HumanEnt = human;
-        if let Location::Transit(bus) = human.location {
-            if let Some(at) = service.get_mut(&bus) {
-                alight_passenger(&mut transit, id, human, at, bus, resources);
+        let aboard = match human.location {
+            Location::Transit(bus) => Some(ServiceVehicle::Bus(bus)),
+            Location::RailTransit(train) => Some(ServiceVehicle::Rail(train)),
+            _ => None,
+        };
+        if let Some(vehicle) = aboard {
+            if let Some(at) = service.get_mut(&vehicle) {
+                alight_passenger(&mut transit, id, human, at, vehicle, resources);
             }
             return;
         }
@@ -444,6 +516,11 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             return;
         };
 
+        if human.trans.pos.distance2(boarding_stop.walk_pos) > BOARDING_DISTANCE.powi(2) {
+            let position = human.trans.pos;
+            detach_for_replan(&mut transit, id, human, position, resources, Some(line));
+            return;
+        }
         if let Some(collider) = human.collider.take() {
             resources
                 .write::<TransportGrid>()
@@ -451,12 +528,8 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         }
         human.it = Itinerary::NONE;
         human.speed.0 = 0.0;
-        if human.trans.pos.distance2(boarding_stop.walk_pos)
-            <= BOARDING_DISTANCE * BOARDING_DISTANCE
-        {
-            if let Some(queue) = queues.get_mut(&(line, stop)) {
-                queue.push((since, id));
-            }
+        if let Some(queue) = queues.get_mut(&(line, stop)) {
+            queue.push((since, id));
         }
     });
 
@@ -467,41 +540,48 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             (stop, queue.into())
         })
         .collect();
-    for (bus, at) in service {
-        if let Some(leg) = transit.legs.get_mut(&bus) {
-            leg.skipped.clear();
-        }
-        if at.retiring {
-            if at.remaining == 0 {
+    for (vehicle, at) in service {
+        if let ServiceVehicle::Bus(bus) = vehicle {
+            if let Some(leg) = transit.legs.get_mut(&bus) {
+                leg.skipped.clear();
+            }
+            if at.retiring && at.remaining == 0 {
                 vehicles.kill(bus);
             }
+        }
+        if !at.boarding {
             continue;
         }
         let queue = queues.get_mut(&(at.line, at.stop)).unwrap();
         let mut remaining = at.remaining;
-        while remaining < BUS_CAPACITY {
+        while remaining < at.capacity {
             let Some((since, id)) = queue.pop_front() else {
                 break;
             };
             world.edit_human(id, |human| {
-                if !Router::board(human, bus, resources) {
-                    return;
-                }
                 let line = &transit.lines[at.line];
-                if matches!(human.router.cur_step(), Some(RoutingStep::RideTransit { alight, .. }) if !line.stops.contains(alight))
-                {
+                if !human.router.waits_for_ride(at.line, at.stop, &line.stops) {
                     let walk_pos = transit.stops[at.stop].walk_pos;
                     detach_for_replan(&mut transit, id, human, walk_pos, resources, Some(at.line));
                     return;
                 }
+                if !Router::board_transit(human, vehicle.location(), resources) {
+                    return;
+                }
                 remaining += 1;
-                human.router.trip_mode = TripProgress::RodeTransit;
-                transit_stats::on_board_with_fare(
+                if let ServiceVehicle::Rail(train) = vehicle {
+                    resources.write::<super::RailTransit>().board(train, id);
+                }
+                super::journey::record_board(
                     resources,
+                    id,
+                    &human.router,
                     at.line,
                     line.fare,
-                    now.0.saturating_sub(since.0),
+                    now,
+                    since,
                 );
+                human.router.trip_mode = TripProgress::RodeTransit;
             });
         }
     }
@@ -512,21 +592,33 @@ fn alight_passenger(
     id: HumanID,
     human: &mut HumanEnt,
     at: &mut StopService,
-    bus: VehicleID,
+    vehicle: ServiceVehicle,
     resources: &Resources,
 ) {
     let walk_pos = transit.stops[at.stop].walk_pos;
     let Some(RoutingStep::RideTransit { line, alight }) = human.router.cur_step() else {
+        if let ServiceVehicle::Rail(train) = vehicle {
+            resources.write::<super::RailTransit>().alight(train, id);
+        }
         detach_for_replan(transit, id, human, walk_pos, resources, Some(at.line));
         return;
     };
     let line_valid = *line == at.line && transit.lines[at.line].stops.contains(alight);
-    let skipped = transit
-        .legs
-        .get(&bus)
-        .is_some_and(|leg| leg.skipped.contains(alight));
+    let skipped = match vehicle {
+        ServiceVehicle::Bus(bus) => transit
+            .legs
+            .get(&bus)
+            .is_some_and(|leg| leg.skipped.contains(alight)),
+        ServiceVehicle::Rail(_) => false,
+    };
+    if (line_valid && !skipped && *alight == at.stop) || at.force_alight || !line_valid || skipped {
+        if let ServiceVehicle::Rail(train) = vehicle {
+            resources.write::<super::RailTransit>().alight(train, id);
+        }
+    }
     if line_valid && !skipped && *alight == at.stop {
         Router::alight(human, walk_pos, resources);
+        resources.write::<super::JourneyStats>().on_alight(at.line);
     } else if at.force_alight || !line_valid || skipped {
         detach_for_replan(transit, id, human, walk_pos, resources, Some(at.line));
     } else {

@@ -7,6 +7,7 @@ use prototypes::Tick;
 use simulation::map::{
     LaneKind, Map, PathKind, Pathfinder, Traversable, TraverseDirection, TraverseKind,
 };
+use simulation::map_dynamic::transit::RailTransit;
 use simulation::map_dynamic::Transit;
 use yakui::{colored_box_container, reflow, Alignment, Color, Dim2, Pivot};
 
@@ -16,14 +17,15 @@ pub(super) fn invalidation_key(transit: &Transit) -> u64 {
     transit.revision
 }
 
-pub(super) fn draw(map: &Map, transit: &Transit, draw: &mut ImmediateDraw) {
+pub(super) fn draw(map: &Map, transit: &Transit, rail: &RailTransit, draw: &mut ImmediateDraw) {
     for line in transit.lines.values() {
         for (&from, &to) in line.stops.iter().zip(line.stops.iter().cycle().skip(1)) {
+            let platform_pair = rail.platforms.get(&from).zip(rail.platforms.get(&to));
             let (Some(from), Some(to)) = (transit.stops.get(from), transit.stops.get(to)) else {
                 continue;
             };
-            let mut points =
-                leg_points(map, from.berth, to.berth).unwrap_or_else(|| vec![from.berth, to.berth]);
+            let mut points = leg_points(map, from.berth, to.berth, platform_pair)
+                .unwrap_or_else(|| vec![from.berth, to.berth]);
             points.dedup_by(|a, b| a.distance2(*b) < 0.01);
             if points.len() >= 2 {
                 for point in &mut points {
@@ -37,6 +39,11 @@ pub(super) fn draw(map: &Map, transit: &Transit, draw: &mut ImmediateDraw) {
     }
 
     for stop in transit.stops.values() {
+        if rail.platforms.contains_key(&stop.id) {
+            draw.line(stop.walk_pos.up(0.85), stop.berth.up(0.85), 0.8)
+                .color(LinearColor::WHITE)
+                .persistent();
+        }
         draw.circle(stop.walk_pos.up(0.85), 4.0)
             .color(LinearColor::WHITE)
             .persistent();
@@ -46,18 +53,32 @@ pub(super) fn draw(map: &Map, transit: &Transit, draw: &mut ImmediateDraw) {
     }
 }
 
-fn leg_points(map: &Map, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+fn leg_points(
+    map: &Map,
+    from: Vec3,
+    to: Vec3,
+    platform_pair: Option<(
+        &simulation::map_dynamic::transit::RailPlatformSpec,
+        &simulation::map_dynamic::transit::RailPlatformSpec,
+    )>,
+) -> Option<Vec<Vec3>> {
     // Each berth lies on the driving lane it serves. A fixed tick keeps the
     // display stable across rebuilds of the same network.
-    let start = map.nearest_lane(from, LaneKind::Driving, Some(4.0))?;
-    let end = map.nearest_lane(to, LaneKind::Driving, Some(4.0))?;
+    let (mode, start, end) = match platform_pair {
+        Some((from, to)) => (PathKind::Rail, from.lane, to.lane),
+        None => (
+            PathKind::Vehicle,
+            map.nearest_lane(from, LaneKind::Driving, Some(4.0))?,
+            map.nearest_lane(to, LaneKind::Driving, Some(4.0))?,
+        ),
+    };
     if start == end {
-        if let Some(path) = PathKind::Vehicle.local_route(map, start, from, to) {
+        if let Some(path) = mode.local_route(map, start, from, to) {
             return Some(path.into_vec());
         }
     }
     let start = Traversable::new(TraverseKind::Lane(start), TraverseDirection::Forward);
-    let route = PathKind::Vehicle.path(map, Tick(0), start, end)?;
+    let route = mode.path(map, Tick(0), start, end)?;
     let last = route.len().checked_sub(1)?;
     let mut points = Vec::new();
     for (index, traversable) in route.into_iter().enumerate() {
@@ -97,7 +118,7 @@ pub(super) fn legend(empty: bool) {
                             colored_box_container(Color::WHITE, || {
                                 fixed_spacer((8.0, 8.0));
                             });
-                            textc(color, "Bus stop");
+                            textc(color, "Transit stop or platform entrance");
                         });
                     });
                 });

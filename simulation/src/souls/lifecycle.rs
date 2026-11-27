@@ -228,6 +228,9 @@ fn remove_building(
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
     cancel_removed(sim, CargoRemoval::Driver(id));
+    crate::map_dynamic::transit::forget_rail_rider(sim, id, &human.location);
+    sim.write::<crate::map_dynamic::transit::JourneyStats>()
+        .forget(id);
     let resources = &sim.resources;
     human
         .household

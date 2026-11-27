@@ -1,9 +1,15 @@
 use goryak::{mincolumn, minrow, outline, padxy};
-use prototypes::{prototypes_iter, RollingStockID, RollingStockPrototype};
+use prototypes::{
+    prototypes_iter, BuildingGen, RenderAsset, RollingStockID, RollingStockPrototype, Size2D,
+};
+use simulation::map::BuildingKind;
+use simulation::world_command::WorldCommand;
 use yakui::widgets::List;
 use yakui::{button, divider, label, CrossAxisAlignment, MainAxisAlignment};
 
 use crate::gui::addtrain::TrainSpawnResource;
+use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
+use crate::gui::Tool;
 use crate::uiworld::UiWorld;
 
 pub fn train_properties(uiw: &UiWorld) {
@@ -16,6 +22,26 @@ pub fn train_properties(uiw: &UiWorld) {
         l.item_spacing = 10.0;
         l.show(|| {
             mincolumn(0.1, || {
+                if uiw.can_author() && button("Passenger Station").clicked {
+                    *uiw.write::<Tool>() = Tool::SpecialBuilding;
+                    uiw.write::<SpecialBuildingResource>().opt = Some(SpecialBuildKind {
+                        company: None,
+                        make: Box::new(|args| {
+                            vec![WorldCommand::MapBuildSpecialBuilding {
+                                pos: args.obb,
+                                connected_road: args.connected_road,
+                                kind: BuildingKind::TrainStation,
+                                gen: BuildingGen::House,
+                                zone: None,
+                            }]
+                        }),
+                        size: Size2D::new(12.0, 20.0),
+                        asset: RenderAsset::Mesh {
+                            path: "rail_freight_station.glb".into(),
+                        },
+                        road_snap: true,
+                    });
+                }
                 if button("remove train").clicked {
                     state.wagons.clear();
                     state.set_zero();

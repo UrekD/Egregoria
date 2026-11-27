@@ -5,7 +5,7 @@ use yakui::widgets::Pad;
 
 use simulation::diagnostics::{citizen_diagnostics, CitizenBlocker, CitizenIntention};
 use simulation::economy::Market;
-use simulation::map_dynamic::{Destination, ParkingReserveError, RouterError};
+use simulation::map_dynamic::{Destination, ParkingReserveError, RouterError, RoutingStep};
 use simulation::souls::desire::WorkKind;
 use simulation::transportation::Location;
 use simulation::{HumanID, Simulation};
@@ -49,13 +49,33 @@ pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
         }
 
         match human.location {
-            Location::Outside => {}
+            Location::Outside => {
+                if let Some(RoutingStep::WaitAtStop { line, since, .. }) = human.router.cur_step() {
+                    let now = simulation::map_dynamic::transit::simulation_elapsed_ticks(sim);
+                    if *since == prototypes::Tick(u64::MAX) {
+                        label(format!("Waiting to join {line:?}"));
+                    } else {
+                        label(format!(
+                            "Waiting for {line:?} · {:.1} game minutes",
+                            now.0.saturating_sub(since.0) as f64
+                                / prototypes::TICKS_PER_MINUTE as f64
+                        ));
+                    }
+                }
+            }
             Location::Vehicle(_) => {
                 label("In a vehicle");
             }
             Location::Transit(_) => {
                 label("On a bus");
             }
+            Location::RailTransit(train) => {
+                label("On a passenger train");
+                if goryak::primary_link(format!("{train:?}")) {
+                    uiworld.write::<crate::gui::InspectedEntity>().e = Some(train.into());
+                }
+            }
+            Location::TransitHeld => label("Waiting for safe rail egress"),
             Location::Building(x) => {
                 minrow(5.0, || {
                     label("In a building:");

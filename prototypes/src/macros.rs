@@ -39,6 +39,7 @@ macro_rules! gen_prototypes {
             )+
             pub(crate) orderings: Orderings,
             pub(crate) fingerprint: u64,
+            pub(crate) pre_passenger_fingerprint: u64,
             declared_types: std::collections::BTreeMap<String, &'static str>,
             conflicting_declarations: std::collections::BTreeSet<String>,
         }
@@ -86,7 +87,7 @@ macro_rules! gen_prototypes {
                 )+
             }
 
-            pub(crate) fn compute_fingerprint(&self) -> std::io::Result<u64> {
+            pub(crate) fn compute_fingerprints(&self) -> std::io::Result<(u64, u64)> {
                 use common::saveload::{Bincode, Encoder};
                 use std::hash::Hasher;
 
@@ -101,7 +102,12 @@ macro_rules! gen_prototypes {
                 #[allow(deprecated)] // Fixed SipHash-2-4 keys and byte-oriented input.
                 let mut hash = std::hash::SipHasher::new_with_keys(0, 0);
                 hash.write(&encoded);
-                Ok(hash.finish())
+                let pre_passenger = hash.finish();
+                let passenger = self.rolling_stock.iter().map(|(id, stock)| {
+                    (id, (stock.passenger_seats, stock.passenger_upkeep_per_day))
+                }).collect::<std::collections::BTreeMap<_, _>>();
+                hash.write(&Bincode::encode(&passenger)?);
+                Ok((hash.finish(), pre_passenger))
             }
 
             pub(crate) fn compute_orderings(&mut self) {

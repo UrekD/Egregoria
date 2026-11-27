@@ -142,6 +142,7 @@ pub struct TrainEnt {
 
 impl SimDrop for TrainEnt {
     fn sim_drop(self, id: TrainID, sim: &mut Simulation) {
+        crate::map_dynamic::transit::rail_train_dropped(sim, id, &self);
         lifecycle::train_dropped(sim, id);
     }
 }
@@ -194,10 +195,11 @@ pub enum HumanWork {
     Itinerary,
     /// Transit boarding examines humans outside and riders in transit, in one pass.
     Outside,
+    Transit,
 }
 
 impl HumanWork {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     const ITINERARY_MEMBERSHIP: u8 =
         (1 << Self::Pedestrian as usize) | (1 << Self::Itinerary as usize);
@@ -218,6 +220,15 @@ impl HumanWork {
             human.location,
             Location::Outside | Location::Transit(_)
         )) << Self::Outside as usize;
+        let transit_work = matches!(
+            human.location,
+            Location::Transit(_) | Location::RailTransit(_)
+        ) || (human.location == Location::Outside
+            && matches!(
+                human.router.cur_step(),
+                Some(crate::map_dynamic::RoutingStep::WaitAtStop { .. })
+            ));
+        mask |= u8::from(transit_work) << Self::Transit as usize;
         mask
     }
 }
@@ -514,6 +525,15 @@ impl HumanStorage {
             #[cfg(test)]
             &self.entities,
         );
+    }
+
+    pub(crate) fn has_active(&self, kind: HumanWork) -> bool {
+        self.activity.dirty
+            || !self.activity.sets[kind as usize].nonempty.is_empty()
+                && self.activity.sets[kind as usize]
+                    .nonempty
+                    .iter()
+                    .any(|&word| word != 0)
     }
 
     pub(crate) fn edit_active(

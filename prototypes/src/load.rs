@@ -56,8 +56,8 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
 
     validation::validate(&p)?;
 
-    p.fingerprint = p
-        .compute_fingerprint()
+    (p.fingerprint, p.pre_passenger_fingerprint) = p
+        .compute_fingerprints()
         .map_err(PrototypeLoadError::Fingerprint)?;
     p.compute_orderings();
     p.print_stats();
@@ -71,6 +71,11 @@ impl Prototypes {
     /// Identifies the effective prototype data in this registry.
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
+    }
+
+    /// Registry encoding used by snapshots before passenger stock policy was added.
+    pub fn pre_passenger_fingerprint(&self) -> u64 {
+        self.pre_passenger_fingerprint
     }
 }
 

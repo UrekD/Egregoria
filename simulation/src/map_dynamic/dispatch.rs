@@ -92,6 +92,15 @@ impl Dispatcher {
 
     /// Index trains on the same occupied lanes used to plan freight service.
     pub fn update(&mut self, map: &Map, world: &World) {
+        self.update_freight(map, world, None);
+    }
+
+    fn update_freight(
+        &mut self,
+        map: &Map,
+        world: &World,
+        passenger: Option<&crate::map_dynamic::transit::RailTransit>,
+    ) {
         let disp_trains = self
             .dispatches
             .entry(DispatchKind::FreightTrain)
@@ -99,6 +108,10 @@ impl Dispatcher {
 
         for (ent, train) in world.trains.iter() {
             let id = DispatchID::FreightTrain(ent);
+            if passenger.is_some_and(|rail| rail.runs.contains_key(&ent)) {
+                disp_trains.unregister(id);
+                continue;
+            }
             if let Some(lane) = train_lane(map, train) {
                 disp_trains.register_on_lane(id, &map.lanes[lane], train.trans.pos);
             } else {
@@ -324,7 +337,8 @@ pub fn dispatch_system(world: &mut World, resources: &mut Resources) {
 
     let mut dispatcher = resources.write::<Dispatcher>();
     let map = resources.read::<Map>();
-    dispatcher.update(&map, world);
+    let passenger = resources.read::<crate::map_dynamic::transit::RailTransit>();
+    dispatcher.update_freight(&map, world, Some(&passenger));
 }
 
 #[cfg(test)]

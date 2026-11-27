@@ -54,7 +54,7 @@ pub struct Router {
     trip_employer: Option<CompanyID>,
     #[inspect(skip)]
     #[serde(skip)]
-    transit_walks: Option<Box<[Option<ValidatedWalk>; 2]>>,
+    transit_walks: Option<Box<[Option<ValidatedWalk>; 3]>>,
     #[inspect(skip)]
     #[serde(skip)]
     drive_check: Option<Box<DriveCheck>>,
@@ -128,12 +128,13 @@ fn routing_changed(
     let cbuf_human = resources.read::<ParCommandBuffer<HumanEnt>>();
     let cbuf_vehicle = resources.read::<ParCommandBuffer<VehicleEnt>>();
     let transit = resources.read::<Transit>();
+    let rail = resources.read::<crate::map_dynamic::transit::RailTransit>();
     let mut transit_paths = None;
 
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let h: &mut HumanEnt = h;
         let router = &mut h.router;
-        if matches!(h.location, Location::Transit(_)) || h.it.is_pedestrian_egress() {
+        if h.location.is_transit() || h.it.is_pedestrian_egress() {
             return;
         }
         if std::mem::take(&mut router.replan_at_alight) {
@@ -208,7 +209,7 @@ fn routing_changed(
         let router = &mut h.router;
 
         let mut transit_steps = None;
-        if !transit.runs.is_empty()
+        if (!transit.runs.is_empty() || !rail.runs.is_empty())
             && router.allows_transit(&h.household)
             && !matches!(h.location, Location::Vehicle(_))
             && (router.vehicle.is_none() || router.vehicle == router.personal_car)
@@ -225,8 +226,9 @@ fn routing_changed(
                 && car.is_none_or(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Car))
             {
                 let now = elapsed_ticks(resources);
-                let paths =
-                    transit_paths.get_or_insert_with(|| TransitPaths::new(&transit, now, &headway));
+                let paths = transit_paths.get_or_insert_with(|| {
+                    TransitPaths::with_rail(&transit, Some(&rail), now, &headway)
+                });
                 if paths.has_service() {
                     let origin = match h.location {
                         Location::Building(id) => map.get(id).map_or(h.trans.pos, |b| b.door_pos),
@@ -244,6 +246,9 @@ fn routing_changed(
                         now,
                         nearby_car,
                         walk_speed,
+                        resources
+                            .read::<crate::map_dynamic::transit::JourneyStats>()
+                            .credit(id, now),
                         |line| transit.allows_line_for_trip(id, router, line),
                     );
                 }
@@ -251,7 +256,8 @@ fn routing_changed(
         }
 
         let mut route = if let Some((steps, paths)) = transit_steps {
-            router.transit_walks = Some(Box::new(paths.map(Some)));
+            let mut paths = paths.into_iter();
+            router.transit_walks = Some(Box::new(std::array::from_fn(|_| paths.next())));
             Ok(steps)
         } else {
             router.steps_to(pos, parking, map, &h.location, &world.vehicles)
@@ -347,7 +353,11 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         let trans: &Transform = &h.trans;
 
         let pos = match h.location {
-            Location::Outside => trans.pos,
+            Location::Outside | Location::TransitHeld => trans.pos,
+            Location::RailTransit(id) => world
+                .trains
+                .get(id)
+                .map_or(trans.pos, |train| train.trans.pos),
             Location::Vehicle(id) | Location::Transit(id) => world
                 .vehicles
                 .get(id)
@@ -418,8 +428,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                 RoutingStep::GetOutVehicle(_) => true,
                 RoutingStep::GetInBuilding(_) => true,
                 RoutingStep::GetOutBuilding(_) => true,
-                RoutingStep::WaitAtStop { .. } => matches!(h.location, Location::Transit(_)),
-                RoutingStep::RideTransit { .. } => !matches!(h.location, Location::Transit(_)),
+                RoutingStep::WaitAtStop { .. } => h.location.is_transit(),
+                RoutingStep::RideTransit { .. } => !h.location.is_transit(),
             };
         }
         let mut next_step_ready = true;
@@ -447,7 +457,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     .unwrap_or(true),
                 RoutingStep::GetOutBuilding(_) => true,
                 RoutingStep::WaitAtStop { .. } => true,
-                RoutingStep::RideTransit { .. } => matches!(h.location, Location::Transit(_)),
+                RoutingStep::RideTransit { .. } => h.location.is_transit(),
             };
         }
 
@@ -470,8 +480,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                             .router
                             .transit_walks
                             .as_deref_mut()
-                            .and_then(|paths| {
-                                paths.iter_mut().find_map(|path| {
+                            .and_then(|walks| {
+                                walks.iter_mut().find_map(|path| {
                                     if path
                                         .as_ref()
                                         .is_some_and(|path| path.matches(pos, obj, map))
@@ -982,7 +992,7 @@ impl Router {
     }
 
     pub(crate) fn needs_route_change(&self, location: &Location) -> bool {
-        if matches!(location, Location::Transit(_)) {
+        if location.is_transit() {
             return false;
         }
         if self.replan_at_alight {
@@ -1005,8 +1015,28 @@ impl Router {
         }
     }
 
+    pub(super) fn has_ridden_transit(&self) -> bool {
+        matches!(self.trip_mode, TripProgress::RodeTransit)
+    }
+
+    pub(super) fn waits_for_ride(&self, line: LineID, stop: StopID, calls: &[StopID]) -> bool {
+        matches!(self.cur_step, Some(RoutingStep::WaitAtStop { line: waiting, stop: boarding, .. })
+            if waiting == line && boarding == stop)
+            && matches!(self.steps.last(), Some(RoutingStep::RideTransit { line: riding, alight })
+                if *riding == line && *alight != stop && calls.contains(alight))
+    }
+
     /// Start the next ride after the boarding system has checked the bus and stop.
+    #[cfg(test)]
     pub(crate) fn board(human: &mut HumanEnt, bus: VehicleID, resources: &Resources) -> bool {
+        Self::board_transit(human, Location::Transit(bus), resources)
+    }
+
+    pub(crate) fn board_transit(
+        human: &mut HumanEnt,
+        vehicle: Location,
+        resources: &Resources,
+    ) -> bool {
         let router = &mut human.router;
         if human.location != Location::Outside || !router.allows_transit(&human.household) {
             return false;
@@ -1020,7 +1050,7 @@ impl Router {
         }
 
         router.cur_step = router.steps.pop();
-        human.location = Location::Transit(bus);
+        human.location = vehicle;
         human.it = Itinerary::NONE;
         human.speed.0 = 0.0;
         if let Some(collider) = human.collider.take() {
@@ -1033,7 +1063,7 @@ impl Router {
 
     /// End a ride at a walkable stop position, keeping the remaining route.
     pub(crate) fn alight(human: &mut HumanEnt, stop_pos: Vec3, resources: &Resources) {
-        if !matches!(human.location, Location::Transit(_)) {
+        if !human.location.is_transit() {
             return;
         }
         human.router.cur_step = None;
@@ -1042,7 +1072,7 @@ impl Router {
 
     /// Leave transit at a walkable position and plan again from there.
     pub(crate) fn force_detach(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {
-        if !matches!(human.location, Location::Transit(_))
+        if !human.location.is_transit()
             && !matches!(human.router.cur_step, Some(RoutingStep::WaitAtStop { .. }))
         {
             return;

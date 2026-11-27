@@ -46,7 +46,7 @@ pub struct ItineraryLeader {
     pub past: Polyline3Queue,
 }
 
-#[derive(Default, Debug, Inspect)]
+#[derive(Clone, Default, Debug, Inspect)]
 pub struct Itinerary {
     kind: ItineraryKind,
     reversed_local_path: Vec<Vec3>,
@@ -75,7 +75,7 @@ impl RoadApproach {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum ItineraryKind {
     #[default]
     None,
@@ -238,7 +238,7 @@ pub enum ItineraryTarget {
     DirectedLane(LaneID, f32),
 }
 
-#[derive(Debug, Serialize, Deserialize, Inspect)]
+#[derive(Clone, Debug, Serialize, Deserialize, Inspect)]
 pub struct Route {
     /// Route is reversed, allows for efficient popping
     pub reversed_route: Vec<Traversable>,

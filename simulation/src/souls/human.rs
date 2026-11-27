@@ -442,7 +442,9 @@ impl HumanEnt {
                         Location::Vehicle(car) => vehicles
                             .get(car)
                             .is_none_or(|car| car.it.is_wait_for_reroute().is_some()),
-                        Location::Transit(_) => false,
+                        Location::Transit(_) | Location::RailTransit(_) | Location::TransitHeld => {
+                            false
+                        }
                         _ => self.it.is_wait_for_reroute().is_some(),
                     };
                     let stalled =
@@ -452,7 +454,7 @@ impl HumanEnt {
                         || self.router.last_error.is_some()
                         || self.router.target_dest != Some(dest)
                     {
-                        if matches!(self.location, Location::Transit(_)) {
+                        if self.location.is_transit() {
                             self.router.cancel_at_alight();
                         } else {
                             self.stop_route(resources);

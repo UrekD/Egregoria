@@ -1,7 +1,7 @@
 use geom::{Color, Vec2, Vec3};
 use ordered_float::OrderedFloat;
-use simulation::map::{LaneKind, Map, ProjectFilter, ProjectKind};
-use simulation::map_dynamic::transit::preview_stop;
+use simulation::map::{BuildingKind, LaneKind, Map, ProjectFilter, ProjectKind};
+use simulation::map_dynamic::transit::{preview_stop, RailPlatformSpec};
 use simulation::map_dynamic::{StopID, Transit};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
@@ -79,9 +79,18 @@ impl StopPreview {
 }
 
 pub(super) fn stop_at(transit: &Transit, pos: Vec3) -> Option<StopID> {
+    stop_at_where(transit, pos, |_| true)
+}
+
+pub(super) fn stop_at_where(
+    transit: &Transit,
+    pos: Vec3,
+    accepts: impl Fn(StopID) -> bool,
+) -> Option<StopID> {
     transit
         .stops
         .values()
+        .filter(|stop| accepts(stop.id))
         .filter_map(|stop| {
             let distance = pos
                 .xy()
@@ -167,5 +176,64 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, removing: bool) {
             preview.draw(&mut draw, colors.gui_danger);
             show_edit_error(uiworld, "TransitAddStop", reason);
         }
+    }
+}
+
+pub(super) fn update_rail(sim: &Simulation, uiworld: &UiWorld, length: f32) {
+    let input = uiworld.read::<InputMap>();
+    let Some(pos) = input.unprojected else { return };
+    let map = sim.map();
+    let colors = simulation::colors();
+    let mut draw = uiworld.write::<ImmediateDraw>();
+    let transit = sim.read::<Transit>();
+    draw_stops(&transit, &mut draw, None, colors.gui_primary);
+    let Some(lane) = map
+        .nearest_lane(pos, LaneKind::Rail, Some(20.0))
+        .and_then(|id| map.get(id))
+    else {
+        return;
+    };
+    let berth = lane.points.project(pos);
+    let offset = lane.points.length_at_proj(berth);
+    let from = lane.points.point_along((offset - length).max(0.0));
+    let station = map
+        .spatial_map()
+        .query_around(berth.xy(), 60.0, ProjectFilter::BUILDING)
+        .filter_map(|hit| match hit {
+            ProjectKind::Building(id) => map.get(id),
+            _ => None,
+        })
+        .filter(|building| building.kind == BuildingKind::TrainStation)
+        .min_by_key(|building| {
+            (
+                OrderedFloat(building.door_pos.distance2(berth)),
+                building.id,
+            )
+        });
+    let Some(station) = station else {
+        draw.line(from.up(0.8), berth.up(0.8), 1.0)
+            .color(colors.gui_danger);
+        return;
+    };
+    let command = WorldCommand::TransitAddRailPlatform {
+        platform: RailPlatformSpec {
+            station: station.id,
+            lane: lane.id,
+            offset,
+            length,
+        },
+    };
+    let valid = preview_edit(sim, uiworld, &command);
+    let color = if valid {
+        colors.gui_primary
+    } else {
+        colors.gui_danger
+    };
+    draw.line(from.up(0.8), berth.up(0.8), 1.0).color(color);
+    draw.line(berth.up(0.8), station.door_pos.up(0.8), 0.8)
+        .color(color);
+    draw.stroke_circle(berth.up(0.8), 2.2, 0.8).color(color);
+    if valid && input.just_act.contains(&InputAction::Select) {
+        uiworld.commands().push(command);
     }
 }

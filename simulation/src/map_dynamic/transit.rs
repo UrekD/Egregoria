@@ -18,7 +18,18 @@ use crate::utils::resources::Resources;
 use crate::world_command::{Rejection, WorldCommand};
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World};
 
+mod journey;
+mod rail;
 mod service;
+
+pub use journey::{JourneyStats, LineJourneyStats};
+pub(crate) use rail::{
+    forget_rail_rider, rail_train_dropped, validate_rail_snapshot, MAX_PASSENGER_STOCK,
+};
+pub use rail::{
+    rail_service_update, PassengerRailLine, PassengerRailRun, RailPlatformSpec, RailSchedule,
+    RailTransit,
+};
 
 #[cfg(test)]
 pub(super) use service::tests::recovery_leg_fixture;
@@ -201,6 +212,8 @@ pub struct Transit {
 }
 
 impl Transit {
+    pub(crate) const FARE_WINDOW_TICKS: u64 = 9_000;
+
     pub fn bus_leg_origin(&self, vehicle: VehicleID) -> Option<StopID> {
         self.legs.get(&vehicle)?.from
     }
@@ -303,12 +316,19 @@ pub fn elapsed_ticks(resources: &Resources) -> Tick {
     Tick(resources.read::<Budget>().elapsed_ticks(calendar_tick))
 }
 
+pub fn simulation_elapsed_ticks(sim: &Simulation) -> Tick {
+    elapsed_ticks(&sim.resources)
+}
+
 pub(crate) fn is_command(command: &WorldCommand) -> bool {
     use WorldCommand::*;
 
     matches!(
         command,
         TransitAddStop { .. }
+            | TransitAddRailPlatform { .. }
+            | TransitCreateRailLine { .. }
+            | TransitSetRailSchedule { .. }
             | TransitRemoveStop { .. }
             | TransitCreateLine { .. }
             | TransitEditLine { .. }
@@ -328,6 +348,8 @@ pub fn validate(sim: &Simulation, command: &WorldCommand) -> Result<(), Rejectio
 enum Prepared {
     Stop(Vec2, Vec3, Berth),
     Line(Vec<u64>),
+    RailPlatform(rail::PlatformPose),
+    RailLine(Vec<u64>, usize),
     Edit,
 }
 
@@ -335,7 +357,61 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
     use WorldCommand::*;
 
     let transit = sim.read::<Transit>();
+    let rail = sim.read::<RailTransit>();
     let prepared = match command {
+        TransitAddRailPlatform { platform } => {
+            if rail.platforms.values().any(|bound| {
+                bound.lane == platform.lane
+                    && (bound.offset - platform.offset).abs() < bound.length.max(platform.length)
+            }) {
+                return Err(Rejection::InvalidConnection);
+            }
+            Prepared::RailPlatform(rail::platform_pose(&sim.map(), *platform)?)
+        }
+        TransitCreateRailLine {
+            calls,
+            consist,
+            schedule,
+        } => {
+            if !schedule.valid() {
+                return Err(Rejection::InvalidConnection);
+            }
+            let (seats, _, _) = rail::fleet_spec(consist).ok_or(Rejection::InvalidTrain)?;
+            Prepared::RailLine(
+                rail::validate_loop(&sim.map(), &rail.platforms, calls, consist)?,
+                seats,
+            )
+        }
+        TransitSetRailSchedule {
+            line,
+            expected_pattern,
+            schedule,
+        } => {
+            let config = rail.lines.get(line).ok_or(Rejection::MissingReference)?;
+            if !schedule.valid()
+                || config.pattern_revision != *expected_pattern
+                || config.is_retiring()
+            {
+                return Err(Rejection::InvalidConnection);
+            }
+            Prepared::Edit
+        }
+        TransitEditLine { line, stops } if rail.lines.contains_key(line) => {
+            let config = &rail.lines[line];
+            if config.is_retiring() || rail.runs.values().any(|run| run.line == *line) {
+                return Err(Rejection::OccupiedTrack);
+            }
+            Prepared::RailLine(
+                rail::validate_loop(&sim.map(), &rail.platforms, stops, &config.consist)?,
+                config.capacity,
+            )
+        }
+        TransitRemoveStop { stop } if rail.platforms.contains_key(stop) => {
+            if transit.lines.values().any(|line| line.stops.contains(stop)) {
+                return Err(Rejection::OccupiedTrack);
+            }
+            Prepared::Edit
+        }
         TransitAddStop { pos, dir } => {
             if !pos.is_finite() {
                 return Err(Rejection::InvalidConnection);
@@ -397,7 +473,11 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
                     .ok_or(Rejection::InvalidConnection)?,
             )
         }
-        TransitSetVehicles { n, .. } if *n > 10 => return Err(Rejection::InvalidConnection),
+        TransitSetVehicles { line, n }
+            if *n > 10 || rail.lines.get(line).is_some_and(|line| line.is_retiring()) =>
+        {
+            return Err(Rejection::InvalidConnection);
+        }
         TransitSetFare { fare, .. } if !(Money::ZERO..=Money::new_bucks(10)).contains(fare) => {
             return Err(Rejection::InvalidConnection);
         }
@@ -584,7 +664,11 @@ fn resolve_stop_on_roads<'a>(
 pub(crate) fn validate_saved_land_stops(sim: &Simulation) -> Result<(), String> {
     let map = sim.map();
     let transit = sim.read::<Transit>();
+    let rail = sim.read::<RailTransit>();
     for (id, stop) in transit.stops.iter() {
+        if rail.platforms.contains_key(&id) {
+            continue;
+        }
         let berth = transit
             .berths
             .get(&id)
@@ -622,8 +706,59 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
     let (world, resources) = sim.world_res();
     let mut transit = resources.write::<Transit>();
     let now = elapsed_ticks(resources);
+    let mut rail = resources.write::<RailTransit>();
 
     match (command, prepared) {
+        (TransitAddRailPlatform { platform }, Prepared::RailPlatform(pose)) => {
+            let id = transit.stops.insert_with_key(|id| TransitStop {
+                id,
+                pos: pose.berth,
+                dir: pose.direction.xy(),
+                walk_pos: pose.door,
+                berth: pose.berth,
+            });
+            rail.platforms.insert(id, *platform);
+        }
+        (
+            TransitCreateRailLine {
+                calls,
+                consist,
+                schedule,
+            },
+            Prepared::RailLine(times, capacity),
+        ) => {
+            let id = insert_line(&mut transit, calls.clone(), 1);
+            rail.lines.insert(
+                id,
+                rail::new_line(*schedule, capacity, consist.clone(), times, now),
+            );
+        }
+        (TransitSetRailSchedule { line, schedule, .. }, _) => {
+            rail.lines
+                .get_mut(line)
+                .unwrap()
+                .set_schedule(*schedule, now);
+        }
+        (TransitEditLine { line, stops }, Prepared::RailLine(times, _)) => {
+            let config = rail.lines.get_mut(line).unwrap();
+            config.pattern_revision += 1;
+            config.leg_ticks = times;
+            transit.lines[*line].stops.clone_from(stops);
+            transit.lines[*line].suspended = false;
+        }
+        (TransitRemoveLine { line }, _) if rail.lines.contains_key(line) => {
+            if rail.runs.values().any(|run| run.line == *line) {
+                rail.lines.get_mut(line).unwrap().remove();
+                transit.lines[*line].target_vehicles = 0;
+            } else {
+                rail.lines.remove(line);
+                transit.lines.remove(*line);
+                resources.write::<JourneyStats>().remove_line(*line);
+            }
+        }
+        (TransitRemoveStop { stop }, _) if rail.platforms.remove(stop).is_some() => {
+            transit.stops.remove(*stop);
+        }
         (TransitAddStop { pos, .. }, Prepared::Stop(dir, walk_pos, berth)) => {
             let id = transit.stops.insert_with_key(|id| TransitStop {
                 id,
@@ -651,19 +786,7 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
             );
         }
         (TransitCreateLine { stops }, Prepared::Line(times)) => {
-            let id = transit.lines.insert_with_key(|id| TransitLine {
-                id,
-                stops: stops.clone(),
-                target_vehicles: 0,
-                fare: Money::ZERO,
-                color: Color::hsv(
-                    (id.data().as_ffi() as u32 % 360) as f32 * 137.5 % 360.0,
-                    0.7,
-                    0.9,
-                    1.0,
-                ),
-                suspended: false,
-            });
+            let id = insert_line(&mut transit, stops.clone(), 0);
             transit.leg_times.insert(id, LineTimes::new(times));
         }
         (TransitEditLine { line, stops }, Prepared::Line(times)) => {
@@ -698,6 +821,22 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
     }
     transit.revision += 1;
     Ok(())
+}
+
+fn insert_line(transit: &mut Transit, stops: Vec<StopID>, target_vehicles: u8) -> LineID {
+    transit.lines.insert_with_key(|id| TransitLine {
+        id,
+        stops,
+        target_vehicles,
+        fare: Money::ZERO,
+        color: Color::hsv(
+            (id.data().as_ffi() as u32 % 360) as f32 * 137.5 % 360.0,
+            0.7,
+            0.9,
+            1.0,
+        ),
+        suspended: false,
+    })
 }
 
 fn replace_stops(
@@ -798,7 +937,7 @@ fn remove_stops(
     }
 
     world.humans.edit_each(|id, human| {
-        if matches!(human.location, Location::Transit(_))
+        if human.location.is_transit()
             || !removed
                 .iter()
                 .any(|&stop| human.router.references_stop(stop))
@@ -823,6 +962,7 @@ fn remove_line(
     line: LineID,
 ) {
     transit.lines.remove(line);
+    resources.write::<JourneyStats>().remove_line(line);
     transit.leg_times.remove(&line);
     let vehicles = resources.read::<ParCommandBuffer<VehicleEnt>>();
     for (&id, _) in transit.runs.iter().filter(|(_, run)| run.line == line) {
@@ -856,7 +996,7 @@ fn refresh_line_times(map: &Map, transit: &mut Transit, line: LineID) {
 /// Returns whether transit took over cancellation. An onboard rider keeps the
 /// ride and decision until alighting, even when the destination is demolished.
 pub fn on_route_cancelled(human: &mut HumanEnt, resources: &Resources) -> bool {
-    if matches!(human.location, Location::Transit(_)) {
+    if human.location.is_transit() {
         if let Some(Destination::Building(id)) = human.router.target_dest {
             if resources.read::<Map>().get(id).is_none() {
                 human.router.defer_replan();
@@ -947,6 +1087,7 @@ pub fn on_topology_changed(sim: &mut Simulation) {
     }
     let (world, resources) = sim.world_res();
     revalidate_stops(world, resources, true);
+    rail::revalidate_rail(world, resources);
     crate::utils::scheduler::drain_commands(sim);
 }
 
@@ -968,8 +1109,12 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
     let mut moved = BTreeSet::new();
     let mut removed = BTreeSet::new();
     let mut changed_lanes = false;
+    let rail = resources.read::<RailTransit>();
     let Transit { stops, berths, .. } = &mut *transit;
     for (id, stop) in stops.iter_mut() {
+        if rail.platforms.contains_key(&id) {
+            continue;
+        }
         let Some((walk, berth)) = resolve_stop(&map, stop.pos, stop.dir) else {
             removed.insert(id);
             continue;
@@ -996,7 +1141,8 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
             .lines
             .iter()
             .filter(|(_, line)| {
-                topology_edited || line.stops.iter().any(|stop| moved.contains(stop))
+                !rail.lines.contains_key(&line.id)
+                    && (topology_edited || line.stops.iter().any(|stop| moved.contains(stop)))
             })
             .map(|(id, _)| id)
             .collect();
