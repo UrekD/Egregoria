@@ -4781,6 +4781,17 @@ mod tests {
         eprintln!("South frontage to Alpska walk: {distance:.1} m");
         assert!(distance <= 170.0,
             "the walk from South homes to the Alpska shops is {distance:.1} m");
+        let west_homes = built.links[&SourceKey::Way { id: 168406408, span: 3 }].road;
+        let west_bakery = built.links[&SourceKey::Way { id: 419255419, span: 1 }].road;
+        let home = super::super::layout::design_point(vec2(1309.8, 1209.0), plan.config);
+        let bakery = super::super::layout::design_point(vec2(1321.7, 1386.6), plan.config);
+        let distance = reach.distance(
+            reach.position(west_homes, home).unwrap(),
+            reach.position(west_bakery, bakery).unwrap(),
+        );
+        eprintln!("West homes to the bakery: {distance:.1} m");
+        assert!(distance <= 450.0,
+            "the walk from West homes to the bakery is {distance:.1} m");
         let hraska_egress = built.junctions[&SourceKey::Node {
             id: 4193639666,
             rail: false,

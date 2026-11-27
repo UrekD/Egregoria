@@ -1342,6 +1342,25 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         );
     }
     connect_south_walk(&mut plan.graph)?;
+    let bakery_end = SourceKey::Node { id: 4576903826, rail: false };
+    let west_south_walk = SourceKey::Node { id: 4605342201, rail: false };
+    if plan.graph.junctions.contains_key(&bakery_end)
+        && plan.graph.junctions.contains_key(&west_south_walk)
+    {
+        let walk = SourceKey::Authored("west-bakery-walk");
+        add_authored_road(
+            &mut plan.graph,
+            walk,
+            [bakery_end, west_south_walk],
+            RoadClass::Walk,
+            None,
+            0,
+        );
+        plan.graph.record(
+            "connect the West bakery cul-de-sac to the West–South footpath",
+            &[bakery_end, west_south_walk, walk],
+        );
+    }
     let ridge = SourceKey::Node {
         id: 4193639670,
         rail: false,
