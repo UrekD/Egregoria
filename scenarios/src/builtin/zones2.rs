@@ -1019,14 +1019,24 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
 
     // Refill the cleared parcel via the checked housing flow. Its new residents
     // submit ordinary job applications near the vacancy just advertised.
-    let lot = ctx
-        .sim
-        .map()
-        .lots()
-        .values()
-        .find(|lot| lot.parent == parcel.parent_road && lot.shape.corners == parcel.shape.corners)
-        .ok_or("hire staging parcel was not restored")?
-        .id;
+    let lot = {
+        let map = ctx.sim.map();
+        let mut lots: Vec<_> = map.lots().values().collect();
+        lots.sort_unstable_by(|a, b| {
+            let distance = |lot: &simulation::map::Lot| {
+                lot.shape.center().distance2(parcel.shape.center())
+            };
+            distance(a).total_cmp(&distance(b)).then(a.id.cmp(&b.id))
+        });
+        lots.into_iter()
+            .find(|lot| {
+                WorldCommand::MapBuildHouse(lot.id)
+                    .validate_and_price(&ctx.sim)
+                    .is_ok()
+            })
+            .ok_or("no legal replacement lot near the demolished worker home")?
+            .id
+    };
     run_teardown_batch(ctx, &[WorldCommand::MapBuildHouse(lot)], 1)?;
     Ok(true)
 }

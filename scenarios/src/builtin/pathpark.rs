@@ -136,12 +136,27 @@ fn setup_at(
         }
         sites.push(building);
     }
-    for (kind, pick) in [
+    for (kind, preferred) in [
         (GarageKind::MultiStorey, point(150., 118.)),
         (GarageKind::Underground, point(364., 81.)),
     ] {
-        let entrance = parking_entrance_near(&sim.map(), pick).ok_or("no garage entrance")?;
-        sim.apply_commands([&WorldCommand::MapPlaceParkingGarage { kind, entrance }]);
+        let map = sim.map();
+        let command = [
+            preferred,
+            point(374., 81.),
+            point(400., 81.),
+            point(300., 261.),
+            point(180., 261.),
+            point(300., 298.),
+            point(180., 298.),
+        ]
+        .into_iter()
+        .filter_map(|pick| parking_entrance_near(&map, pick))
+        .map(|entrance| WorldCommand::MapPlaceParkingGarage { kind, entrance })
+        .find(|command| command.validate_and_price(sim).is_ok())
+        .ok_or_else(|| format!("no feasible {kind:?} garage entrance"))?;
+        drop(map);
+        sim.apply_commands([&command]);
         let outcome = sim
             .read::<CommandOutcomes>()
             .parking_garage(0)
