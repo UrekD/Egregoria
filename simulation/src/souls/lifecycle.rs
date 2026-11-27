@@ -145,11 +145,15 @@ pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>)
 }
 
 fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: bool) -> bool {
+    if super::service_dispatch::clearance_blocked(sim, id) {
+        return false;
+    }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let removed = sim.map_mut().remove_building(id);
     let Some(building) = removed else {
         return false;
     };
+    super::service_dispatch::release_station(sim, id);
     super::events::remove_incident(sim, id);
     super::demolition::forget_site(sim, id);
     residence::on_building_removed(sim, id);

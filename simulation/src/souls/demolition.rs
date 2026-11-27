@@ -32,6 +32,14 @@ pub enum DemolitionPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearanceBlocker {
+    Land(LandDenial),
+    Water,
+    WorkLimit,
+    Responders,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemolitionQuote {
     pub policy: u16,
     pub signature: u64,
@@ -60,7 +68,7 @@ pub struct DemolitionView {
     pub quote: Option<DemolitionQuote>,
     pub phase: Option<DemolitionPhase>,
     pub progress_percent: u8,
-    pub blocker: Option<LandDenial>,
+    pub blocker: Option<ClearanceBlocker>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -69,7 +77,7 @@ struct DemolitionJob {
     accepted_at: Tick,
     work_started: Option<Tick>,
     next_update: Tick,
-    blocked: Option<LandDenial>,
+    blocked: Option<ClearanceBlocker>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -103,6 +111,45 @@ fn deserialize_sites<'de, D: serde::Deserializer<'de>>(
 ) -> Result<BTreeMap<BuildingID, SiteRemnant>, D::Error> {
     // The map's occupied site table is separately validated against these records.
     deserialize_map::<_, _, 262_144>(d)
+}
+
+pub(crate) fn decode_wave1(bytes: &[u8]) -> std::io::Result<SiteRemnants> {
+    #[derive(Deserialize)]
+    struct Wave1Job {
+        quote: DemolitionQuote,
+        accepted_at: Tick,
+        work_started: Option<Tick>,
+        next_update: Tick,
+        blocked: Option<LandDenial>,
+    }
+    #[derive(Deserialize)]
+    struct Wave1Remnant {
+        original_kind: BuildingKind,
+        cause: SiteRemnantCause,
+        job: Option<Wave1Job>,
+    }
+    #[derive(Deserialize)]
+    struct Wave1Remnants {
+        #[serde(deserialize_with = "deserialize_map::<_, _, 262_144>")]
+        sites: BTreeMap<BuildingID, Wave1Remnant>,
+    }
+    let legacy: Wave1Remnants = Bincode::decode(bytes)?;
+    Ok(SiteRemnants {
+        sites: legacy.sites.into_iter().map(|(site, remnant)| {
+            (site, SiteRemnant {
+                original_kind: remnant.original_kind,
+                cause: remnant.cause,
+                job: remnant.job.map(|job| DemolitionJob {
+                    quote: job.quote,
+                    accepted_at: job.accepted_at,
+                    work_started: job.work_started,
+                    next_update: job.next_update,
+                    blocked: job.blocked.map(ClearanceBlocker::Land),
+                }),
+            })
+        }).collect(),
+        due: BTreeSet::new(),
+    })
 }
 
 pub type DemolitionError = Rejection;
@@ -378,11 +425,14 @@ pub(crate) fn demolition_update(sim: &mut Simulation) {
                 job.next_update = Tick(now.0.saturating_add(duration(job.quote)));
             }
         } else {
-            let result = sim
-                .map()
-                .authorize_building_removal_budgeted(site, &mut remaining);
+            let result = if super::service_dispatch::clearance_blocked(sim, site) {
+                Err(ClearanceBlocker::Responders)
+            } else {
+                sim.map().prepare_demolition_clearance(site, &mut remaining)
+            };
             match result {
                 Ok(()) => {
+                    super::service_dispatch::release_station(sim, site);
                     sim.map_mut()
                         .clear_prepared_building(site)
                         .expect("scheduled site still occupies the map");

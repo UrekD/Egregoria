@@ -92,7 +92,7 @@ impl Lot {
         if include_lots {
             filter = filter | ProjectFilter::LOT;
         }
-        map.spatial_map.query(shape, filter).next().is_some()
+        map.service_apron_overlaps(&shape) || map.spatial_map.query(shape, filter).next().is_some()
             || map
                 .spatial_map
                 .query(Polygon::from(shape.corners.as_slice()), ProjectFilter::ROAD)

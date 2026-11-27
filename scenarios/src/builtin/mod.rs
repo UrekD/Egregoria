@@ -14,7 +14,7 @@ mod water_basic;
 pub mod water_fixtures;
 mod zones2;
 
-use crate::builders::{grid_city, place_company, place_grid_power_plant, place_service_sites};
+use crate::builders::{grid_city, place_company, place_grid_power_plant};
 use crate::{Scenario, ScenarioCtx};
 use geom::vec2;
 use simulation::SimulationOptions;
@@ -27,6 +27,9 @@ pub const PERF_10K: (Scenario, SimulationOptions) = (
     perf::OPTIONS,
 );
 
+pub const P9_SCALE: (Scenario, SimulationOptions) = fire::SCALE;
+pub const P9_SOAK: (Scenario, SimulationOptions) = fire::SOAK;
+
 pub const ZONES2_L3: (Scenario, SimulationOptions) = zones2::ATTAINMENT;
 
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
@@ -38,6 +41,8 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
         budget_day::SCENARIO.1,
     ),
     economy_loop::SCENARIO,
+    fire::RESPONSE,
+    fire::REPAIR,
     fire::RUINS,
     fire::RESUME,
     growth_basic::SCENARIO,
@@ -81,7 +86,7 @@ fn run_served_budget_day(ctx: &mut ScenarioCtx) -> Result<(), String> {
     grid_city(ctx, vec2(700.0, 475.0), 1, 2, 225.0);
     let spur_origin = vec2(700.0, 500.0);
     let plant = place_grid_power_plant(ctx, spur_origin)?;
-    let sites = place_service_sites(
+    let sites = services_basic::place_prevention_fixture_services(
         ctx,
         spur_origin,
         [

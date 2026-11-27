@@ -448,9 +448,18 @@ fn p7_snapshot_loads_p6_slot_with_recorded_replay() {
     assert!(replay.obsolete_recording_discarded());
     assert_eq!(replay.command_count(), 0);
     drop(replay);
-    city.save_to_slot(&root.0, &id, SnapshotRevision::new(2))
-        .unwrap();
-    let reopened = Simulation::load_from_slot(&root.0, &id).unwrap();
+    let original_snapshot = fs::read(&paths.zip).unwrap();
+    let original_replay = fs::read(&paths.replay).unwrap();
+    assert!(city.save_to_slot(&root.0, &id, SnapshotRevision::new(2)).is_err());
+    let migrated = SlotId::new("migrated").unwrap();
+    let cancelled = city.encode_slot(SnapshotRevision::new(2)).unwrap()
+        .publish_with_gate(&root.0, &migrated, || None::<()>);
+    assert!(cancelled.is_none());
+    assert_eq!(fs::read(&paths.zip).unwrap(), original_snapshot);
+    assert_eq!(fs::read(&paths.replay).unwrap(), original_replay);
+    city.save_to_slot(&root.0, &migrated, SnapshotRevision::new(3)).unwrap();
+    let reopened = Simulation::load_from_slot(&root.0, &migrated).unwrap();
+    assert!(reopened.read::<Replay>().migrated_city());
     assert_eq!(reopened.hashes(), city.hashes());
     assert!(!reopened
         .read::<crate::Replay>()

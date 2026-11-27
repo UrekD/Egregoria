@@ -237,6 +237,35 @@ impl ScenarioCtx {
         self.executed_ticks - before
     }
 
+    pub(crate) fn measure_fire_window(&mut self, label: &str, ticks: u64) -> (f64, f64) {
+        let mut samples = Vec::new();
+        let mut phases = BTreeMap::new();
+        for _ in 0..ticks {
+            self.run_ticks(1);
+            let mut total = 0.0;
+            for (name, ms) in self.sched.latest_samples().filter(|(name, _)| {
+                matches!(*name, "advance_fire_trips" | "events_update" | "demolition_update" | "dispatch_fire")
+            }) {
+                total += f64::from(ms);
+                let (sum, max) = phases.entry(name).or_insert((0.0, 0.0_f64));
+                *sum += f64::from(ms);
+                *max = max.max(f64::from(ms));
+            }
+            samples.push(total);
+        }
+        samples.sort_unstable_by(f64::total_cmp);
+        let peak = *samples.last().expect("nonempty scale window");
+        let p99 = samples[(samples.len() * 99).div_ceil(100) - 1];
+        eprintln!("P9 {label}: summed p99 {p99:.3} ms, peak {peak:.3} ms over {ticks} ticks");
+        self.sample(label);
+        let extra = &mut self.samples.last_mut().unwrap().extra;
+        extra.extend([("p9_p99_ms".into(), p99), ("p9_peak_ms".into(), peak)]);
+        for (phase, (sum, max)) in phases {
+            extra.extend([(format!("{phase}_elapsed_ms"), sum), (format!("{phase}_peak_ms"), max)]);
+        }
+        (p99, peak)
+    }
+
     /// Collect raw per-tick timing samples for the perf JSON report.
     pub fn enable_perf_timings(&mut self) {
         self.perf_timings = Some(PerfTimingRecorder::default());
@@ -296,6 +325,7 @@ impl ScenarioCtx {
                 (MEDIAN_TICKS_PER_SEC.to_string(), median_ticks_per_sec),
                 (P95_MS_PER_TICK.to_string(), percentile_ms(95)),
                 (P99_MS_PER_TICK.to_string(), percentile_ms(99)),
+                ("max_ms_per_tick".to_string(), times[n - 1].as_secs_f64() * 1_000.0),
             ]);
         }
         self.sample_with_extra(label, extra)
@@ -327,6 +357,9 @@ impl ScenarioCtx {
             ticks_per_sec,
             extra,
         };
+        if let Some(path) = std::env::var_os("EGR_P9_WORKLOAD_FILE") {
+            write_p9_workload(&self.sim, &sample, path);
+        }
         self.samples.push(sample.clone());
         sample
     }
@@ -940,4 +973,41 @@ mod tests {
             })
         );
     }
+}
+
+fn write_p9_workload(sim: &Simulation, sample: &MetricSample, path: std::ffi::OsString) {
+    use std::io::Write;
+
+    let map = sim.map();
+    let world = sim.world();
+    let topology = map.roads().values().map(|road| {
+        let lanes: Vec<_> = road.lanes_iter().map(|(id, kind)| {
+            let lane = map.get(id).expect("road lane");
+            serde_json::json!([kind as u8, lane.speed_limit, lane.points.as_slice()])
+        }).collect();
+        serde_json::json!([road.points().as_slice(), lanes])
+    }).collect::<Vec<_>>();
+    let traffic = world.humans.values().map(|human| {
+        let work = human.work.as_ref().map(|work| work.workplace);
+        serde_json::json!([human.home.house, work, human.router.target_dest])
+    }).collect::<Vec<_>>();
+    let record = serde_json::json!({
+        "label": sample.label,
+        "tick": sample.tick,
+        "topology": topology,
+        "sites": map.buildings().len(),
+        "population": sim.population_scale().persons(sample.humans),
+        "employed": sim.population_scale().persons(sample.extra["employed"] as usize),
+        "jobs": world.companies.values().map(|company| u64::from(company.comp.max_workers)).sum::<u64>(),
+        "buildings": map.buildings().len(),
+        "services": map.buildings().values().filter(|building| {
+            building.kind.as_goods_company().is_some_and(|id| id.is_service())
+        }).count(),
+        "parked_fleet": world.vehicles.values().filter(|vehicle| vehicle.vehicle.state.is_parked()).count(),
+        "traffic_demand": traffic,
+    });
+    let mut file = std::fs::OpenOptions::new().append(true).create(true).open(path)
+        .expect("open benchmark workload artifact");
+    serde_json::to_writer(&mut file, &record).expect("write benchmark workload artifact");
+    writeln!(file).expect("finish benchmark workload record");
 }

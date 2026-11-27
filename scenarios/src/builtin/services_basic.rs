@@ -1,6 +1,6 @@
 use crate::builders::{
     grid_city, paint_zone_blocks, place_freight_station, place_grid_power_plant,
-    place_service_sites, SCHOOL_SITE, UTILITY_SITES,
+    grant_money, place_service_sites, SCHOOL_SITE, UTILITY_SITES,
 };
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2};
@@ -38,6 +38,68 @@ const COVERAGE_SITES: [(&str, Vec2); 6] = [
     ("garbage-depot", vec2(125.0, 450.0)),
     ("park", vec2(175.0, 350.0)),
 ];
+
+/// These coverage fixtures model a city with legacy prevention services already installed.
+pub(super) fn place_prevention_fixture_services(
+    ctx: &mut ScenarioCtx,
+    origin: Vec2,
+    sites: impl IntoIterator<Item = (&'static str, Vec2)>,
+) -> Result<Vec<BuildingID>, String> {
+    sites.into_iter().map(|(name, offset)| {
+        let near = origin + offset;
+        if name == "fire-station" {
+            placement_before_aprons(ctx, near)
+                .ok_or_else(|| format!("could not place {name} at {offset:?}"))
+        } else {
+            place_service_sites(ctx, origin, [(name, offset)]).map(|sites| sites[0])
+        }
+    }).collect()
+}
+
+fn placement_before_aprons(ctx: &mut ScenarioCtx, near: Vec2) -> Option<BuildingID> {
+    use geom::OBB;
+    use prototypes::{try_prototype, GoodsCompanyID};
+    use simulation::map::{Map, ProjectFilter, ProjectKind};
+
+    let proto = try_prototype(GoodsCompanyID::new("fire-station"))?;
+    let (road, shape) = {
+        let map = ctx.sim.map();
+        let mut sites = Vec::new();
+        let occupied = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
+        for object in map.spatial_map().query_around(near, 250.0, ProjectFilter::ROAD) {
+            let ProjectKind::Road(id) = object else { continue };
+            let Some(road) = map.get(id) else { continue };
+            if road.sidewalks(road.src).incoming.is_none() {
+                continue;
+            }
+            let points = road.points();
+            let (nearest, segment) = points.project_segment_2d(near);
+            let Some(tangent) = points.segment_vec(segment.saturating_sub(1)) else { continue };
+            for (point, tangent) in [(nearest, tangent), points.point_dir_along(points.length() * 0.5)] {
+                let Some(direction) = tangent.xy().try_normalize() else { continue };
+                let side = direction.perpendicular();
+                for outward in [side, -side] {
+                    let center = point.xy() + outward * (0.5 * (road.width + proto.size.w) + 1.0);
+                    let shape = OBB::new(center, outward, proto.size.w, proto.size.h);
+                    if map.environment().height(center).is_some()
+                        && !map.spatial_map().query(shape, occupied).any(|other| other != object)
+                    {
+                        sites.push((center.distance2(near), road.id, shape));
+                    }
+                }
+            }
+        }
+        let (_, road, shape) = sites.into_iter().min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))?;
+        (road, shape)
+    };
+    let id = ctx.sim.write::<Map>().build_special_building(
+        &shape, BuildingKind::GoodsCompany(proto.id), proto.bgen, None, Some(road),
+    )?;
+    ctx.sim.write::<BuildingInfos>().insert(id);
+    grant_money(ctx, -proto.price);
+    ctx.run_ticks(1);
+    Some(id)
+}
 
 static BASELINE: OnceLock<Metrics> = OnceLock::new();
 
@@ -103,7 +165,7 @@ fn run_to(ctx: &mut ScenarioCtx, coverage_services: bool, resume: bool) -> Resul
     let coverage_sites = coverage_services
         .then_some(COVERAGE_SITES.as_slice())
         .unwrap_or(&[]);
-    let services = place_service_sites(
+    let services = place_prevention_fixture_services(
         ctx,
         ORIGIN,
         UTILITY_SITES

@@ -22,6 +22,7 @@ pub mod human;
 pub mod lifecycle;
 pub mod residence;
 pub mod service_access;
+pub mod service_dispatch;
 
 /// Adds souls to empty buildings
 pub(crate) fn add_souls_to_empty_buildings(sim: &mut Simulation) {

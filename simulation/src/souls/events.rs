@@ -291,7 +291,18 @@ pub fn events_update(sim: &mut Simulation) {
             };
             let incident = incidents.active.get_mut(&id).expect("scheduled incident");
             let minutes = tick.0.saturating_sub(incident.last_update.0) / TICKS_PER_MINUTE;
-            incident.damage = (u64::from(incident.damage) + minutes).min(LOSS_MINUTES) as u8;
+            let working = sim.read::<super::service_dispatch::FireFleet>()
+                .suppression_started(id, incident.id);
+            let working_minutes = working.map_or(0, |start| tick.0.saturating_sub(start.0) / TICKS_PER_MINUTE);
+            if working_minutes >= super::service_dispatch::SUPPRESSION_MINUTES {
+                incidents.active.remove(&id);
+                history.record(tick, id, FireEventKind::Extinguished);
+                continue;
+            }
+            let exposed_minutes = working.map_or(minutes, |start| {
+                start.0.saturating_sub(incident.last_update.0) / TICKS_PER_MINUTE
+            }).min(minutes);
+            incident.damage = (u64::from(incident.damage) + exposed_minutes).min(LOSS_MINUTES) as u8;
             if incident.damage == LOSS_MINUTES as u8 {
                 incidents.active.remove(&id);
                 history.record(tick, id, FireEventKind::Collapsed);
@@ -299,7 +310,8 @@ pub fn events_update(sim: &mut Simulation) {
                 continue;
             }
             incident.position = building.obb.center().z(building.height);
-            incident.intensity = (1 + incident.damage / 10).min(9);
+            incident.intensity = (1 + incident.damage / 10).min(9)
+                .saturating_sub(working_minutes as u8).max(1);
             incident.last_update.0 += minutes * TICKS_PER_MINUTE;
             incident.next_update = Tick(incident.last_update.0.saturating_add(TICKS_PER_MINUTE));
             let next_update = incident.next_update;
@@ -370,6 +382,9 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
             .fold(0, |state, field| splitmix64(state ^ field));
         if u128::from(roll) < threshold {
             incidents.counters.spontaneous += 1;
+            if benchmark_suppresses_fire_offers() {
+                continue;
+            }
             incidents.offer(Offer {
                 due: Tick(minute * TICKS_PER_MINUTE),
                 site,
@@ -380,6 +395,14 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
         incidents.next_risk_minute += 1;
         incidents.cohort_after = None;
     }
+}
+
+// Only the source-pinned background benchmark sets this process option.
+fn benchmark_suppresses_fire_offers() -> bool {
+    static BACKGROUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BACKGROUND.get_or_init(|| {
+        std::env::var_os("EGR_P9_BENCH_PROFILE").is_some_and(|value| value == "background")
+    })
 }
 
 fn eligible(building: &Building) -> bool {

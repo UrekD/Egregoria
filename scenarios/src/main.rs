@@ -1,5 +1,5 @@
 use scenarios::builtin::{
-    demo_cities, growth_basic, perf, water_fixtures, zones2_scenarios, PERF_10K, SCENARIOS,
+    demo_cities, growth_basic, perf, water_fixtures, zones2_scenarios, P9_SCALE, P9_SOAK, PERF_10K, SCENARIOS,
 };
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
@@ -25,7 +25,7 @@ fn usage() -> String {
     let names = SCENARIOS
         .iter()
         .map(|(scenario, _)| scenario.name)
-        .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
+        .chain([P9_SCALE.0.name, P9_SOAK.0.name, PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
         .join("|");
     format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios traffic-repair compare --fixtures repair-cohort,repair-no-loss [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair compare --root DIR --fixtures ID --edit QUOTE.json [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair soak --root DIR --fixtures ID --days N [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair perf --agents N --layout compact|growing --warmup W --ticks T --pairs N --modes LIST [--manifest PATH] [--json PATH]\n       scenarios traffic-repair stage --manifest PATH --class release|diagnostic --out DIR [--bundle-root DIR] [--run-source SHA]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
@@ -248,7 +248,7 @@ fn run() -> Result<(), String> {
         "zones2_staged" => zones2_scenarios().collect(),
         _ => SCENARIOS
             .iter()
-            .chain(std::iter::once(&PERF_10K))
+            .chain([&P9_SCALE, &P9_SOAK, &PERF_10K])
             .filter(|(scenario, _)| scenario.name == name)
             .collect(),
     };

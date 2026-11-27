@@ -148,18 +148,43 @@ fn build_district(
         ("coal-mine", vec2(540.0, 625.0)),
         ("bakery", vec2(570.0, 102.0)),
     ];
-    place_service_sites(
-        ctx,
-        ORIGIN,
-        UTILITY_SITES
-            .into_iter()
-            .chain(
-                services
-                    .into_iter()
-                    .filter(|&(name, _)| with_health || name != "clinic"),
-            )
-            .chain(extra_sites.iter().copied()),
-    )?;
+    for (name, offset) in UTILITY_SITES
+        .into_iter()
+        .chain(services.into_iter().filter(|&(name, _)| with_health || name != "clinic"))
+        .chain(extra_sites.iter().copied())
+    {
+        if name == "fire-station" {
+            // Keep the original west frontage while leaving room for the bay
+            // and boarding pocket between the building and the sidewalk.
+            let command = {
+                let map = ctx.sim.map();
+                let frontage = ORIGIN + vec2(0.0, offset.y);
+                let height = map.environment().height(frontage).ok_or("missing fire frontage terrain")?;
+                let project = map.project(frontage.z(height), 0.0, ProjectFilter::ROAD);
+                let ProjectKind::Road(road) = project.kind else {
+                    return Err("missing west road for the fire station".into());
+                };
+                let proto = try_prototype(prototypes::GoodsCompanyID::new(name)).expect("stock fire station");
+                let outward = -Vec2::X;
+                let setback = 0.5 * (map.roads()[road].width + proto.size.w) + 12.5;
+                WorldCommand::MapBuildSpecialBuilding {
+                    pos: geom::OBB::new(frontage + outward * setback, outward, proto.size.w, proto.size.h),
+                    kind: BuildingKind::GoodsCompany(proto.id),
+                    gen: proto.bgen,
+                    zone: None,
+                    connected_road: Some(road),
+                }
+            };
+            ctx.submit(&[command]);
+            ctx.flush();
+            let outcomes = ctx.sim.read::<CommandOutcomes>();
+            if !outcomes.last.is_empty() {
+                return Err(format!("could not commission the west fire station: {:?}", outcomes.last));
+            }
+        } else {
+            place_service_sites(ctx, ORIGIN, [(name, offset)])?;
+        }
+    }
     Ok(freight)
 }
 
@@ -854,6 +879,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     let mut disconnected = reload_abandoned()?;
     for run in [&mut disconnected, &mut resumed] {
         run_teardown_batch(run, &erasures, 13 * TICKS_PER_HOUR)?;
+        clear_decline_ruins(run, parcels.iter().map(|&(site, _, _)| site))?;
         let map = run.sim.map();
         for &(id, origin, _) in &parcels {
             if map.get(id).is_some()
@@ -863,7 +889,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                     .any(|lot| lot.shape.center().distance2(origin.shape.center()) < 0.01)
             {
                 return Err(format!(
-                    "collapse without frontage retained the shell or restored a parcel for {id:?}"
+                    "clearance without frontage retained the shell or restored a parcel for {id:?}"
                 ));
             }
         }
@@ -892,6 +918,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     for run in [&mut *live, &mut resumed] {
         run_teardown_batch(run, &repairs, 13 * TICKS_PER_HOUR)?;
+        clear_decline_ruins(run, parcels.iter().map(|&(site, _, _)| site))?;
         let map = run.sim.map();
         for &(id, origin, zone) in &parcels {
             if map.get(id).is_some()
@@ -902,7 +929,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                 })
             {
                 return Err(format!(
-                    "timed collapse did not restore usable frontage for {id:?}"
+                    "paid clearance did not restore usable frontage for {id:?}"
                 ));
             }
         }
@@ -937,6 +964,29 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
 }
 
+fn clear_decline_ruins(
+    ctx: &mut ScenarioCtx,
+    sites: impl IntoIterator<Item = BuildingID>,
+) -> Result<(), String> {
+    let mut commands = Vec::new();
+    let mut longest = 0;
+    for site in sites {
+        if !ctx.sim.map().is_ruined(site) {
+            return Err(format!("site {site:?} did not become a ruin"));
+        }
+        let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, site)
+            .map_err(|error| format!("clearance quote for {site:?} failed: {error:?}"))?
+            .quote;
+        longest = longest.max(u64::from(quote.minutes));
+        commands.push(WorldCommand::MapStartDemolition { site, quote });
+    }
+    for batch in commands.chunks(32) {
+        run_teardown_batch(ctx, batch, 1)?;
+    }
+    ctx.run_ticks(longest * prototypes::TICKS_PER_MINUTE);
+    Ok(())
+}
+
 fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // The district's housing is full. Record a demolition that frees storefront
     // jobs while baskets and deliveries are in flight. The next market pass can
@@ -964,9 +1014,10 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
     };
-    ctx.remove_fixture_site(home)?;
-    ctx.run_ticks(1);
-    Ok(())
+    let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, home)
+        .map_err(|error| format!("worker housing demolition quote failed: {error:?}"))?
+        .quote;
+    run_teardown_batch(ctx, &[WorldCommand::MapStartDemolition { site: home, quote }], 1)
 }
 
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {

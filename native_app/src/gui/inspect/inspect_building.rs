@@ -113,6 +113,9 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     let age = elapsed_tick(sim).0.saturating_sub(incident.alarm_tick.0) / prototypes::TICKS_PER_MINUTE;
                     textc(error(), format!("Fire intensity {} · {} min since alarm", incident.intensity, age));
                     label(format!("Structural damage  {}%", u16::from(incident.damage) * 100 / 85));
+                    if let Some(reason) = simulation::souls::service_dispatch::fire_response_blocker(sim, id) {
+                        label(inspect_service::fire_blocker_label(reason));
+                    }
                 }
                 match building.kind {
                     BuildingKind::SiteRemnant => render_remnant(uiworld, sim, id),

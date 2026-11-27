@@ -532,6 +532,16 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
         resumed.tick(&mut resumed_sched, []);
     }
     assert_eq!(sim.hashes(), resumed.hashes());
+    assert!(sim.map().is_ruined(regrown));
+    let quote = crate::souls::demolition::demolition_quote(&sim, regrown).unwrap().quote;
+    let clear = WorldCommand::MapStartDemolition { site: regrown, quote };
+    sim.apply_commands([&clear]);
+    resumed.apply_commands([&clear]);
+    for _ in 0..u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE {
+        sim.tick(&mut sched, []);
+        resumed.tick(&mut resumed_sched, []);
+    }
+    assert_eq!(sim.hashes(), resumed.hashes());
     {
         let map = sim.map();
         assert!(map.get(regrown).is_none());

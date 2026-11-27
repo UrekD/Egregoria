@@ -342,6 +342,15 @@ impl Itinerary {
         }
     }
 
+    pub(crate) fn service_sweep(points: &[Vec3]) -> Self {
+        let terminal = *points.last().expect("a checked apron has swept waypoints");
+        Self {
+            kind: ItineraryKind::Simple(terminal),
+            reversed_local_path: points.iter().rev().copied().collect(),
+            ..Self::default()
+        }
+    }
+
     pub fn wait_until(x: f64) -> Self {
         Self {
             kind: ItineraryKind::WaitUntil(x),
@@ -421,6 +430,40 @@ impl Itinerary {
         let start = driving_lane_points(map, start_lane, start_offset)?.point_along(start_offset);
         let target = ItineraryTarget::DirectedLane(end_lane, end_offset);
         Self::route_from(tick, start, start_lane, target, map, PathKind::Vehicle)
+    }
+
+    /// Installs a checked, reversed lane/turn path without starting a second search.
+    pub(crate) fn service_drive(
+        map: &Map,
+        from: crate::souls::service_access::DirectedLaneAnchor,
+        to: crate::souls::service_access::DirectedLaneAnchor,
+        reversed_route: Vec<Traversable>,
+    ) -> Option<Self> {
+        let start = from.offset_cm as f32 / 100.0;
+        let end_offset = to.offset_cm as f32 / 100.0;
+        let points = driving_lane_points(map, from.lane, start)?;
+        let target = ItineraryTarget::DirectedLane(to.lane, end_offset);
+        let end_pos = driving_lane_points(map, to.lane, end_offset)?.point_along(end_offset);
+        let start_pos = points.point_along(start);
+        let mut local = if reversed_route.is_empty() {
+            directed_local_path(points, start_pos, end_offset, end_pos)?
+        } else {
+            directed_local_path(points, start_pos, points.length(), points.last())?
+        };
+        local.reverse();
+        Some(Self {
+            kind: ItineraryKind::Route(
+                Route {
+                    reversed_route,
+                    end_pos,
+                    cur: Traversable::new(TraverseKind::Lane(from.lane), TraverseDirection::Forward),
+                    target,
+                },
+                PathKind::Vehicle,
+            ),
+            reversed_local_path: local,
+            ..Self::default()
+        })
     }
 
     pub(crate) fn route_rail(
@@ -1483,10 +1526,14 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     // Boarding and routing have settled. Build grants from one frozen view
     // before any user's final itinerary movement.
     let mut junction_state = resources.write::<JunctionAdmission>();
+    let fleet = resources.read::<crate::souls::service_dispatch::FireFleet>();
     let mut junction_frame = if map.has_junction_controller() {
         let mut grid = resources.write::<TransportGrid>();
         grid.refresh_admission_colliders(world);
-        JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick)
+        let incidents = resources.read::<crate::souls::events::ServiceIncidents>();
+        JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick, &|truck| {
+            fleet.is_live_outbound(world, &incidents, truck)
+        })
     } else {
         junction_state.clear();
         JunctionFrame::default()
@@ -1542,7 +1589,12 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             speed * DELTA,
             time.seconds,
             map,
-            |start, target, kind| failures.route(time.tick, start, target, map, kind),
+            |start, target, kind| {
+                if truck.is_some_and(|truck| fleet.owns_truck(truck)) {
+                    return None;
+                }
+                failures.route(time.tick, start, target, map, kind)
+            },
             record,
             admission.as_mut(),
             |traversal, from, to| {

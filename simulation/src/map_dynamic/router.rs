@@ -1204,7 +1204,7 @@ impl Router {
         selected || self.plans_with(id)
     }
 
-    pub(crate) fn cancel_route(&mut self, parking: &mut ParkingManagement) {
+    pub fn cancel_route(&mut self, parking: &mut ParkingManagement) {
         if matches!(self.cur_step, Some(RoutingStep::RideTransit { .. })) {
             self.defer_replan();
             return;

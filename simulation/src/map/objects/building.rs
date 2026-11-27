@@ -224,6 +224,14 @@ impl PreparedGrowableAppearance {
 pub(in crate::map) struct PreparedBuilding(Building);
 
 impl PreparedBuilding {
+    pub(in crate::map) fn connected_road(&self) -> Option<RoadID> {
+        self.0.connected_road
+    }
+
+    pub(in crate::map) fn door(&self) -> Vec3 {
+        self.0.door_pos
+    }
+
     pub(in crate::map) fn base_height(&self) -> f32 {
         self.0.height
     }

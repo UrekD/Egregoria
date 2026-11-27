@@ -347,9 +347,15 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             _ => {}
         }
 
+        let camera = uiworld.camera().camera;
         if mode == OverlayMode::Coverage(ServiceKind::Fire) {
-            for incident in sim.read::<simulation::souls::events::ServiceIncidents>().active() {
-                draw.circle(incident.position.up(0.4), 4.0).color(simulation::colors().gui_danger);
+            if let Some(bounds) = view::bounds(&camera, &map) {
+                for incident in sim.read::<simulation::souls::events::ServiceIncidents>().active() {
+                    if bounds.contains(incident.position.xy()) {
+                        draw.circle(incident.position.up(0.4), 4.0)
+                            .color(simulation::colors().gui_danger);
+                    }
+                }
             }
         }
 
@@ -357,7 +363,6 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             draw_selected_service_ring(uiworld, &map, kind, &mut draw);
         }
 
-        let camera = uiworld.camera().camera;
         let projection = *camera.proj_cache.as_ref();
         if rebuild || cache.projection != projection {
             cache.projection = projection;

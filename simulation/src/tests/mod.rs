@@ -507,6 +507,7 @@ impl TestCtx {
 
     pub(crate) fn remove_fixture_building(&mut self, building: BuildingID) {
         assert!(crate::souls::lifecycle::remove_site(&mut self.g, building));
+        crate::utils::scheduler::drain_commands(&mut self.g);
     }
 
     pub(crate) fn tick_fast(&mut self) {

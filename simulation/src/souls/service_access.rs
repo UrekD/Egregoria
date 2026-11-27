@@ -1,12 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use geom::{PolyLine3, Segment3, Shape, Spline3, Transform, Vec3, OBB};
+use geom::{Intersect, PolyLine3, Segment3, Shape, Spline3, Transform, Vec3, OBB};
 use ordered_float::OrderedFloat;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
+use serde::{Deserialize, Serialize};
 
 use crate::map::{
-    BuildingID, Lane, LaneID, LaneKind, Map, ParkingSpotID, PreparedEffects, ProjectFilter, RoadID,
+    BuildingID, BuildingKind, Lane, LaneID, LaneKind, Map, ParkingSpotID, PreparedEffects,
+    ProjectFilter, RoadID, Traversable, TraverseDirection, TraverseKind, TurnID, TurnKind,
     ROAD_Z_OFFSET,
 };
 use crate::map_dynamic::ParkingManagement;
@@ -16,9 +18,9 @@ use crate::Simulation;
 const STEPS: usize = 16;
 const CLEARANCE: f32 = 0.5;
 const MAX_LOCAL_GRADE: f32 = 0.6;
-const APRON_WORK: usize = 4096;
+pub(crate) const APRON_WORK: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessError {
     MissingStation,
     MissingFrontage,
@@ -27,28 +29,32 @@ pub enum AccessError {
     NoReturnLoop,
     OccupiedCurb,
     WorkLimit,
+    AlreadyCommissioned,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectedLaneAnchor {
     pub lane: LaneID,
     pub offset_cm: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FireApronPreview {
     pub road: RoadID,
     pub arrival: DirectedLaneAnchor,
     pub departure: DirectedLaneAnchor,
     pub bay: Transform,
     pub pocket: Vec3,
+    pub(crate) door: Vec3,
+    pub(crate) envelope: OBB,
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 256>")]
     pub parking_displacements: Vec<ParkingSpotID>,
     pub return_drive_ms: u64,
     pub arrival_sweep: [Vec3; STEPS + 1],
     pub departure_sweep: [Vec3; STEPS + 1],
 }
 
-struct AccessBudget(usize);
+pub(crate) struct AccessBudget(pub(crate) usize);
 
 impl AccessBudget {
     fn charge(&mut self, work: usize) -> Result<(), AccessError> {
@@ -62,24 +68,41 @@ pub fn preview_fire_apron(
     sim: &Simulation,
     site: BuildingID,
 ) -> Result<FireApronPreview, AccessError> {
+    if let Some(apron) = super::service_dispatch::commissioned_apron(sim, site) {
+        return Ok(apron);
+    }
     let map = sim.map();
     let station = map
         .get(site)
-        .filter(|building| {
-            building
-                .kind
-                .as_goods_company()
-                .and_then(|id| try_prototype(ServiceID::from(id)))
-                .is_some_and(|proto| proto.service_kind == ServiceKind::Fire)
-        })
+        .filter(|building| is_fire_station(building.kind))
         .ok_or(AccessError::MissingStation)?;
-    let road = station
-        .connected_road
+    check_apron(
+        sim,
+        station.connected_road,
+        station.door_pos,
+        None,
+        &mut AccessBudget(APRON_WORK),
+    )
+}
+
+pub(crate) fn is_fire_station(kind: BuildingKind) -> bool {
+    kind.as_goods_company()
+        .and_then(|id| try_prototype(ServiceID::from(id)))
+        .is_some_and(|proto| proto.service_kind == ServiceKind::Fire)
+}
+
+pub(crate) fn check_apron(
+    sim: &Simulation,
+    road: Option<RoadID>,
+    door: Vec3,
+    proposed_building: Option<OBB>,
+    work: &mut AccessBudget,
+) -> Result<FireApronPreview, AccessError> {
+    let map = sim.map();
+    let road = road
         .and_then(|road| map.get(road))
         .ok_or(AccessError::MissingFrontage)?;
-    let mut work = AccessBudget(APRON_WORK);
-    let door = station.door_pos;
-    let (_, road_offset) = project_offset(road.points(), door, &mut work)?;
+    let (_, road_offset) = project_offset(road.points(), door, work)?;
     let (road_pos, road_direction) = road.points().point_dir_along(road_offset);
     let outward = road_direction.xy().perpendicular();
     let outward = outward * (door.xy() - road_pos.xy()).dot(outward).signum();
@@ -97,7 +120,7 @@ pub fn preview_fire_apron(
             _ => continue,
         };
         let lane = map.get(id).ok_or(AccessError::MissingFrontage)?;
-        let (nearest, offset) = project_offset(&lane.points, door, &mut work)?;
+        let (nearest, offset) = project_offset(&lane.points, door, work)?;
         if kind == LaneKind::Walking && (nearest.xy() - road_pos.xy()).dot(outward) <= 0.0 {
             continue;
         }
@@ -119,9 +142,15 @@ pub fn preview_fire_apron(
     let parking = sim.read::<ParkingManagement>();
     let traffic = sim.read::<TransportGrid>();
     let mut failure = AccessError::NoTruckFit;
-    for shift in [0.0, -16.0, 16.0, -32.0, 32.0] {
-        match frontage.preview(&map, &parking, &traffic, offset + shift, &mut work) {
-            Ok(apron) => return Ok(apron),
+    for shift in [0.0, -16.0, 16.0, -32.0, 32.0, -43.0, 43.0] {
+        match frontage.preview(&map, &parking, &traffic, offset + shift, work) {
+            Ok(apron)
+                if proposed_building.is_none_or(|shape| !shape.intersects(&apron.envelope))
+                    && !map.service_apron_overlaps(&apron.envelope) =>
+            {
+                return Ok(apron)
+            }
+            Ok(_) => failure = AccessError::OccupiedCurb,
             Err(AccessError::WorkLimit) => return Err(AccessError::WorkLimit),
             Err(reason) => failure = reason,
         }
@@ -226,6 +255,13 @@ impl Frontage<'_> {
             }
         }
 
+        for index in 0..=STEPS {
+            work.charge(1)?;
+            let point = pocket.lerp(self.door, index as f32 / STEPS as f32);
+            if !dry(point) {
+                return Err(AccessError::MissingSidewalk);
+            }
+        }
         let intersects_sweep = |pos: Vec3, clearance: f32| {
             [&arrival_sweep, &departure_sweep].into_iter().any(|sweep| {
                 sweep.windows(2).any(|pair| {
@@ -271,13 +307,15 @@ impl Frontage<'_> {
         };
         let arrival = anchor(entry);
         let departure = anchor(exit);
-        let return_drive_ms = return_loop(map, departure, arrival, work)?;
+        let return_drive_ms = drive_route(map, departure, arrival, work)?.0;
         Ok(FireApronPreview {
             road: self.road,
             arrival,
             departure,
             bay,
             pocket,
+            door: self.door,
+            envelope,
             parking_displacements,
             return_drive_ms,
             arrival_sweep,
@@ -319,34 +357,59 @@ fn sweep(from: Transform, to: Transform) -> [Vec3; STEPS + 1] {
     std::array::from_fn(|i| spline.get(i as f32 / STEPS as f32))
 }
 
-fn return_loop(
+pub(crate) fn drive_route(
     map: &Map,
     from: DirectedLaneAnchor,
     to: DirectedLaneAnchor,
     work: &mut AccessBudget,
-) -> Result<u64, AccessError> {
+) -> Result<(u64, Vec<Traversable>), AccessError> {
     let start = map.get(from.lane).ok_or(AccessError::NoReturnLoop)?;
+    let end = map.get(to.lane).ok_or(AccessError::NoReturnLoop)?;
+    let from_m = from.offset_cm as f32 / 100.0;
+    let to_m = to.offset_cm as f32 / 100.0;
+    if from_m > start.points.length()
+        || to_m > end.points.length()
+        || start.kind != LaneKind::Driving
+        || end.kind != LaneKind::Driving
+    {
+        return Err(AccessError::NoReturnLoop);
+    }
     let speed = |lane: &Lane| lane.speed_limit * VehicleKind::Truck.speed_factor();
     let lane_ms = |meters: f32, speed: f32| (1000.0 * meters.max(0.0) / speed).ceil() as u64;
-    let tail = lane_ms(
-        start.points.length() - from.offset_cm as f32 / 100.0,
-        speed(start),
-    );
-    let mut frontier = BinaryHeap::from([Reverse((tail, from.lane, true))]);
-    let mut costs = BTreeMap::new();
-    while let Some(Reverse((ms, id, initial))) = frontier.pop() {
+    let driving = |kind| Traversable::new(kind, TraverseDirection::Forward);
+    if from.lane == to.lane && from_m <= to_m {
+        return Ok((lane_ms(to_m - from_m, speed(start)), vec![]));
+    }
+
+    let tail = lane_ms(start.points.length() - from_m, speed(start));
+    let initial = (from.lane, true);
+    let mut frontier = BinaryHeap::from([Reverse((tail, initial))]);
+    let mut costs: BTreeMap<LaneID, (u64, (LaneID, bool), TurnID)> = BTreeMap::new();
+    while let Some(Reverse((ms, (id, first)))) = frontier.pop() {
         work.charge(1)?;
-        if !initial && costs.get(&id).is_some_and(|&best| best != ms) {
+        if !first && costs.get(&id).is_some_and(|&(best, _, _)| best != ms) {
             continue;
         }
-        if !initial && id == to.lane {
-            return Ok(ms);
+        if !first && id == to.lane {
+            let mut route = vec![];
+            let mut cursor = id;
+            loop {
+                work.charge(2)?;
+                let (_, previous, turn) = costs[&cursor];
+                route.push(driving(TraverseKind::Lane(cursor)));
+                route.push(driving(TraverseKind::Turn(turn)));
+                if previous == initial {
+                    break;
+                }
+                cursor = previous.0;
+            }
+            return Ok((ms, route));
         }
         let lane = map.get(id).ok_or(AccessError::NoReturnLoop)?;
         let junction = map.get(lane.dst).ok_or(AccessError::NoReturnLoop)?;
         for turn in junction.turns() {
             work.charge(1)?;
-            if turn.id.src != id || turn.id.bidirectional {
+            if turn.id.src != id || turn.id.bidirectional || turn.kind != TurnKind::Driving {
                 continue;
             }
             let Some(next) = map
@@ -356,7 +419,7 @@ fn return_loop(
                 continue;
             };
             let distance = if next.id == to.lane {
-                to.offset_cm as f32 / 100.0
+                to_m
             } else {
                 next.points.length()
             };
@@ -364,11 +427,25 @@ fn return_loop(
             let cost = ms
                 .saturating_add(turn_ms)
                 .saturating_add(lane_ms(distance, speed(next)));
-            if costs.get(&next.id).is_none_or(|old| cost < *old) {
-                costs.insert(next.id, cost);
-                frontier.push(Reverse((cost, next.id, false)));
+            if costs.get(&next.id).is_none_or(|&(old, _, _)| cost < old) {
+                costs.insert(next.id, (cost, (id, first), turn.id));
+                frontier.push(Reverse((cost, (next.id, false))));
             }
         }
     }
     Err(AccessError::NoReturnLoop)
+}
+
+pub(crate) fn current_anchor(
+    map: &Map,
+    lane: LaneID,
+    position: Vec3,
+) -> Option<DirectedLaneAnchor> {
+    let lane = map.get(lane)?;
+    let (nearest, offset) =
+        project_offset(&lane.points, position, &mut AccessBudget(APRON_WORK)).ok()?;
+    (nearest.distance2(position) <= 2.25).then_some(DirectedLaneAnchor {
+        lane: lane.id,
+        offset_cm: (offset * 100.0).round() as u32,
+    })
 }

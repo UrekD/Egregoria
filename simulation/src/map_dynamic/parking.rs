@@ -85,6 +85,20 @@ impl ParkingManagement {
         !self.reserved_spots.contains(&spot)
     }
 
+    pub(crate) fn reserve_service_curb(&mut self, spots: &[ParkingSpotID]) -> bool {
+        if spots.iter().any(|spot| self.reserved_spots.contains(spot)) {
+            return false;
+        }
+        self.reserved_spots.extend(spots.iter().copied());
+        true
+    }
+
+    pub(crate) fn release_service_curb(&mut self, spots: &[ParkingSpotID]) {
+        for spot in spots {
+            self.reserved_spots.remove(spot);
+        }
+    }
+
     pub fn reserve_random_free_spot(
         &mut self,
         spots: &ParkingSpots,

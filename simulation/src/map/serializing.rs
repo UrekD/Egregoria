@@ -319,7 +319,10 @@ impl SerializedMap {
             }
         }
         for (id, building) in self.buildings.iter() {
-            if building.obb.corners.iter().any(|point| !point.is_finite())
+            if building.id != id
+                || !building.door_pos.is_finite()
+                || !building.height.is_finite()
+                || building.obb.corners.iter().any(|point| !point.is_finite())
                 || !super::valid_building_index_bounds(building.obb.bbox())
                 || building
                     .zone

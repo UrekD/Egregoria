@@ -133,6 +133,7 @@ const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
 const PRE_FIRE_VERSION: &str = "0.12.0";
+const PRE_FLEET_VERSION: &str = "0.13.0";
 const STOCK_PRE_FIRE_REGISTRY: u64 = 0x3043_cb34_6553_1b7d;
 const STOCK_PRE_SCALE_REGISTRY: u64 = 0x72b8_f131_c320_71d4;
 const VERSION: &str = include_str!("../../VERSION");
@@ -140,6 +141,7 @@ const VERSION: &str = include_str!("../../VERSION");
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SnapshotSchema {
     Current,
+    P9Wave1,
     P7P8,
     P6,
     PreOrigin,
@@ -150,6 +152,7 @@ impl SnapshotSchema {
     fn for_version(version: &str) -> Option<Self> {
         Some(match version {
             VERSION => Self::Current,
+            PRE_FLEET_VERSION => Self::P9Wave1,
             PRE_FIRE_VERSION => Self::P7P8,
             PRE_P7_VERSION => Self::P6,
             PRE_ORIGIN_VERSION => Self::PreOrigin,
@@ -160,10 +163,12 @@ impl SnapshotSchema {
 
     fn registry(self) -> Result<u64, SaveLoadError> {
         let installed = prototypes::try_prototypes().ok_or(SaveLoadError::PrototypeRegistry)?;
-        if self == Self::Current {
+        if matches!(self, Self::Current | Self::P9Wave1) {
             return Ok(installed.fingerprint());
         }
-        if installed.pre_fire_fingerprint() != STOCK_PRE_FIRE_REGISTRY {
+        let projection = installed.pre_fire_fingerprint();
+        let pre_scale_stock = self == Self::PreScale && projection == STOCK_PRE_SCALE_REGISTRY;
+        if projection != STOCK_PRE_FIRE_REGISTRY && !pre_scale_stock {
             return Err(SaveLoadError::PrototypeRegistry);
         }
         Ok(if self == Self::PreScale { STOCK_PRE_SCALE_REGISTRY } else { STOCK_PRE_FIRE_REGISTRY })
@@ -180,6 +185,7 @@ impl SnapshotSchema {
     fn accepts_legacy_replay(self, version: &str) -> bool {
         match self {
             Self::Current => false,
+            Self::P9Wave1 => version == "0.13.0+commands.3",
             Self::P7P8 => version == "0.12.0+commands.2",
             Self::P6 => matches!(version, "0.11.1" | "0.11.1+commands.2"),
             Self::PreOrigin => matches!(version, "0.11.1" | "0.11.1-scale-p1"),
@@ -2099,8 +2105,13 @@ impl SimulationDeser {
             .transpose()
             .map_err(|error| corrupt(error.to_string()))?;
         schema.check_registry(registry)?;
-        for resource in ["service_incidents", "site_remnants"] {
-            if self.res.contains_key(resource) != (schema == SnapshotSchema::Current) {
+        let has_incidents = matches!(schema, SnapshotSchema::Current | SnapshotSchema::P9Wave1);
+        for (resource, required) in [
+            ("service_incidents", has_incidents),
+            ("site_remnants", has_incidents),
+            ("fire_fleet", schema == SnapshotSchema::Current),
+        ] {
+            if self.res.contains_key(resource) != required {
                 return Err(corrupt(format!("Unexpected presence or absence of resource {resource}")));
             }
         }
@@ -2120,7 +2131,14 @@ impl SimulationDeser {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
                 if schema != SnapshotSchema::Current {
                     match l.name {
-                        "service_incidents" | "site_remnants" => continue,
+                        "service_incidents" | "site_remnants" if !has_incidents => continue,
+                        "fire_fleet" => continue,
+                        "site_remnants" if schema == SnapshotSchema::P9Wave1 => {
+                            let remnants = crate::souls::demolition::decode_wave1(&self.res[l.name])
+                                .map_err(|error| corrupt(format!("Could not decode Wave 1 clearance jobs: {error}")))?;
+                            sim.insert(remnants);
+                            continue;
+                        }
                         ReplayJson::RESOURCE_NAME => {
                             let data = self.res.get(l.name)
                                 .ok_or_else(|| corrupt("Missing resource replay".into()))?;
@@ -2146,7 +2164,7 @@ impl SimulationDeser {
         let origin: MapOrigin = match self.res.get("map_origin") {
             Some(bytes) => Bincode::decode(bytes)
                 .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if matches!(schema, SnapshotSchema::Current | SnapshotSchema::P7P8 | SnapshotSchema::P6) => {
+            None if has_incidents || matches!(schema, SnapshotSchema::P7P8 | SnapshotSchema::P6) => {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2168,7 +2186,9 @@ impl SimulationDeser {
             .map_err(|error| corrupt(error.to_string()))?;
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::souls::demolition::restore_remnants(&mut sim).map_err(|reason| corrupt(reason.into()))?;
-        crate::souls::events::restore_incidents(&sim, schema != SnapshotSchema::Current)
+        crate::souls::events::restore_incidents(&sim, !has_incidents)
+            .map_err(|reason| corrupt(reason.into()))?;
+        crate::souls::service_dispatch::restore_fire_fleet(&sim)
             .map_err(|reason| corrupt(reason.into()))?;
         sim.read::<economy::cargo::FreightTrace>()
             .validate_ownership(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
