@@ -2110,13 +2110,19 @@ pub fn build_network(
     let batch_size = if graph.wet { 1 } else { links.len().max(1) };
     let keys: Vec<_> = graph.links.keys().collect();
     for (batch, links) in links.chunks(batch_size).enumerate() {
-        sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(
-            projects.clone(),
-            links.to_vec(),
-        )]);
+        let command = WorldCommand::MapMakeMultipleConnections(projects.clone(), links.to_vec());
+        let base = batch * batch_size;
+        if keys[base..base + links.len()]
+            .iter()
+            .any(|&key| graph.links[key].class == RoadClass::Walk)
+        {
+            sim.apply_authored_connection_batch(&command)
+                .map_err(|reason| format!("CITYMAP authored connection batch rejected {reason:?}"))?;
+        } else {
+            sim.apply_commands([&command]);
+        }
         let outcomes = sim.read::<CommandOutcomes>();
         if !outcomes.last.is_empty() || outcomes.accepted != [0] {
-            let base = batch * batch_size;
             let failed: Vec<_> = outcomes
                 .link_outcomes(0)
                 .iter()
@@ -2502,6 +2508,52 @@ pub fn validate_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn citymap_dry_network_preserves_pedestrian_only_links() {
+        use crate::citymap::{build_dry_town, pinned_test_paths, plan_town, read_inputs, TownConfig};
+        use simulation::world_command::Rejection;
+
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (mut sim, built) = build_dry_town(&plan).unwrap();
+        assert_eq!(built.links.len(), plan.graph.links.len());
+
+        let paths: Vec<_> = plan
+            .graph
+            .links
+            .values()
+            .filter(|link| link.class == RoadClass::Walk)
+            .collect();
+        assert!(!paths.is_empty());
+        let map = sim.map();
+        for link in paths {
+            let road = &map.roads()[built.links[&link.key].road];
+            let kinds: Vec<_> = road.lanes_iter().map(|(_, kind)| kind).collect();
+            assert_eq!(
+                kinds,
+                [LaneKind::Walking, LaneKind::Walking],
+                "{:?}",
+                link.key
+            );
+        }
+        drop(map);
+
+        let player_command = WorldCommand::MapMakeMultipleConnections(
+            vec![
+                MapProject::ground(vec2(20.0, 20.0).z(10.0)),
+                MapProject::ground(vec2(100.0, 20.0).z(10.0)),
+            ],
+            vec![(0, 1, None, RoadClass::Walk.pattern(false, 0.0))],
+        );
+        sim.apply_commands([&player_command]);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(
+            outcomes.rejections_for(0),
+            [("MapMakeMultipleConnections", Rejection::InvalidConnection)]
+        );
+        assert!(outcomes.connection_batch(0).is_none());
+    }
 
     #[test]
     fn citymap_spacing_checks_unlinked_pairs_in_stable_order() {

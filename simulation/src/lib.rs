@@ -707,6 +707,7 @@ impl Simulation {
             replay.commands(1..bootstrap_end),
             false,
             BudgetCategory::StarterInfrastructure,
+            false,
         );
         if options.preset == MapPreset::Waters {
             sim.check_waters_starters().map_err(|reason| {
@@ -783,6 +784,7 @@ impl Simulation {
                 .chain(start_commands.iter().map(|(_, cmd)| cmd)),
             false,
             BudgetCategory::StarterInfrastructure,
+            false,
         );
         if opts.preset == MapPreset::Waters {
             sim.check_waters_starters()?;
@@ -881,7 +883,7 @@ impl Simulation {
         // so that instant commands work on single player but the game is still deterministic
         {
             profiling::scope!("applying commands");
-            self.apply_command_batch(commands, true, BudgetCategory::Construction);
+            self.apply_command_batch(commands, true, BudgetCategory::Construction, false);
         }
 
         {
@@ -898,7 +900,34 @@ impl Simulation {
 
     /// Applies a command batch without advancing the simulation clock.
     pub fn apply_commands<'a>(&mut self, commands: impl IntoIterator<Item = &'a WorldCommand>) {
-        self.apply_command_batch(commands, false, BudgetCategory::Construction);
+        self.apply_command_batch(commands, false, BudgetCategory::Construction, false);
+    }
+
+    /// Builds a batch in a fresh authored layout, including the legacy
+    /// two-sided pedestrian links used to lay out its junctions.
+    /// Batch and link outcomes are recorded in `CommandOutcomes`.
+    pub fn apply_authored_connection_batch(
+        &mut self,
+        command: &WorldCommand,
+    ) -> Result<(), Rejection> {
+        let WorldCommand::MapMakeMultipleConnections(projects, _) = command else {
+            return Err(Rejection::InvalidConnection);
+        };
+        if self.get_tick() != INITIAL_TICK
+            || !self.read::<MapOrigin>().constructor.is_authored()
+            || self.read::<Replay>().enabled
+            || self.map().land_ownership().is_tiled()
+            || projects.iter().any(|project| {
+                !matches!(
+                    project.kind,
+                    map::ProjectKind::Ground | map::ProjectKind::Intersection(_)
+                )
+            })
+        {
+            return Err(Rejection::InvalidConnection);
+        }
+        self.apply_command_batch([command], false, BudgetCategory::Construction, true);
+        Ok(())
     }
 
     pub fn edit_water(&mut self, edit: WaterEdit) -> Result<WaterEditOutcome, WaterEditError> {
@@ -956,6 +985,7 @@ impl Simulation {
         commands: impl IntoIterator<Item = &'a WorldCommand>,
         steps_systems: bool,
         construction: BudgetCategory,
+        authored_connections: bool,
     ) {
         let limit = self.command_batch_limit();
         let tiled = limit == world_command::MAX_TILED_COMMANDS;
@@ -1018,6 +1048,7 @@ impl Simulation {
             return;
         }
         let mut water = PrepareBudget::new(admitted, self.map().environment());
+        water.authored_connections = authored_connections;
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         let parent = self.write::<CommandOutcomes>().begin_batch();

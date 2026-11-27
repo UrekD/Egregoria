@@ -471,6 +471,7 @@ pub struct PrepareBudget {
     guard_terraform: bool,
     reject_surface: bool,
     shared_topology: bool,
+    pub(crate) authored_connections: bool,
     demolition_preparations: u8,
     remaining: usize,
 }
@@ -481,6 +482,7 @@ impl PrepareBudget {
             guard_terraform: false,
             reject_surface: false,
             shared_topology: false,
+            authored_connections: false,
             demolition_preparations: 32,
             remaining: work_units.min(MAX_WATER_BATCH_WORK),
         }
@@ -516,6 +518,7 @@ impl PrepareBudget {
                     MapUpgradeRoad { .. } | MapSetJunctionRules { .. } | MapMakeWalkingPath { .. }
                 )
             }),
+            authored_connections: false,
             demolition_preparations: 32,
             remaining: MAX_WATER_BATCH_WORK,
         };
@@ -2625,10 +2628,17 @@ impl WorldCommand {
             return Err(Rejection::InvalidBatchIndex);
         }
 
-        if links
-            .iter()
-            .any(|(_, _, _, pattern)| pattern.is_walking_only())
-        {
+        if links.iter().any(|(_, _, _, pattern)| {
+            if !pattern.is_walking_only() {
+                return false;
+            }
+            // Authored junctions are assembled from scratch. Their legacy
+            // pedestrian links have a sidewalk on each side of the centreline.
+            !(batch.authored_connections
+                && !pattern.local_one_way
+                && matches!(pattern.lanes_forward.as_slice(), [(LaneKind::Walking, _)])
+                && matches!(pattern.lanes_backward.as_slice(), [(LaneKind::Walking, _)]))
+        }) {
             return Err(Rejection::InvalidConnection);
         }
         let mut map = sim.map_mut();
