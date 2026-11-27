@@ -703,6 +703,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         .map(|building| WorldCommand::SetBuildingParkingOpen { building, open: false })
         .collect();
     if !close.is_empty() {
+        prepare_draining_parking(live)?;
         run_teardown_batch(live, &close, 1)?;
     }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
@@ -967,6 +968,61 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     let regrown = resumed_checkpoint(live, &resumed, root, "zones2_staffed_regrown")?;
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
+}
+
+fn prepare_draining_parking(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    use simulation::map::building_parking::{parking_entrance_near, GarageKind};
+
+    let (connection, start, direction) = {
+        let map = ctx.sim.map();
+        [
+            (vec2(2.0, 5.0), Vec2::Y),
+            (vec2(3.0, 5.0), Vec2::Y),
+            (vec2(5.0, 3.0), Vec2::X),
+            (vec2(5.0, 4.0), Vec2::X),
+        ]
+        .into_iter()
+        .find_map(|(corner, direction)| {
+            let start = ORIGIN + corner * BLOCK;
+            let from = map.project(start.z(0.0), 0.0, ProjectFilter::INTER);
+            if !matches!(from.kind, ProjectKind::Intersection(_)) {
+                return None;
+            }
+            let to = map.project((start + direction * 480.0).z(0.0), 0.0, ProjectFilter::ALL);
+            let command = WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: LanePatternBuilder::default().build(),
+            };
+            command.validate_and_price(&ctx.sim).ok()?;
+            Some((command, start, direction))
+        })
+        .ok_or("staffed teardown needs a receiving street")?
+    };
+    run_teardown_batch(ctx, &[connection], 1)?;
+    let side = vec2(-direction.y, direction.x);
+    for (kind, side) in [
+        (GarageKind::MultiStorey, side),
+        (GarageKind::Underground, -side),
+    ] {
+        let command = {
+            let map = ctx.sim.map();
+            [70.0, 110.0, 150.0]
+                .into_iter()
+                .filter_map(|distance| {
+                    parking_entrance_near(
+                        &map,
+                        (start + direction * distance + side * 19.0).z(0.0),
+                    )
+                })
+                .map(|entrance| WorldCommand::MapPlaceParkingGarage { kind, entrance })
+                .find(|command| command.validate_and_price(&ctx.sim).is_ok())
+                .ok_or("staffed teardown needs receiving garage capacity")?
+        };
+        run_teardown_batch(ctx, &[command], 1)?;
+    }
+    Ok(())
 }
 
 fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
