@@ -911,7 +911,10 @@ fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
         if !parking.open {
             label("Closed to arrivals");
             if parking.missing_owners != 0 {
-                label(format!("Drain blocked · {} cars without owners", parking.missing_owners));
+                label(format!(
+                    "Drain blocked · {} cars without owners",
+                    parking.missing_owners
+                ));
             }
         }
         if uiw.can_author()
@@ -929,8 +932,14 @@ fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
             });
         }
     } else if let Some(curb) = sim.building_curb_parking(building.id) {
-        label(format!("Curb bays nearby · {} occupied / {}", curb.occupied, curb.capacity));
-        label(format!("{} reserved · {} masked", curb.reserved, curb.masked));
+        label(format!(
+            "Curb bays nearby · {} occupied / {}",
+            curb.occupied, curb.capacity
+        ));
+        label(format!(
+            "{} reserved · {} masked",
+            curb.reserved, curb.masked
+        ));
         label(format!(
             "Serving curb {:?} · nearest bay {:.0}, {:.0}",
             curb.road, curb.nearest_bay.x, curb.nearest_bay.y

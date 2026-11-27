@@ -81,7 +81,12 @@ pub fn bench_slot_with_workers(
     let load_ms = milliseconds(start.elapsed());
     let mut ctx = ScenarioCtx::from_sim(sim);
     let window = measure_windows(
-        &mut ctx, warmup_ticks, measured_ticks, None, false, id.as_str() == "lesce_osm",
+        &mut ctx,
+        warmup_ticks,
+        measured_ticks,
+        None,
+        false,
+        id.as_str() == "lesce_osm",
     )?;
 
     let start = Instant::now();
@@ -247,7 +252,8 @@ fn measure_windows(
             .count()
     };
     let mut peak_active_vehicles = track_traffic.then(|| count_active_vehicles(&ctx.sim));
-    let mut parking_work = track_parking_work.then(|| crate::runner::ParkingWorkload::new(&ctx.sim));
+    let mut parking_work =
+        track_parking_work.then(|| crate::runner::ParkingWorkload::new(&ctx.sim));
     ctx.enable_perf_timings();
     let start = Instant::now();
     let completed_steps = ctx.run_ticks_observed(measured_ticks, |sim| {
@@ -262,7 +268,11 @@ fn measure_windows(
     let measured_wall_seconds = start.elapsed().as_secs_f64();
     sample_workload(ctx, "measured", expected_agents)?;
     if let Some(workload) = parking_work {
-        ctx.samples.last_mut().unwrap().extra.extend(workload.finish(&ctx.sim));
+        ctx.samples
+            .last_mut()
+            .unwrap()
+            .extra
+            .extend(workload.finish(&ctx.sim));
     }
     Ok(MeasuredWindow {
         completed_steps,

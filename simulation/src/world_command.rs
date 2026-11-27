@@ -1995,24 +1995,35 @@ impl WorldCommand {
             return Ok(());
         }
         match self {
-            MapRemoveBuilding(id) => return if traffic.properties.busy(*id) {
-                Err(Rejection::BusyConflict)
-            } else {
-                Ok(())
-            },
+            MapRemoveBuilding(id) => {
+                return if traffic.properties.busy(*id) {
+                    Err(Rejection::BusyConflict)
+                } else {
+                    Ok(())
+                }
+            }
             MapLoadParis | MapLoadTestField { .. } => return Err(Rejection::BusyConflict),
-            MapRemoveRoad(_) | MapUpgradeRoad { .. } | MapRemoveIntersection(_)
-            | MapSetJunctionRules { .. } | MapUpdateIntersectionPolicy { .. }
-            | MapMakeConnection { .. } | MapMakeMultipleConnections(..)
-            | MapMakeWalkingPath { .. } | Terraform { .. }
-            | MapBuildSpecialBuilding { .. } | MapBuildHouse(_) => {}
+            MapRemoveRoad(_)
+            | MapUpgradeRoad { .. }
+            | MapRemoveIntersection(_)
+            | MapSetJunctionRules { .. }
+            | MapUpdateIntersectionPolicy { .. }
+            | MapMakeConnection { .. }
+            | MapMakeMultipleConnections(..)
+            | MapMakeWalkingPath { .. }
+            | Terraform { .. }
+            | MapBuildSpecialBuilding { .. }
+            | MapBuildHouse(_) => {}
             _ => return Ok(()),
         }
         let map = sim.map();
-        let protected = traffic.protected_motion_roads(&map, remaining)
+        let protected = traffic
+            .protected_motion_roads(&map, remaining)
             .map_err(|error| Rejection::water_error(&error))?;
         let retire_vacant = matches!(self, MapRemoveRoad(_));
-        let protects = |road| protected.contains(&road) || traffic.properties.protects_road(road, retire_vacant);
+        let protects = |road| {
+            protected.contains(&road) || traffic.properties.protects_road(road, retire_vacant)
+        };
         let touches_junction = |id| {
             map.get(id).is_some_and(|joint: &crate::map::Intersection| {
                 joint.roads.iter().any(|&road| protects(road))
@@ -2039,9 +2050,15 @@ impl WorldCommand {
                 .expand(width),
             )
         };
-        if matches!(self, MapMakeConnection { .. } | MapMakeMultipleConnections(..)
-            | MapMakeWalkingPath { .. } | Terraform { .. } | MapBuildSpecialBuilding { .. }
-            | MapBuildHouse(_)) {
+        if matches!(
+            self,
+            MapMakeConnection { .. }
+                | MapMakeMultipleConnections(..)
+                | MapMakeWalkingPath { .. }
+                | Terraform { .. }
+                | MapBuildSpecialBuilding { .. }
+                | MapBuildHouse(_)
+        ) {
             let checks = match self {
                 MapMakeMultipleConnections(_, links) => links.len(),
                 _ => 1,
@@ -2173,7 +2190,8 @@ impl WorldCommand {
             }
             MapPlaceParkingGarage { kind, entrance } => {
                 let map = sim.map();
-                let (building, layout) = map.prepare_parking_garage(*kind, *entrance, &mut budget.remaining)?;
+                let (building, layout) =
+                    map.prepare_parking_garage(*kind, *entrance, &mut budget.remaining)?;
                 let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
                 crate::map::spend_water_work(&mut budget.remaining, traffic.proof_site_count())
                     .map_err(|error| Rejection::water_error(&error))?;

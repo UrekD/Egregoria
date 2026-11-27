@@ -141,16 +141,18 @@ fn pathpark_home_car_leaves_through_the_apron_and_uses_a_destination_garage() {
             Some(DrivewayPhase::Entering) if !saw_ingress => {
                 saw_ingress = true;
                 assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 0);
-                ctx.g.apply_commands([&WorldCommand::SetBuildingParkingOpen {
-                    building: garage,
-                    open: false,
-                }]);
+                ctx.g
+                    .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+                        building: garage,
+                        open: false,
+                    }]);
                 assert_eq!(ctx.g.building_parking(garage).unwrap().held, 1);
                 ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
             }
             _ => {}
         }
-        if !saw_gate && ctx.g.car_stored_inside_garage(car)
+        if !saw_gate
+            && ctx.g.car_stored_inside_garage(car)
             && ctx.g.world.humans[human].location == Location::Outside
         {
             saw_gate = true;
@@ -197,8 +199,13 @@ fn pathpark_home_car_leaves_through_the_apron_and_uses_a_destination_garage() {
     assert!(ctx.g.map().get(garage).is_none());
 }
 
-
-fn property_trip() -> (TestCtx, crate::map::BuildingID, crate::world::HumanID, crate::world::VehicleID, crate::map::BuildingID) {
+fn property_trip() -> (
+    TestCtx,
+    crate::map::BuildingID,
+    crate::world::HumanID,
+    crate::world::VehicleID,
+    crate::map::BuildingID,
+) {
     use crate::map::building_parking::{parking_entrance_near, GarageKind};
     use crate::world_command::{CommandOutcomes, WorldCommand};
     let mut ctx = TestCtx::new();
@@ -252,14 +259,20 @@ fn pathpark_closing_cancels_an_uncommitted_hold() {
     use common::saveload::{Bincode, Encoder};
 
     let (mut ctx, home, human, car, garage) = property_trip();
-    ctx.g.world.edit_human(human, |h| { h.router.go_to(Destination::Building(garage)); });
+    ctx.g.world.edit_human(human, |h| {
+        h.router.go_to(Destination::Building(garage));
+    });
     assert!((0..500).any(|_| {
         ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
         ctx.tick_fast();
         ctx.g.building_parking(garage).unwrap().held == 1
     }));
     assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 1);
-    ctx.g.apply_commands([&WorldCommand::SetBuildingParkingOpen { building: garage, open: false }]);
+    ctx.g
+        .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: garage,
+            open: false,
+        }]);
     assert_eq!(ctx.g.building_parking(garage).unwrap().held, 0);
     ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
     for _ in 0..1_200 {
@@ -279,7 +292,11 @@ fn pathpark_despawn_preserves_the_original_stored_car() {
 
     let (mut ctx, home, human, car, _) = property_trip();
     ctx.g.read::<ParCommandBuffer<HumanEnt>>().kill(human);
-    ctx.g.apply_commands([&WorldCommand::SetBuildingParkingOpen { building: home, open: false }]);
+    ctx.g
+        .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: home,
+            open: false,
+        }]);
     assert!(!ctx.g.world.humans.contains_key(human));
     assert!(ctx.g.world.vehicles.contains_key(car));
     assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 1);
@@ -301,7 +318,9 @@ fn pathpark_property_departure_uses_shared_garage_when_curbs_are_full() {
             parking.mask(spot);
         }
     }
-    ctx.g.world.edit_human(human, |h| { h.router.go_to(Destination::Outside(door)); });
+    ctx.g.world.edit_human(human, |h| {
+        h.router.go_to(Destination::Outside(door));
+    });
     assert!((0..500).any(|_| {
         ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
         ctx.tick_fast();
@@ -317,10 +336,18 @@ fn pathpark_oversized_garage_batch_has_no_side_effects() {
     let (mut ctx, _, _, _, garage) = property_trip();
     let mut entrance = ctx.g.building_parking(garage).unwrap().entrance;
     entrance.station_cm += 16_000;
-    entrance = ctx.g.map().pick_curb(entrance.road, entrance.side, entrance.station_cm).unwrap();
-    let command = WorldCommand::MapPlaceParkingGarage { kind: GarageKind::Underground, entrance };
+    entrance = ctx
+        .g
+        .map()
+        .pick_curb(entrance.road, entrance.side, entrance.station_cm)
+        .unwrap();
+    let command = WorldCommand::MapPlaceParkingGarage {
+        kind: GarageKind::Underground,
+        entrance,
+    };
     assert!(command.validate_and_price(&ctx.g).is_ok());
-    ctx.g.apply_commands(std::iter::repeat_n(&command, MAX_TILED_COMMANDS + 1));
+    ctx.g
+        .apply_commands(std::iter::repeat_n(&command, MAX_TILED_COMMANDS + 1));
     assert!(ctx.g.read::<CommandOutcomes>().accepted.is_empty());
 }
 
@@ -334,11 +361,19 @@ fn pathpark_imports_only_suppress_parking_for_the_benchmark_profile() {
             ctx.g.use_curb_only_benchmark_parking();
         }
         ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
-        let lot = ctx.g.map().lots().values()
+        let lot = ctx
+            .g
+            .map()
+            .lots()
+            .values()
             .filter(|lot| !Lot::footprint_obstructed(&ctx.g.map(), lot.shape, false))
             .min_by_key(|lot| lot.shape.center().distance2(vec2(250., 135.)) as i32)
-            .unwrap().id;
-        let home = ctx.g.seed_imported_growable(lot, BuildingKind::House, Density::Low).unwrap();
+            .unwrap()
+            .id;
+        let home = ctx
+            .g
+            .seed_imported_growable(lot, BuildingKind::House, Density::Low)
+            .unwrap();
         assert_eq!(ctx.g.building_parking(home).is_some(), !curb_only);
     }
 }

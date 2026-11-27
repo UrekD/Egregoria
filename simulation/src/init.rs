@@ -427,9 +427,7 @@ fn register_property_parking() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "property_parking",
             optional: true,
-            save: Box::new(|sim, output| {
-                sim.read::<DrivewayTraffic>().properties.save(output)
-            }),
+            save: Box::new(|sim, output| sim.read::<DrivewayTraffic>().properties.save(output)),
             load: Box::new(|sim, data| {
                 sim.write::<DrivewayTraffic>().properties =
                     crate::map::building_parking::BuildingParking::load(data)?;

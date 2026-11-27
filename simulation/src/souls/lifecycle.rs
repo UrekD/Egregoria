@@ -259,7 +259,9 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
     }
     let removed_car = human.router.personal_car.filter(|&car| {
-        !sim.write::<crate::transportation::DrivewayTraffic>().properties.owner_dropped(car)
+        !sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .owner_dropped(car)
     });
     if let Some(car) = removed_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
@@ -280,11 +282,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
     }
     let employers = clear_soul_references(sim, SoulID::Human(id));
-    if let (Some(_), Some(car), Some(batch)) = (
-        &employers,
-        removed_car,
-        &mut sim.world.departing,
-    ) {
+    if let (Some(_), Some(car), Some(batch)) = (&employers, removed_car, &mut sim.world.departing) {
         batch.removed_cars.insert(car);
     }
 

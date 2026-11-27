@@ -1103,7 +1103,8 @@ mod pathpark_driveway {
                     }
                 }
             }
-            self.properties.protected_motion_roads(map, &mut roads, remaining)?;
+            self.properties
+                .protected_motion_roads(map, &mut roads, remaining)?;
             Ok(roads)
         }
 

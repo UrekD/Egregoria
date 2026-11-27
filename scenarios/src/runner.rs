@@ -53,7 +53,9 @@ impl ParkingWorkload {
                     _ => self.person_offers += 1,
                 }
             }
-            if human.router.personal_car
+            if human
+                .router
+                .personal_car
                 .and_then(|car| sim.world().vehicles.get(car))
                 .is_some_and(|vehicle| !vehicle.vehicle.state.is_parked())
             {
@@ -66,22 +68,38 @@ impl ParkingWorkload {
         [
             ("active_personal_vehicle_ticks", self.active_car_ticks),
             ("offered_person_trips", self.person_offers),
-            ("completed_person_trips", Self::completed(sim).saturating_sub(self.initial_completed)),
+            (
+                "completed_person_trips",
+                Self::completed(sim).saturating_sub(self.initial_completed),
+            ),
             ("offered_freight_work", self.freight_offers),
-            ("completed_freight_work",
-                Self::freight_completed(sim).saturating_sub(self.initial_freight_completed)),
-        ].into_iter().map(|(key, count)| (key.to_owned(), count as f64)).collect()
+            (
+                "completed_freight_work",
+                Self::freight_completed(sim).saturating_sub(self.initial_freight_completed),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, count)| (key.to_owned(), count as f64))
+        .collect()
     }
 
     fn completed(sim: &Simulation) -> u64 {
         use simulation::economy::{DailyEconomyMetrics, TripPurpose, TripStats};
         let trips = sim.read::<TripStats>();
-        let freight_trips: u64 = sim.read::<DailyEconomyMetrics>().days.values().map(|day| {
-            [TripPurpose::FreightOutbound, TripPurpose::FreightReturn].into_iter()
-                .filter_map(|purpose| day.trips_by_purpose.get(&purpose))
-                .map(|stats| stats.completed).sum::<u64>()
-        }).sum();
-        (trips.car.completed + trips.walk.completed + trips.transit.completed).saturating_sub(freight_trips)
+        let freight_trips: u64 = sim
+            .read::<DailyEconomyMetrics>()
+            .days
+            .values()
+            .map(|day| {
+                [TripPurpose::FreightOutbound, TripPurpose::FreightReturn]
+                    .into_iter()
+                    .filter_map(|purpose| day.trips_by_purpose.get(&purpose))
+                    .map(|stats| stats.completed)
+                    .sum::<u64>()
+            })
+            .sum();
+        (trips.car.completed + trips.walk.completed + trips.transit.completed)
+            .saturating_sub(freight_trips)
     }
 
     fn freight_completed(sim: &Simulation) -> u64 {

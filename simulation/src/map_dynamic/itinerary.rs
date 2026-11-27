@@ -502,7 +502,13 @@ impl Itinerary {
         };
 
         Self::route_from_lanes(
-            start, start_lane, end_lane, end, target, map, pathkind,
+            start,
+            start_lane,
+            end_lane,
+            end,
+            target,
+            map,
+            pathkind,
             |start| pathkind.path(map, tick, start, end_lane),
         )
     }

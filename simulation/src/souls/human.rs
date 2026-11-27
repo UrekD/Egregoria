@@ -471,9 +471,13 @@ impl HumanEnt {
 
                 let origin = self.ground_position(map);
                 let car_at_pickup = self.router.personal_car.is_some_and(|car| {
-                    resources.read::<crate::transportation::DrivewayTraffic>()
-                        .properties.parked_at(car)
-                        .is_some_and(|site| site != home && self.location == Location::Building(site))
+                    resources
+                        .read::<crate::transportation::DrivewayTraffic>()
+                        .properties
+                        .parked_at(car)
+                        .is_some_and(|site| {
+                            site != home && self.location == Location::Building(site)
+                        })
                 });
                 let walk_home = map.get(home).is_some_and(|building| {
                     let car_near_home = self
@@ -855,14 +859,16 @@ fn start_basket(
             traffic.properties.parked_at(car).is_some()
                 && traffic.properties.arrival_target(store, car).is_some()
                 && map.get(store).is_some_and(|building| {
-                    h.ground_position(map).distance2(building.door_pos) > NEAR_PARKING_RADIUS.powi(2)
+                    h.ground_position(map).distance2(building.door_pos)
+                        > NEAR_PARKING_RADIUS.powi(2)
                 })
         });
         if let Some(car) = own_car {
             h.stop_route(resources);
             h.router.walk_only_pickup = false;
             h.router.use_vehicle(Some(car));
-            h.router.go_to_for(Destination::Building(store), TripPurpose::Shopping);
+            h.router
+                .go_to_for(Destination::Building(store), TripPurpose::Shopping);
         } else {
             h.start_walk(store, TripPurpose::Shopping, resources);
         }

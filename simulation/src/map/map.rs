@@ -1726,8 +1726,8 @@ impl Map {
         crate::world_command::Rejection,
     > {
         use super::building_parking::{garage_footprint, prepare_public_garage};
-        use geom::Shape;
         use crate::world_command::Rejection;
+        use geom::Shape;
         let charge = |remaining: &mut usize, work| {
             spend_water_work(remaining, work).map_err(|_| Rejection::WaterWorkLimit)
         };

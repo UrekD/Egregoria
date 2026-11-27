@@ -4,8 +4,8 @@ use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKi
 use simulation::map::{
     BuildingID, Density, LanePatternBuilder, MapProject, ProjectKind, ZoneCell, ZoneKind,
 };
-use simulation::souls::human::spawn_human;
 use simulation::map_dynamic::Destination;
+use simulation::souls::human::spawn_human;
 use simulation::transportation::Location;
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::{Simulation, SimulationOptions};
@@ -25,7 +25,7 @@ pub const GROWABLES: (Scenario, SimulationOptions) = (
     OPTIONS,
 );
 
-fn setup(sim: &mut Simulation) -> Result<Vec<BuildingID>, String> {
+fn setup(sim: &mut Simulation, round_trip: bool) -> Result<Vec<BuildingID>, String> {
     let ground = |x, y| MapProject {
         pos: vec3(x, y, 0.0),
         kind: ProjectKind::Ground,
@@ -36,6 +36,28 @@ fn setup(sim: &mut Simulation) -> Result<Vec<BuildingID>, String> {
         inter: None,
         pat: LanePatternBuilder::default().build(),
     }]);
+    if round_trip {
+        let (start, end) = {
+            let map = sim.map();
+            let road = map.roads().values().next().ok_or("no fixture road")?;
+            let joint = |id| MapProject {
+                pos: map.intersections()[id].pos,
+                kind: ProjectKind::Intersection(id),
+            };
+            (joint(road.src), joint(road.dst))
+        };
+        let links = [(1, 2), (2, 3), (3, 0)]
+            .into_iter()
+            .map(|(from, to)| (from, to, None, LanePatternBuilder::default().build()))
+            .collect();
+        sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(
+            vec![start, end, ground(450.0, 280.0), ground(75.0, 280.0)],
+            links,
+        )]);
+        if sim.map().roads().len() != 4 {
+            return Err("could not close the tagged driver's return loop".into());
+        }
+    }
     let mut sites = Vec::new();
     for (point, kind, density) in [
         (vec2(238.0, 135.0), ZoneKind::Residential, Density::Low),
@@ -103,7 +125,7 @@ fn setup(sim: &mut Simulation) -> Result<Vec<BuildingID>, String> {
 }
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    let sites = setup(&mut ctx.sim)?;
+    let sites = setup(&mut ctx.sim, true)?;
     let summaries: Vec<_> = sites
         .iter()
         .filter_map(|&id| ctx.sim.building_parking(id))
@@ -140,19 +162,30 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         summaries.len()
     );
     ctx.sample("property_opening");
-    let (driver, home, car) = ctx.sim.world().humans.iter().find_map(|(driver, person)| {
-        let Location::Building(home) = person.location else { return None };
-        let parking = ctx.sim.building_parking(home)?;
-        (parking.kind == BuildingParkingKind::Driveway && parking.occupied != 0)
-            .then(|| Some((driver, home, person.router.personal_car?))).flatten()
-    }).ok_or("no tagged driver at an occupied driveway")?;
+    let (driver, home, car) = ctx
+        .sim
+        .world()
+        .humans
+        .iter()
+        .find_map(|(driver, person)| {
+            let Location::Building(home) = person.location else {
+                return None;
+            };
+            let parking = ctx.sim.building_parking(home)?;
+            let car = person.router.personal_car?;
+            (parking.kind == BuildingParkingKind::Driveway && parking.occupied != 0)
+                .then_some((driver, home, car))
+        })
+        .ok_or("no tagged driver at an occupied driveway")?;
     let garage = *sites.get(4).ok_or("missing tagged public garage")?;
     ctx.sim.world_mut_unchecked().edit_human(driver, |person| {
         person.router.go_to(Destination::Building(garage));
     });
     let mut occupied = false;
     for _ in 0..4_000 {
-        ctx.sim.world_mut_unchecked().edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.sim
+            .world_mut_unchecked()
+            .edit_human(driver, |person| person.decision.wait = u8::MAX);
         ctx.run_ticks(1);
         let person = &ctx.sim.world().humans[driver];
         if person.location == Location::Building(garage) && ctx.sim.car_stored_inside_garage(car) {
@@ -160,8 +193,15 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
             break;
         }
     }
-    if !occupied || ctx.sim.building_parking(home).is_none_or(|parking| parking.occupied != 0) {
-        return Err("tagged driver did not drive from the driveway to the public garage door".into());
+    if !occupied
+        || ctx
+            .sim
+            .building_parking(home)
+            .is_none_or(|parking| parking.occupied != 0)
+    {
+        return Err(
+            "tagged driver did not drive from the driveway to the public garage door".into(),
+        );
     }
     ctx.sample("tagged_garage_arrival");
     ctx.submit(&[WorldCommand::SetBuildingParkingOpen {
@@ -170,11 +210,17 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }]);
     let mut drained = false;
     for _ in 0..5_000 {
-        ctx.sim.world_mut_unchecked().edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.sim
+            .world_mut_unchecked()
+            .edit_human(driver, |person| person.decision.wait = u8::MAX);
         ctx.run_ticks(1);
         let person = &ctx.sim.world().humans[driver];
         if person.location == Location::Building(home)
-            && ctx.sim.building_parking(garage).is_some_and(|parking| parking.occupied == 0)
+            && ctx.sim.building_parking(home).is_some_and(|parking| parking.occupied == 1)
+            && ctx
+                .sim
+                .building_parking(garage)
+                .is_some_and(|parking| parking.occupied == 0)
             && person.router.personal_car == Some(car)
         {
             drained = true;
@@ -191,7 +237,7 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
 pub fn generate(root: &Path) -> Result<(), String> {
     let root = std::path::absolute(root).map_err(|error| error.to_string())?;
     let mut ctx = ScenarioCtx::new(OPTIONS);
-    setup(&mut ctx.sim)?;
+    setup(&mut ctx.sim, false)?;
     super::demo_cities::publish(&ctx.sim, &root, "pathpark_growables", "PathPark Garages")
 }
 

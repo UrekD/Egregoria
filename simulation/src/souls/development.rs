@@ -423,7 +423,8 @@ impl Upgrade {
                         |prototype| prototype.parking,
                     )
             });
-        let Ok(layout) = crate::map::building_parking::prepare_property_upgrade(sim, id, parking, residential)
+        let Ok(layout) =
+            crate::map::building_parking::prepare_property_upgrade(sim, id, parking, residential)
         else {
             return;
         };
