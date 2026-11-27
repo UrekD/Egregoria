@@ -328,23 +328,23 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     let mut offers = Vec::new();
     for (index, sites) in districts.iter().enumerate() {
-        let destination = if index % 2 == 0 {
-            Destination::Building(sites[4])
-        } else {
-            let map = ctx.sim.map();
-            let storefront = map.get(sites[3]).unwrap().door_pos;
-            let lane = map
-                .nearest_lane(storefront, LaneKind::Walking, Some(60.0))
-                .and_then(|lane| map.get(lane))
-                .ok_or("curb cohort frontage has no sidewalk")?;
-            Destination::Outside(lane.points.project(storefront))
-        };
         for (driver, person) in ctx.sim.world().humans.iter() {
             let Some(car) = person.router.personal_car else {
                 continue;
             };
             let home = person.home.house;
             if sites[..3].contains(&home) {
+                let destination = if index % 2 == 0 {
+                    Destination::Building(sites[4])
+                } else {
+                    let map = ctx.sim.map();
+                    let curbside = map.get(home).unwrap().door_pos - geom::Vec3::X * 65.0;
+                    let lane = map
+                        .nearest_lane(curbside, LaneKind::Walking, Some(60.0))
+                        .and_then(|lane| map.get(lane))
+                        .ok_or("curb cohort frontage has no sidewalk")?;
+                    Destination::Outside(lane.points.project(curbside))
+                };
                 offers.push(ScaleTrip {
                     driver,
                     car,
@@ -404,7 +404,8 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         return Err("mixed-supply resumed parking holds diverged".into());
     }
     drop(resumed);
-    for _ in 0..30 {
+    // Allow time for a turnaround and the walk from an alternate bay.
+    for _ in 0..60 {
         advance(ctx, 200, &mut workload);
     }
     let mut curb = 0;
