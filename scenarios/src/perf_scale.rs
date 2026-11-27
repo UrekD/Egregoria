@@ -96,6 +96,9 @@ pub fn bench_slot_with_workers(
         None
     };
     let mut ctx = ScenarioCtx::from_sim(sim);
+    if opening.is_some() && id.as_str() == "lesce_osm" {
+        ctx.sim.use_curb_only_benchmark_parking();
+    }
     let window = measure_windows(
         &mut ctx,
         warmup_ticks,
