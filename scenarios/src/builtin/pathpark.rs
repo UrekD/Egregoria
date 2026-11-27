@@ -2,8 +2,7 @@ use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2};
 use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKind, GarageKind};
 use simulation::map::{
-    BuildingID, Density, LanePatternBuilder, MapProject, ProjectFilter, ZoneCell,
-    ZoneKind,
+    BuildingID, Density, LaneKind, LanePatternBuilder, MapProject, ProjectFilter, ZoneCell, ZoneKind,
 };
 use simulation::map_dynamic::Destination;
 use simulation::souls::human::spawn_human;
@@ -322,17 +321,23 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     let mut offers = Vec::new();
     for (index, sites) in districts.iter().enumerate() {
+        let destination = if index % 2 == 0 {
+            Destination::Building(sites[4])
+        } else {
+            let map = ctx.sim.map();
+            let storefront = map.get(sites[3]).unwrap().door_pos;
+            let lane = map
+                .nearest_lane(storefront, LaneKind::Walking, Some(60.0))
+                .and_then(|lane| map.get(lane))
+                .ok_or("curb cohort frontage has no sidewalk")?;
+            Destination::Outside(lane.points.project(storefront))
+        };
         for (driver, person) in ctx.sim.world().humans.iter() {
             let Some(car) = person.router.personal_car else {
                 continue;
             };
             let home = person.home.house;
             if sites[..3].contains(&home) {
-                let destination = if index % 2 == 0 {
-                    Destination::Building(sites[4])
-                } else {
-                    Destination::Outside(ctx.sim.map().get(sites[3]).unwrap().door_pos)
-                };
                 offers.push(ScaleTrip {
                     driver,
                     car,
@@ -397,6 +402,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     let mut curb = 0;
     let mut garage = 0;
+    let mut curb_miss = None;
     for trip in &offers {
         let human = &ctx.sim.world().humans[trip.driver];
         let vehicle = &ctx.sim.world().vehicles[trip.car];
@@ -414,6 +420,15 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             {
                 curb += 1
             }
+            Destination::Outside(destination) => {
+                curb_miss.get_or_insert_with(|| {
+                    format!(
+                        "driver {:?} is {:?} at {:?}, destination {destination:?}, car {:?} at {:?}, routing error {:?}",
+                        trip.driver, human.location, human.trans.pos, vehicle.vehicle.state,
+                        vehicle.trans.pos, human.router.last_error,
+                    )
+                });
+            }
             _ => {}
         }
     }
@@ -428,7 +443,10 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     ]));
     ctx.sample_perf_with_extra("measured", POPULATION, extra, true);
     if curb == 0 || garage == 0 || (curb + garage) * 100 < offers.len() as i32 * 90 {
-        return Err(format!("mixed-supply departures reached {curb} curb and {garage} garage destinations from {} tagged offers", offers.len()));
+        return Err(format!(
+            "mixed-supply departures reached {curb} curb and {garage} garage destinations from {} tagged offers; first curb miss {curb_miss:?}",
+            offers.len(),
+        ));
     }
     let close: Vec<_> = garages
         .iter()
