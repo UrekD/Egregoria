@@ -54,6 +54,13 @@ pub struct FireApronPreview {
     pub departure_sweep: [Vec3; STEPS + 1],
 }
 
+impl FireApronPreview {
+    /// Truck and crew footprints reserved while the apron is commissioned.
+    pub fn protected_footprints(&self) -> [OBB; 2] {
+        [self.envelope, walking_corridor(self.bay, self.pocket, self.door)]
+    }
+}
+
 /// Covers the two pocket offsets and the paths converging on the door.
 pub(crate) fn walking_corridor(bay: Transform, pocket: Vec3, door: Vec3) -> OBB {
     let direction = (door - pocket).xy().try_normalize().unwrap_or(bay.dir.xy());

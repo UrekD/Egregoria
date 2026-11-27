@@ -1,6 +1,6 @@
 use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
-    place_scored_company, place_special, site_clear, water_site,
+    place_scored_company, place_scored_company_avoiding, place_special, site_clear, water_site,
 };
 use super::network::close_pairs;
 use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
@@ -518,20 +518,16 @@ fn prepare_opening(
     }
     let intake_homes = intake_parcels.iter().map(|parcel| parcel.lot).collect();
     let (parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts, &intake_parcels)?;
-    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
     // Opening them before housing still gives them the first hiring pool.
+    let protected: Vec<_> = parcels.iter().chain(&reserves).map(|parcel| parcel.footprint).collect();
     let place_company_around_parcels = |sim: &mut Simulation, name: &str, anchor: Vec2, district: Option<&str>| {
         let polygon = district.and_then(|key| plan.districts.iter().find(|d| d.key == key));
-        place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
+        place_scored_company_avoiding(sim, plan, &roads, name, &protected, |map, road, footprint| {
             if !map.roads()[road]
                 .lanes_iter()
                 .any(|(_, kind)| kind == LaneKind::Parking)
-                || parcels
-                    .iter()
-                    .chain(&reserves)
-                    .any(|parcel| parcel.footprint.intersects(&footprint))
             {
                 return None;
             }
@@ -542,6 +538,20 @@ fn prepare_opening(
         .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
+    if profiled_wet {
+        // Reserve the rail buyer's frontage near the West workforce before
+        // civic placement can use the same space for a fire apron.
+        let foundry = place_company_around_parcels(
+            sim,
+            "foundry",
+            at(1114.0, 2186.0),
+            Some("west"),
+        )?;
+        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
+        sites.insert("rail-foundry".into(), foundry);
+    }
+    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
+
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
         let depot = place_company_around_parcels(sim, "small-depot", cohort.anchor, None)?;
@@ -606,16 +616,6 @@ fn prepare_opening(
             verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
         }
         drop(map);
-        // Keep the regular iron-ore buyer near the West workforce and verify
-        // its loading route from the rail terminal.
-        let foundry = place_company_around_parcels(
-            sim,
-            "foundry",
-            at(1114.0, 2186.0),
-            Some("west"),
-        )?;
-        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
-        sites.insert("rail-foundry".into(), foundry);
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
@@ -1342,14 +1342,8 @@ fn place_civic_sites(
                 && (service.service_kind != ServiceKind::School || serial < MAX_SCHOOLS)
             {
                 let Some((building, road)) =
-                    place_scored_company(sim, plan, roads, name, |_, road, footprint| {
+                    place_scored_company_avoiding(sim, plan, roads, name, &protected, |_, road, footprint| {
                         let distance = footprint.center().distance(cohort.anchor);
-                        if protected.iter().any(|parcel| {
-                            parcel.center().distance2(footprint.center()) < 45.0_f32.powi(2)
-                                && parcel.intersects(&footprint)
-                        }) {
-                            return None;
-                        }
                         let source = reach.position(road, front(footprint))?;
                         let covered: u32 = allocation(source, &receivers)
                             .into_iter()
@@ -1384,13 +1378,9 @@ fn place_civic_sites(
                 .take(MAX_SCHOOLS - serial)
             {
                 let anchor = super::layout::design_point(point, plan.config);
-                let school = place_scored_company(sim, plan, roads, name, |_, _, footprint| {
+                let school = place_scored_company_avoiding(sim, plan, roads, name, &protected, |_, _, footprint| {
                     let distance = footprint.center().distance2(anchor);
-                    (distance <= 160.0_f32.powi(2)
-                        && protected
-                            .iter()
-                            .all(|parcel| !parcel.intersects(&footprint)))
-                    .then_some(distance)
+                    (distance <= 160.0_f32.powi(2)).then_some(distance)
                 })?;
                 if let Some((building, _)) = school {
                     serial += 1;
@@ -4646,6 +4636,15 @@ mod tests {
         let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
         let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
         let map = sim.map();
+        for parcel in &opening.reserves {
+            let lot = map.get(parcel.lot).expect("infill reserve still exists");
+            assert!(
+                check_growable_lot(&map, lot, parcel.zoning).is_ok(),
+                "infill reserve {:?} in {} must still fit after civic placement",
+                parcel.lot,
+                parcel.district,
+            );
+        }
         let plant = opening.sites["coal-power-plant"];
         let turnaround = built.junctions[&SourceKey::Authored("coal-turnaround")];
         assert!(map.intersections()[turnaround].turn_policy.back_turns);

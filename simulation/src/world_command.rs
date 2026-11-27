@@ -606,6 +606,7 @@ pub struct ActionPreview {
     pub road: Option<crate::map::RoadPreview>,
     pub paint: Option<crate::map::EligiblePaintCells>,
     pub water: Option<crate::map::WaterEditPreview>,
+    pub fire_apron: Option<Box<FireApronPreview>>,
 }
 
 impl ActionPreview {
@@ -615,6 +616,7 @@ impl ActionPreview {
             road: None,
             paint: None,
             water: None,
+            fire_apron: None,
         }
     }
 }
@@ -1945,11 +1947,15 @@ impl WorldCommand {
                 PreparedAction::JunctionEdit(prepared) => {
                     Ok(ActionPreview::priced(prepared.preview.cost))
                 }
-                PreparedAction::SpecialBuilding(_, _, cost)
-                | PreparedAction::RetrofitFireApron(_, _, cost)
-                | PreparedAction::Command(_, cost) => {
-                    Ok(ActionPreview::priced(cost))
-                }
+                PreparedAction::SpecialBuilding(_, fire_apron, cost) => Ok(ActionPreview {
+                    fire_apron,
+                    ..ActionPreview::priced(cost)
+                }),
+                PreparedAction::RetrofitFireApron(_, fire_apron, cost) => Ok(ActionPreview {
+                    fire_apron: Some(fire_apron),
+                    ..ActionPreview::priced(cost)
+                }),
+                PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
             },
         }
     }

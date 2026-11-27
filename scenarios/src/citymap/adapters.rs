@@ -1,5 +1,5 @@
-use geom::{Intersect, Polygon, Segment, Vec2, OBB};
-use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
+use geom::{Intersect, Polygon, Segment, Shape, Vec2, OBB};
+use prototypes::{try_prototype, BuildingGen, GoodsCompanyID, ServiceID, ServiceKind};
 use simulation::map::{
     river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind,
     LaneKind, Map, ProjectFilter, ProjectKind, RoadID, WaterSiteRequest, Zone, ZoneCell,
@@ -100,6 +100,17 @@ pub(super) fn place_scored_company(
     plan: &TownPlan,
     roads: &BTreeSet<RoadID>,
     name: &str,
+    score: impl FnMut(&Map, RoadID, OBB) -> Option<f32>,
+) -> Result<Option<(BuildingID, RoadID)>, String> {
+    place_scored_company_avoiding(sim, plan, roads, name, &[], score)
+}
+
+pub(super) fn place_scored_company_avoiding(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    roads: &BTreeSet<RoadID>,
+    name: &str,
+    protected: &[OBB],
     mut score: impl FnMut(&Map, RoadID, OBB) -> Option<f32>,
 ) -> Result<Option<(BuildingID, RoadID)>, String> {
     let id = GoodsCompanyID::new(name);
@@ -108,8 +119,15 @@ pub(super) fn place_scored_company(
     let gen = BuildingGen::NoWalkway {
         door_pos: geom::vec2(0.0, -proto.size.h * 0.5),
     };
+    let fire_station = try_prototype(ServiceID::from(id))
+        .is_some_and(|service| service.service_kind == ServiceKind::Fire);
+    // Sample recessed sites and shorter frontage intervals for the truck apron.
+    let setbacks: &[f32] = if fire_station { &[2.0, 12.5] } else { &[2.0] };
+    let spacing = if fire_station { 5 } else { 10 };
+    let protected: Vec<_> = protected.iter().map(|parcel| (parcel.bbox(), parcel)).collect();
     let (obb, road) = {
         let map = sim.map();
+        let needs_preview = fire_station || map.land_ownership().extent().is_some();
         let mut best = None;
         for &id in roads {
             let road = &map.roads()[id];
@@ -117,7 +135,7 @@ pub(super) fn place_scored_company(
                 continue;
             }
             let points = road.points();
-            for offset in (24..(points.length() as usize).saturating_sub(24)).step_by(10) {
+            for offset in (24..(points.length() as usize).saturating_sub(24)).step_by(spacing) {
                 let (point, tangent) = points.point_dir_along(offset as f32);
                 if (point.z - 10.0).abs() > 1.0 {
                     continue;
@@ -125,10 +143,17 @@ pub(super) fn place_scored_company(
                 let Some(across) = tangent.xy().perpendicular().try_normalize() else {
                     continue;
                 };
-                for outward in [across, -across] {
+                let positions = setbacks.iter().flat_map(|&setback| [(across, setback), (-across, setback)]);
+                for (outward, setback) in positions {
                     let center =
-                        point.xy() + outward * (road.width * 0.5 + proto.size.h * 0.5 + 2.0);
+                        point.xy() + outward * (road.width * 0.5 + proto.size.h * 0.5 + setback);
                     let footprint = OBB::new(center, outward, proto.size.h, proto.size.w);
+                    let bounds = footprint.bbox();
+                    if protected.iter().any(|(parcel_bounds, parcel)| {
+                        parcel_bounds.intersects(&bounds) && parcel.intersects(&footprint)
+                    }) {
+                        continue;
+                    }
                     let Some(score) = score(&map, id, footprint) else {
                         continue;
                     };
@@ -136,8 +161,17 @@ pub(super) fn place_scored_company(
                         continue;
                     }
                     if site_clear(&map, plan, footprint, None)
-                        && (map.land_ownership().extent().is_none()
-                            || special_command(kind, footprint, gen, id).preview(sim).is_ok())
+                        && (!needs_preview
+                            || special_command(kind, footprint, gen, id)
+                                .preview(sim)
+                                .is_ok_and(|preview| {
+                                    preview.fire_apron.is_none_or(|apron| {
+                                        let clearance = apron.protected_footprints();
+                                        protected.iter().all(|(_, parcel)| {
+                                            clearance.iter().all(|part| !parcel.intersects(part))
+                                        })
+                                    })
+                                }))
                     {
                         best = Some((score, footprint, id));
                     }

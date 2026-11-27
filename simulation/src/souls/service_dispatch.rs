@@ -632,10 +632,11 @@ fn prepare_apron(
 }
 
 fn guard_frontage(sim: &Simulation, site: BuildingID, apron: &FireApronPreview) {
-    sim.map_mut().service_frontages.entry(apron.road).or_default().extend([
-        (site, apron.envelope),
-        (site, walking_corridor(apron.bay, apron.pocket, apron.door)),
-    ]);
+    sim.map_mut()
+        .service_frontages
+        .entry(apron.road)
+        .or_default()
+        .extend(apron.protected_footprints().map(|shape| (site, shape)));
 }
 
 fn release_frontage(sim: &Simulation, site: BuildingID, apron: &FireApronPreview) {
@@ -1822,10 +1823,7 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
         frontages
             .entry(apron.road)
             .or_insert_with(Vec::new)
-            .extend([
-                (site, apron.envelope),
-                (site, walking_corridor(apron.bay, apron.pocket, apron.door)),
-            ]);
+            .extend(apron.protected_footprints().map(|shape| (site, shape)));
         Ok(())
     };
     for (&site, station) in &mut fleet.stations {
