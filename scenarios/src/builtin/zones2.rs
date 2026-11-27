@@ -717,7 +717,32 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         };
         let now = elapsed(&live.sim);
         if now >= staging_deadline {
-            return Err(format!("{missing} after {staged} worker housing changes"));
+            let roads = {
+                let map = live.sim.map();
+                mixed_sellers(&live.sim)
+                    .filter_map(|seller| {
+                        let SoulID::GoodsCompany(company) = seller else {
+                            return None;
+                        };
+                        let id = live.sim.world().companies[company].comp.building;
+                        map.get(id)?.connected_road
+                    })
+                    .collect::<BTreeSet<_>>()
+            };
+            let blocked: Vec<_> = roads
+                .iter()
+                .filter_map(|&road| {
+                    WorldCommand::MapRemoveRoad(road)
+                        .validate_and_price(&live.sim)
+                        .err()
+                        .map(|error| (road, error))
+                })
+                .collect();
+            return Err(format!(
+                "{missing} after {staged} worker housing changes with {}/{} frontage roads removable; blocked roads {blocked:?}",
+                roads.len() - blocked.len(),
+                roads.len(),
+            ));
         }
         if staged < 4 && now >= next_stage {
             // A match can appear on the same tick as demolition or after the
