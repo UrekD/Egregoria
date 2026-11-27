@@ -736,6 +736,7 @@ impl VehicleDepartureReferences {
         references
     }
 
+    #[inline]
     fn record_human(&mut self, order: usize, id: HumanID, human: &HumanEnt, include_steps: bool) {
         let mut record = |vehicle| {
             if let Some(refs) = self.by_vehicle.get_mut(&vehicle) {
@@ -744,10 +745,9 @@ impl VehicleDepartureReferences {
                 }
             }
         };
-        for vehicle in human.router.personal_car.into_iter()
-            .chain(human.router.selected_vehicle())
-            .chain(driver_truck(human))
-        {
+        let personal = human.router.personal_car;
+        let selected = human.router.selected_vehicle().filter(|&vehicle| Some(vehicle) != personal);
+        for vehicle in personal.into_iter().chain(selected).chain(driver_truck(human)) {
             record(vehicle);
         }
         if let Location::Vehicle(vehicle) = human.location {
@@ -952,10 +952,11 @@ fn prepare_human_departures(
             world.humans.get(id)?.router.personal_car
         }))
     }).filter(|references| !references.by_vehicle.is_empty());
+    let check_baskets = closed_home.is_some() && !resources.read::<HouseholdClaims>().baskets.is_empty();
     let mut site_humans = Vec::new();
     for (order, (buyer, human)) in world.humans.iter().enumerate() {
         if let Some((site, door)) = closed_home {
-            if building_references(human, |id| id == site, |id| (id == site).then_some(door)).is_some() {
+            if building_references(human, |id| id == site, |id| (id == site).then_some(door), check_baskets).is_some() {
                 site_humans.push(buyer);
             }
         }
@@ -1038,16 +1039,18 @@ struct BuildingReferences {
     food_affected: bool,
 }
 
+#[inline]
 fn building_references(
     human: &HumanEnt,
     includes: impl Fn(BuildingID) -> bool + Copy,
     exit_door: impl Fn(BuildingID) -> Option<Vec3>,
+    check_baskets: bool,
 ) -> Option<BuildingReferences> {
     let door = match human.location {
         Location::Building(id) => exit_door(id),
         _ => None,
     };
-    let seller_removed = human.household.reservation.as_ref()
+    let seller_removed = check_baskets && human.household.reservation.as_ref()
         .is_some_and(|basket| includes(basket.building));
     let work_affected = human.work.as_ref().is_some_and(|work| {
         includes(work.workplace)
@@ -1073,7 +1076,7 @@ fn clear_references(
     let includes = |id| buildings.contains_key(&id);
     let mut clear = |human_id, human: &mut crate::world::HumanEdit<'_>| {
         let Some(BuildingReferences { door, seller_removed, route_affected, food_affected }) =
-            building_references(human, includes, |id| buildings.get(&id).copied().flatten())
+            building_references(human, includes, |id| buildings.get(&id).copied().flatten(), true)
         else {
             return;
         };
