@@ -423,18 +423,19 @@ impl Upgrade {
                         |prototype| prototype.parking,
                     )
             });
-        let Ok(layout) =
-            crate::map::building_parking::prepare_property_upgrade(sim, id, parking, residential)
-        else {
-            return;
-        };
+        // The shell footprint stays fixed, so a busy layout can remain in use
+        // even when the next tier cannot install its preferred parking.
+        let layout =
+            crate::map::building_parking::prepare_property_upgrade(sim, id, parking, residential);
         if !sim
             .map_mut()
             .update_growable_appearance(id, self.appearance)
         {
             return;
         }
-        crate::map::building_parking::commit_property_upgrade(sim, id, layout);
+        if let Ok(layout) = layout {
+            crate::map::building_parking::commit_property_upgrade(sim, id, layout);
+        }
         if let Some(home) = self.home {
             sim.write::<Residences>().replace(id, home);
             sim.write::<BuildingInfos>().mark_vacancy_changed(id);
@@ -1656,6 +1657,67 @@ mod tests {
                 let abandoned = place(sim, ZoneKind::MixedUse, 330.0);
                 assert!(sim.map_mut().mark_growable_abandoned(abandoned, 0));
                 assert!(spawn_human(sim, abandoned).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn pathpark_incompatible_parking_does_not_block_housing_upgrade() {
+        use crate::map::building_parking::prepare_property_upgrade;
+        use common::saveload::{Bincode, Encoder};
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::pathpark_incompatible_parking_does_not_block_housing_upgrade"
+            ),
+            || {
+                let (mut test, _) = street_with_prototypes(
+                    r#"
+                    for i = 1, rawlen(data) do
+                        local prototype = rawget(data, i)
+                        if prototype.name == "residence-low-l2" then
+                            prototype.parking = {kind = "garage", spaces = 8}
+                        end
+                    end
+                    "#,
+                );
+                let sim = &mut test.g;
+                let id = place_at_density(sim, ZoneKind::Residential, Density::Low, 240.0);
+                let resident = spawn_human(sim, id).unwrap();
+                let car = sim.world().humans[resident].router.personal_car.unwrap();
+                let before = sim.building_parking(id).unwrap();
+                assert_eq!(before.occupied, 1);
+                let old_housing = sim.growable_summary(id).unwrap().housing_slots;
+                let upgrade = {
+                    let map = sim.map();
+                    let context = super::Assessment {
+                        map: &map,
+                        infos: &sim.read::<BuildingInfos>(),
+                        residences: &sim.read::<super::Residences>(),
+                        world: sim.world(),
+                        coverage: &sim.read::<CoverageGrid>(),
+                        environment: &sim.read::<EnvGrid>(),
+                    };
+                    super::prepare_upgrade(&context, map.get(id).unwrap(), None, 2).unwrap()
+                };
+                let spec = super::try_prototype(upgrade.home.as_ref().unwrap().prototype)
+                    .unwrap()
+                    .parking;
+                assert!(prepare_property_upgrade(sim, id, spec, true).is_err());
+                upgrade.commit(sim, id);
+                let grown = sim.growable_summary(id).unwrap();
+                assert_eq!(grown.level, 2);
+                assert!(grown.housing_slots > old_housing);
+                let reloaded: Simulation = Bincode::decode(&Bincode::encode(sim).unwrap()).unwrap();
+                let after = reloaded.building_parking(id).unwrap();
+                assert_eq!(after.kind, before.kind);
+                assert_eq!(after.entrance, before.entrance);
+                assert_eq!(after.occupied, 1);
+                assert_eq!(
+                    reloaded.world().humans[resident].router.personal_car,
+                    Some(car),
+                );
             },
         );
     }
