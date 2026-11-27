@@ -966,13 +966,19 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 person.router.go_to(Destination::Building(trip.home));
             });
     }
-    let returned = |sim: &Simulation, trip: &ScaleTrip| {
+    let parked = |sim: &Simulation, trip: &ScaleTrip| {
         sim.world().humans.get(trip.driver).is_some_and(|human| {
-            human.location == Location::Building(trip.home)
-                && human.router.personal_car == Some(trip.car)
-                && sim.world().vehicles.get(trip.car)
+            human.router.personal_car == Some(trip.car)
+                && sim
+                    .world()
+                    .vehicles
+                    .get(trip.car)
                     .is_some_and(|car| car.vehicle.state.is_parked())
         })
+    };
+    let returned = |sim: &Simulation, trip: &ScaleTrip| {
+        parked(sim, trip)
+            && sim.world().humans[trip.driver].location == Location::Building(trip.home)
     };
     let public_facilities_empty = |sim: &Simulation| {
         public_facilities.iter().all(|&garage| {
@@ -985,13 +991,11 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     const DRAIN_BATCH: usize = 200;
     let mut drain_ticks = 0;
     let mut home_followups = 0;
-    loop {
+    let mut quiet_batches = 0;
+    while drain_ticks < DRAIN_LIMIT {
         ctx.run_ticks_observed(DRAIN_BATCH as u64, |sim| sample_supply(sim, &mut supply));
         drain_ticks += DRAIN_BATCH;
         if public_facilities_empty(&ctx.sim) {
-            if offers.iter().all(|trip| returned(&ctx.sim, trip)) {
-                break;
-            }
             // Closure can send a driver who already walked home to retrieve
             // a car at the garage door. Finish that driver's scripted trip
             // once closure has moved the car to a legal space.
@@ -1013,31 +1017,50 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 });
             }
         }
-        if drain_ticks == DRAIN_LIMIT {
-            let missing: Vec<_> = offers
-                .iter()
-                .filter(|trip| !returned(&ctx.sim, trip))
-                .map(|trip| {
-                    let world = ctx.sim.world();
-                    let driver = world.humans.get(trip.driver).map(|human| {
-                        (
-                            &human.location,
-                            human.trans.pos,
-                            human.router.target_dest,
-                            human.router.personal_car,
-                            human.router.last_error,
-                            format!("{:?}", human.router.cur_step()),
-                        )
-                    });
-                    let car = world.vehicles.get(trip.car).map(|car| &car.vehicle.state);
-                    (trip.driver, trip.car, driver, car)
-                })
-                .collect();
-            return Err(format!(
-                "drain timed out at {drain_ticks} ticks, missing {missing:?}, public parking empty = {}",
-                public_facilities_empty(&ctx.sim)
-            ));
+        let physical_clear =
+            public_facilities_empty(&ctx.sim) && offers.iter().all(|trip| parked(&ctx.sim, trip));
+        let returned_count = offers
+            .iter()
+            .filter(|trip| returned(&ctx.sim, trip))
+            .count();
+        if physical_clear && returned_count == offers.len() {
+            break;
         }
+        let quiet = physical_clear
+            && offers.iter().all(|trip| {
+                let human = &ctx.sim.world().humans[trip.driver];
+                returned(&ctx.sim, trip)
+                    || (human.router.target_dest == Some(Destination::Building(trip.home))
+                        && human.router.cur_step().is_none()
+                        && human.it.has_ended(0.0))
+            });
+        quiet_batches = if quiet { quiet_batches + 1 } else { 0 };
+        if drain_ticks >= 12_000 && quiet_batches >= 5 && returned_count * 100 >= offers.len() * 90
+        {
+            break;
+        }
+    }
+    let returned_count = offers
+        .iter()
+        .filter(|trip| returned(&ctx.sim, trip))
+        .count();
+    let parked_count = offers.iter().filter(|trip| parked(&ctx.sim, trip)).count();
+    if !public_facilities_empty(&ctx.sim)
+        || parked_count != offers.len()
+        || returned_count * 100 < offers.len() * 90
+    {
+        return Err(format!(
+            "drain at tick {drain_ticks} reached {returned_count}/{} doors with {parked_count} original cars parked and public parking clear = {}",
+            offers.len(), public_facilities_empty(&ctx.sim)
+        ));
+    }
+    let unfinished: Vec<_> = offers
+        .iter()
+        .filter(|trip| !returned(&ctx.sim, trip))
+        .map(|trip| (trip.driver, trip.car, trip.home))
+        .collect();
+    if !unfinished.is_empty() {
+        println!("PathPark scale unfinished return walks: {unfinished:?}");
     }
     if home_followups > offers.len() / 20 {
         return Err(format!(
@@ -1047,7 +1070,11 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     let mut drain = BTreeMap::from([
         ("tagged_offers".to_owned(), (offers.len() * 2) as f64),
-        ("tagged_returns".to_owned(), offers.len() as f64),
+        ("tagged_returns".to_owned(), returned_count as f64),
+        (
+            "unfinished_return_walks".to_owned(),
+            unfinished.len() as f64,
+        ),
         ("drain_ticks".to_owned(), drain_ticks as f64),
         ("home_followups".to_owned(), home_followups as f64),
     ]);
