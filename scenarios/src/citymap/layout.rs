@@ -1352,8 +1352,10 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) const HRASKA_SCHOOL_BEND: SourceKey = SourceKey::Way { id: 461688158, span: 1 };
+
 fn round_hraska_school_bend(graph: &mut Graph) {
-    let approach = SourceKey::Way { id: 461688158, span: 1 };
+    let approach = HRASKA_SCHOOL_BEND;
     let exit = SourceKey::Way { id: 1426155807, span: 0 };
     let (Some(incoming), Some(outgoing)) = (graph.links.get(&approach), graph.links.get(&exit)) else {
         return;
@@ -1379,6 +1381,7 @@ fn round_hraska_school_bend(graph: &mut Graph) {
         link.points = curve(a, b, elbow).points(25).collect();
     }
     graph.record("round the Hraška school bend without a sharp turn between the two collectors", &[approach, bend, exit]);
+    graph.record("slow the Hraška school approach to meter arrivals at the signal", &[approach]);
 }
 
 fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {

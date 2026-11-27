@@ -2174,7 +2174,15 @@ fn pattern(graph: &Graph, link: &LinkSpec, index: usize) -> LanePattern {
     } else {
         0.0
     };
-    link.class.pattern(link.one_way, adjustment)
+    let mut pattern = link.class.pattern(link.one_way, adjustment);
+    if graph.wet && link.key == super::layout::HRASKA_SCHOOL_BEND {
+        for (kind, speed) in pattern.lanes_forward.iter_mut().chain(&mut pattern.lanes_backward) {
+            if *kind == LaneKind::Driving {
+                *speed = 8.0;
+            }
+        }
+    }
+    pattern
 }
 
 pub fn resolve_network(map: &Map, graph: &Graph) -> Result<BuiltNetwork, String> {

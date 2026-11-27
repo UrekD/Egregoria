@@ -4788,7 +4788,7 @@ mod tests {
         let junction = &map.intersections()[hraska_egress];
         assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
-        let bend = built.links[&SourceKey::Way { id: 461688158, span: 1 }].road;
+        let bend = built.links[&super::super::layout::HRASKA_SCHOOL_BEND].road;
         let road = &map.roads()[bend];
         assert_eq!(
             road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving).count(),
@@ -4798,6 +4798,8 @@ mod tests {
             road.lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
             "the Hraška school bend must keep curb manoeuvres clear of the turn onto the collector",
         );
+        assert!(road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving)
+            .all(|(lane, _)| map.lanes()[lane].speed_limit == 8.0));
         let exit = built.links[&SourceKey::Way { id: 1426155807, span: 0 }].road;
         let (_, entering) = road.points().point_dir_along(road.points().length());
         let (_, leaving) = map.roads()[exit].points().point_dir_along(0.0);
