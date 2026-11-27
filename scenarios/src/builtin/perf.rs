@@ -67,7 +67,15 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
 
     // perf_10k measures the 08:25–10:05 morning commute ramp in game time (fixed tick
     // counts, so the hourly passes at 09:00 and 10:00 fall inside the measured window).
-    for (label, ticks) in [("setup", 0), ("warmup", 2_000), ("measured", 10_000)] {
+    const WARMUP_TICKS: u64 = 2_000;
+    const MEASURED_TICKS: u64 = 10_000;
+    let mut opening = crate::runner::ParkingOpening::capture(&ctx.sim);
+    for (label, ticks) in [("setup", 0), ("warmup", WARMUP_TICKS), ("measured", MEASURED_TICKS)] {
+        if label == "measured" {
+            if let Some(opening) = opening.take() {
+                opening.write(&ctx.sim, None, WARMUP_TICKS, MEASURED_TICKS)?;
+            }
+        }
         let workload = if label == "measured" && options.minimum_employment_percent.is_some() {
             let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
             ctx.run_ticks_observed(ticks, |sim| workload.observe(sim));

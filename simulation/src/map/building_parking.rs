@@ -461,7 +461,7 @@ pub(crate) struct BuildingParking {
     #[serde(skip)]
     mouths: BTreeMap<RoadID, BTreeSet<(u32, BuildingID)>>,
     #[serde(skip)]
-    public_garages: BTreeSet<BuildingID>,
+    public_garages: BTreeMap<(i32, i32), BTreeSet<BuildingID>>,
     #[serde(skip)]
     closing_cars: BTreeSet<VehicleID>,
     #[serde(skip)]
@@ -532,6 +532,10 @@ struct Motion {
     car: VehicleID,
     tick: u16,
     departure: Option<DirectedPlan>,
+}
+
+fn garage_cell(door: Vec3) -> (i32, i32) {
+    ((door.x / 200.0).floor() as i32, (door.y / 200.0).floor() as i32)
 }
 
 impl BuildingParking {
@@ -605,7 +609,10 @@ impl BuildingParking {
             .or_default()
             .insert((layout.anchor.station_cm, id));
         if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
-            self.public_garages.insert(id);
+            self.public_garages
+                .entry(garage_cell(layout.door))
+                .or_default()
+                .insert(id);
         }
         self.sites.insert(
             id,
@@ -627,7 +634,14 @@ impl BuildingParking {
             if mouths.is_empty() {
                 self.mouths.remove(&anchor.road);
             }
-            self.public_garages.remove(&id);
+            if matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_)) {
+                let cell = garage_cell(site.layout.door);
+                let garages = self.public_garages.get_mut(&cell).unwrap();
+                garages.remove(&id);
+                if garages.is_empty() {
+                    self.public_garages.remove(&cell);
+                }
+            }
             for spot in site.layout.masks {
                 parking.unmask(spot);
             }
@@ -730,25 +744,25 @@ impl BuildingParking {
         !self.public_garages.is_empty()
     }
 
-    pub(crate) fn nearby_public_garages(&self, map: &Map, destination: Vec3) -> Vec<BuildingID> {
+    pub(crate) fn nearby_public_garages(&self, destination: Vec3) -> Vec<BuildingID> {
         if !self.has_public_garages() {
             return Vec::new();
         }
-        let mut garages: Vec<_> = map
-            .spatial_map()
-            .query_around(destination.xy(), 400.0, ProjectFilter::BUILDING)
-            .filter_map(|object| {
-                let crate::map::ProjectKind::Building(id) = object else {
-                    return None;
-                };
-                if !self.public_garages.contains(&id) {
-                    return None;
-                }
+        let radius = 400.0;
+        let delta = Vec3::new(radius, radius, 0.0);
+        let (left, bottom) = garage_cell(destination - delta);
+        let (right, top) = garage_cell(destination + delta);
+        let mut garages: Vec<_> = (bottom..=top)
+            .flat_map(|y| (left..=right).map(move |x| (x, y)))
+            .filter_map(|cell| self.public_garages.get(&cell))
+            .flatten()
+            .take(64)
+            .filter_map(|&id| {
                 let site = &self.sites[&id];
                 site.free_slot()?;
                 let door = site.layout.door;
                 let distance = door.distance2(destination);
-                (distance <= 400.0_f32.powi(2) && (door.z - destination.z).abs() < 4.0)
+                (distance <= radius.powi(2) && (door.z - destination.z).abs() < 4.0)
                     .then_some((ordered_float::OrderedFloat(distance), id))
             })
             .collect();
@@ -973,7 +987,12 @@ impl BuildingParking {
         })
     }
 
-    pub(crate) fn update(&mut self, world: &mut World, grid: &mut TransportGrid) {
+    pub(crate) fn update(
+        &mut self,
+        world: &mut World,
+        grid: &mut TransportGrid,
+        mut recover: impl FnMut(VehicleID, Vec3),
+    ) {
         self.motions.retain(|id, motion| {
             let site = self.sites.get_mut(id).unwrap();
             let Some(actor) = world.vehicles.get_mut(motion.car) else {
@@ -991,10 +1010,17 @@ impl BuildingParking {
                 return true;
             }
             if let Some(route) = motion.departure.take() {
-                self.parked.remove(&motion.car);
+                let occupant = self.parked.remove(&motion.car).unwrap();
                 site.occupied.remove(&motion.car);
                 self.closing_cars.remove(&motion.car);
-                actor.it = route.into_itinerary();
+                if world.humans.get(occupant.driver)
+                    .is_some_and(|human| human.router.personal_car == Some(motion.car))
+                {
+                    actor.it = route.into_itinerary();
+                } else {
+                    actor.it = Itinerary::NONE;
+                    recover(motion.car, site.layout.door);
+                }
                 sync_actor(grid, actor);
             } else {
                 let arrival = self.arrivals.remove(&motion.car).unwrap();
@@ -1041,7 +1067,10 @@ impl BuildingParking {
             !retire_vacant
                 || mouths
                     .iter()
-                    .any(|&(_, id)| self.busy(id) || self.public_garages.contains(&id))
+                    .any(|&(_, id)| {
+                        self.busy(id)
+                            || matches!(self.sites[&id].layout.kind, BuildingParkingKind::PublicGarage(_))
+                    })
         })
     }
 
@@ -1187,7 +1216,10 @@ impl BuildingParking {
                 .or_default()
                 .insert((layout.anchor.station_cm, id));
             if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
-                self.public_garages.insert(id);
+                self.public_garages
+                    .entry(garage_cell(layout.door))
+                    .or_default()
+                    .insert(id);
             }
             for &mask in &layout.masks {
                 if !map.parking.contains(mask) || !parking.is_unreserved(mask) {

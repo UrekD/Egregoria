@@ -101,6 +101,9 @@ pub fn generate_with_options(
         .collect();
     report.junction_policies = junction_policy_changes(&sim.map(), &city, &network);
     let mut ctx = ScenarioCtx::from_sim(sim);
+    if std::env::var_os("EGR_PATHPARK_CURB_ONLY").is_some() {
+        ctx.sim.use_curb_only_benchmark_parking();
+    }
     let facilities = lesce::place_facilities(&mut ctx, &city, &network, &layout, &mut report)?;
     lesce::check_routes(&ctx.sim, &city, &network, &layout, &facilities, &mut report)?;
     super::zoning::zone_and_seed(&mut ctx.sim, &city, &network, &facilities, &mut report)?;

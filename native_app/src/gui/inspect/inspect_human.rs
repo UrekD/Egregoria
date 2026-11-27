@@ -158,6 +158,12 @@ fn blocker_description(blocker: CitizenBlocker) -> &'static str {
         CitizenBlocker::DestinationDisconnected => "The destination has no road connection",
         CitizenBlocker::PickupTimedOut => "The last retail pickup timed out",
         CitizenBlocker::Route(RouterError::PropertyParkingBlocked) => "The driveway entrance is blocked",
+        CitizenBlocker::Route(RouterError::PropertyParkingUnavailable(_)) => {
+            "The property parking claim is no longer available"
+        }
+        CitizenBlocker::Route(RouterError::PropertyParkingBudgetExhausted) => {
+            "The parking search reached its work limit"
+        }
         CitizenBlocker::Route(RouterError::LocatingVehicle) => "Could not locate the vehicle",
         CitizenBlocker::Route(RouterError::TranslatingParkingSpotToDrivePos) => {
             "Could not route to the parking spot"

@@ -41,26 +41,26 @@ impl PathKind {
         map: &Map,
         start: Traversable,
         end: LaneID,
+        remaining: &mut usize,
     ) -> Option<Vec<Traversable>> {
         use std::collections::{hash_map::Entry, VecDeque};
 
-        let mut remaining = 512_usize;
         let mut parents = FastMap::default();
         parents.insert(walk_state(start), None);
         let mut queue = VecDeque::from([start]);
         while let Some(current) = queue.pop_front() {
-            remaining = remaining.checked_sub(1)?;
+            *remaining = remaining.checked_sub(1)?;
             if current.kind == TraverseKind::Lane(end) {
                 let mut path = vec![current];
                 while let Some(parent) = parents[&walk_state(*path.last()?)] {
-                    remaining = remaining.checked_sub(1)?;
+                    *remaining = remaining.checked_sub(1)?;
                     path.push(parent);
                 }
                 path.reverse();
                 return Some(path);
             }
             for (next, _) in walk_successors(map, current) {
-                remaining = remaining.checked_sub(1)?;
+                *remaining = remaining.checked_sub(1)?;
                 if let Entry::Vacant(entry) = parents.entry(walk_state(next)) {
                     entry.insert(Some(current));
                     queue.push_back(next);

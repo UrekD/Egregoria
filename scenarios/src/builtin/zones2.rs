@@ -707,7 +707,15 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
     stage_teardown_hires(live)?;
-    let (roads, affected) = staffed_teardown_frontage(&live.sim)?;
+    let mut frontage = staffed_teardown_frontage(&live.sim);
+    for _ in 0..TICKS_PER_HOUR {
+        if frontage.is_ok() {
+            break;
+        }
+        live.run_ticks(1);
+        frontage = staffed_teardown_frontage(&live.sim);
+    }
+    let (roads, affected) = frontage?;
     let (endpoints, parcels) = {
         let map = live.sim.map();
         let endpoints: Vec<_> = roads
@@ -955,11 +963,21 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let infos = ctx.sim.read::<BuildingInfos>();
         let map = ctx.sim.map();
         let mut workers_by_home = BTreeMap::<_, usize>::new();
+        let mut removable = BTreeMap::new();
         for seller in mixed_sellers(&ctx.sim) {
             let SoulID::GoodsCompany(company) = seller else {
                 continue;
             };
-            for &worker in &ctx.sim.world().companies[company].workers.0 {
+            let employer = &ctx.sim.world().companies[company];
+            let Some(road) = map.get(employer.comp.building).and_then(|site| site.connected_road) else {
+                continue;
+            };
+            if !*removable.entry(road).or_insert_with(|| {
+                WorldCommand::MapRemoveRoad(road).validate_and_price(&ctx.sim).is_ok()
+            }) {
+                continue;
+            }
+            for &worker in &employer.workers.0 {
                 let home = infos
                     .residence_of(SoulID::Human(worker))
                     .filter(|&home| map.get(home).is_some_and(|site| !site.is_mixed_use()));
@@ -970,13 +988,32 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
         }
         workers_by_home
             .into_iter()
-            .filter(|&(home, _)| ctx.sim.building_parking(home)
-                .is_none_or(|parking| parking.occupied == 0 && parking.held == 0))
+            .filter(|&(home, _)| {
+                WorldCommand::MapRemoveBuilding(home).validate_and_price(&ctx.sim).is_ok()
+            })
             .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
     };
-    run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)
+    let parcel = *ctx.sim.map().lot_origin(home).ok_or("hire staging house has no parcel")?;
+    run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)?;
+
+    // Refill the cleared parcel via the checked housing flow. Its new residents
+    // submit ordinary job applications near the vacancy just advertised.
+    let lot = ctx.sim.map().lots().values()
+        .find(|lot| lot.parent == parcel.parent_road && lot.shape.corners == parcel.shape.corners)
+        .ok_or("hire staging parcel was not restored")?.id;
+    run_teardown_batch(ctx, &[WorldCommand::MapBuildHouse(lot)], 1)?;
+    let home = ctx.sim.map().buildings().values()
+        .find(|building| building.obb.corners == parcel.shape.corners)
+        .map(|building| building.id).ok_or("replacement hire staging home was not built")?;
+    // Existing zoning immigration still runs. Seed one applicant if the new
+    // home has no residents, so the timing of that pass does not decide the cut.
+    if ctx.sim.read::<BuildingInfos>().get(home).is_some_and(|info| info.residents.is_empty()) {
+        simulation::souls::human::spawn_human(&mut ctx.sim, home)
+            .ok_or("could not stage a real job applicant")?;
+    }
+    Ok(())
 }
 
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {

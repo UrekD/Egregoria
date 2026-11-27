@@ -44,6 +44,7 @@ fn run_paris(ctx: &mut ScenarioCtx, case: PerfCase) -> Result<MeasuredWindow, St
         Some(case.agents),
         false,
         false,
+        None,
     )
 }
 
@@ -79,7 +80,21 @@ pub fn bench_slot_with_workers(
     let sim = Simulation::load_from_slot(&root, id)
         .map_err(|error| format!("{} ({id}): {error}", root.display()))?;
     let load_ms = milliseconds(start.elapsed());
+    let opening = crate::runner::ParkingOpening::capture(&sim);
+    let slot_revision = if opening.is_some() {
+        let paths = simulation::slot_paths(&root, id).map_err(|error| error.to_string())?;
+        let header = Simulation::read_slot_snapshot_header(&paths.zip, simulation::SnapshotKind::Zip)
+            .map_err(|error| error.to_string())?;
+        Some(header.revision.ok_or("missing benchmark slot revision")?.get())
+    } else {
+        None
+    };
     let mut ctx = ScenarioCtx::from_sim(sim);
+    if opening.is_some() && id.as_str() == "lesce_osm" {
+        let world = ctx.sim.world_mut_unchecked();
+        let terminal = world.freight_stations.keys().min().ok_or("missing Lesce freight terminal")?;
+        world.freight_stations[terminal].f.waiting_cargo = 100;
+    }
     let window = measure_windows(
         &mut ctx,
         warmup_ticks,
@@ -87,6 +102,7 @@ pub fn bench_slot_with_workers(
         None,
         false,
         id.as_str() == "lesce_osm",
+        opening.zip(slot_revision),
     )?;
 
     let start = Instant::now();
@@ -229,6 +245,7 @@ fn measure_windows(
     expected_agents: Option<usize>,
     track_traffic: bool,
     track_parking_work: bool,
+    opening: Option<(crate::runner::ParkingOpening, u128)>,
 ) -> Result<MeasuredWindow, String> {
     let start_tick = ctx.sim.get_tick();
     if start_tick
@@ -244,6 +261,9 @@ fn measure_windows(
         peak_agents = peak_agents.max(sim.world().humans.len())
     });
     sample_workload(ctx, "warmup", expected_agents)?;
+    if let Some((opening, revision)) = opening {
+        opening.write(&ctx.sim, Some(revision), warmup_ticks, measured_ticks)?;
+    }
     let count_active_vehicles = |sim: &Simulation| {
         sim.world()
             .vehicles
@@ -429,6 +449,7 @@ pub fn benchmark_layout_with_scale(
         Some(case.agents),
         true,
         false,
+        None,
     )?;
     if fixture.activity_floors_checked {
         validate_activity(&ctx.samples, &fixture, window.peak_active_vehicles.unwrap())?;
@@ -746,7 +767,7 @@ mod tests {
         let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
         ctx.run_ticks(3);
         let setup_tick = ctx.sim.get_tick();
-        let window = measure_windows(&mut ctx, 2, 1, None, false, false).unwrap();
+        let window = measure_windows(&mut ctx, 2, 1, None, false, false, None).unwrap();
         let case = PerfCase {
             agents: 1,
             warmup_ticks: 2,
@@ -781,7 +802,7 @@ mod tests {
         });
         grid_city(&mut ctx, vec2(700.0, 700.0), 2, 2, 160.0);
         setup_houses(&mut ctx, 4).unwrap();
-        let window = measure_windows(&mut ctx, 1, 1, None, false, false).unwrap();
+        let window = measure_windows(&mut ctx, 1, 1, None, false, false, None).unwrap();
         let case = PerfCase {
             agents: 4,
             warmup_ticks: 1,

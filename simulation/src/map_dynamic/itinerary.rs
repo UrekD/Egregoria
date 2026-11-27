@@ -423,13 +423,23 @@ impl Itinerary {
         )
     }
 
-    pub(crate) fn property_walk(start: Vec3, end: Vec3, map: &Map) -> Option<Self> {
+    pub(crate) fn property_walk(
+        start: Vec3,
+        end: Vec3,
+        map: &Map,
+        remaining: &mut usize,
+    ) -> Option<Self> {
         let local_sidewalk = |position: Vec3| {
             let lane = map.nearest_lane(position, crate::map::LaneKind::Walking, Some(24.0))?;
             (map.get(lane)?.points.project_dist2(position) <= 24.0_f32.powi(2)).then_some(lane)
         };
         let start_lane = local_sidewalk(start)?;
         let end_lane = local_sidewalk(end)?;
+        let geometry_work = map.get(start_lane)?.points.len() + map.get(end_lane)?.points.len();
+        *remaining = remaining.saturating_sub(geometry_work);
+        if *remaining == 0 {
+            return None;
+        }
         Self::route_from_lanes(
             start,
             start_lane,
@@ -438,7 +448,7 @@ impl Itinerary {
             ItineraryTarget::Position(end),
             map,
             PathKind::Pedestrian,
-            |start| PathKind::bounded_parking_walk(map, start, end_lane),
+            |start| PathKind::bounded_parking_walk(map, start, end_lane, remaining),
         )
     }
 

@@ -1251,7 +1251,12 @@ mod pathpark_driveway {
             let map = resources.read::<Map>();
             let now = crate::map_dynamic::transit::elapsed_ticks(resources).0;
             let mut grid = resources.write::<TransportGrid>();
-            traffic.properties.update(world, &mut grid);
+            traffic.properties.update(world, &mut grid, |car, door| {
+                let cbuf = resources.read::<crate::ParCommandBuffer<crate::VehicleEnt>>();
+                cbuf.exec_ent(car, move |sim| {
+                    crate::map_dynamic::recover_car_later(sim, car, Some(door));
+                });
+            });
             for facility in &mut traffic.facilities {
                 if facility.advance(world, &map, &mut grid, now) {
                     facility.claim = None;

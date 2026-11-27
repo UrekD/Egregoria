@@ -100,15 +100,19 @@ impl ParkingManagement {
             .then_some(SpotReservation(spot))
     }
 
-    pub(crate) fn property_curb_candidates(&self, map: &Map, near: Vec3) -> Vec<ParkingSpotID> {
+    pub(crate) fn property_curb_candidates(
+        &self,
+        map: &Map,
+        near: Vec3,
+    ) -> (Vec<ParkingSpotID>, Vec<ParkingSpotID>) {
         use crate::map::{ProjectFilter, ProjectKind};
         use ordered_float::OrderedFloat;
         let radius = 400.0_f32;
-        let mut candidates = Vec::new();
+        let mut lanes = Vec::new();
         for hit in map
             .spatial_map()
             .query_around(near.xy(), radius, ProjectFilter::ROAD)
-            .take(64)
+            .take(32)
         {
             let ProjectKind::Road(id) = hit else { continue };
             let Some(road) = map.get(id) else { continue };
@@ -116,24 +120,44 @@ impl ParkingManagement {
                 if kind != LaneKind::Parking {
                     continue;
                 }
-                let Some(spots) = map.parking.closest_spots(lane, near) else {
-                    continue;
-                };
-                for spot in spots.take(64).filter(|&spot| self.is_spot_free(spot)).take(8) {
-                    let point = map.parking.get(spot).unwrap().trans.pos;
-                    let distance = point.distance2(near);
-                    if distance <= radius.powi(2) && (point.z - near.z).abs() < 4.0 {
-                        candidates.push((OrderedFloat(distance), spot));
-                    }
+                if let Some(spots) = map.parking.closest_spots(lane, near) {
+                    lanes.push(spots);
                 }
             }
         }
-        candidates.sort_unstable();
-        candidates
-            .into_iter()
-            .take(32)
-            .map(|(_, spot)| spot)
-            .collect()
+        // Interleave lanes so a full stretch of curb cannot consume the whole
+        // inspection allowance before a different street is even considered.
+        let mut curb = Vec::new();
+        let mut street = Vec::new();
+        let mut inspections = 64;
+        while inspections > 0 && !lanes.is_empty() {
+            lanes.retain_mut(|spots| {
+                if inspections == 0 {
+                    return false;
+                }
+                let Some(spot) = spots.next() else { return false };
+                inspections -= 1;
+                let point = map.parking.get(spot).unwrap().trans.pos;
+                let distance = point.distance2(near);
+                if distance <= radius.powi(2)
+                    && (point.z - near.z).abs() < 4.0
+                    && self.is_spot_free(spot)
+                {
+                    let candidates = if distance <= NEAR_PARKING_RADIUS.powi(2) {
+                        &mut curb
+                    } else {
+                        &mut street
+                    };
+                    candidates.push((OrderedFloat(distance), spot));
+                }
+                true
+            });
+        }
+        let ranked = |mut candidates: Vec<_>| {
+            candidates.sort_unstable();
+            candidates.into_iter().take(8).map(|(_, spot)| spot).collect()
+        };
+        (ranked(curb), ranked(street))
     }
 
     pub(crate) fn mask(&mut self, spot: ParkingSpotID) {

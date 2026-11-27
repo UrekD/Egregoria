@@ -762,6 +762,8 @@ fn apply_router_error(view: &mut TripView, error: Option<RouterError>) {
                 RouterError::TranslatingParkingSpotToDrivePos => "Parking access unavailable",
                 RouterError::LocatingVehicle => "Vehicle location unavailable",
                 RouterError::PropertyParkingBlocked => "Property parking entrance unavailable",
+                RouterError::PropertyParkingUnavailable(_) => "Property parking claim unavailable",
+                RouterError::PropertyParkingBudgetExhausted => "Parking search limit reached",
             };
             view.state = format!("Stuck · {reason}");
         }

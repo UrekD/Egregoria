@@ -43,12 +43,20 @@ def digest(value, label):
     return value
 
 
-def score(artifacts, fixture, run, build, pinned, cpu):
+def run_order(pairs):
+    for fixture in FIXTURES:
+        for pair in range(1, pairs + 1):
+            builds = ("parent", "candidate") if pair % 2 else ("candidate", "parent")
+            for build in builds:
+                yield fixture, pair, build
+    yield "perf_10k", "absolute", "candidate"
+
+
+def score(artifacts, fixture, run, build, pinned, cpu, identity):
     stem = artifacts / f"{fixture}-{run}-{build}"
     if int(stem.with_suffix(".status").read_text()) != 0:
         raise ValueError(f"{stem} benchmark failed")
     payload = json.loads(stem.with_suffix(".json").read_text())
-    identity = json.loads(stem.with_suffix(".workload.json").read_text())
     if (identity["fixture"], identity["run"], identity["build"]) != (fixture, run, build):
         raise ValueError(f"{stem} has the wrong run identity")
     if (count(identity["workers"], "workers"), count(identity["cpu"], "cpu")) != (1, cpu):
@@ -122,6 +130,28 @@ def compare(manifest, artifacts):
     if type(pairs) is not int or pairs < 3:
         raise ValueError("at least three complete pairs are required")
     cpu = count(manifest["cpu"], "cpu")
+    campaign = digest(manifest["campaign_id"], "campaign_id")
+    previous_end = 0
+    measurements = {}
+    timing_signatures = {fixture: set() for fixture in FIXTURES}
+    for sequence, key in enumerate(run_order(pairs), 1):
+        fixture, run, build = key
+        stem = artifacts / f"{fixture}-{run}-{build}"
+        identity = json.loads(stem.with_suffix(".workload.json").read_text())
+        if identity["campaign_id"] != campaign:
+            raise ValueError(f"{stem} belongs to another campaign")
+        start = count(identity["start_ns"], "start_ns")
+        end = count(identity["end_ns"], "end_ns")
+        if count(identity["sequence"], "sequence") != sequence or not previous_end <= start < end:
+            raise ValueError(f"{stem} is out of execution order")
+        previous_end = end
+        result = score(artifacts, fixture, run, build, manifest["fixtures"][fixture], cpu, identity)
+        timing = tuple(result[key] for key in
+                       ("median_ticks_per_sec", "p99_ms_per_tick", "wall_ticks_per_sec"))
+        if timing in timing_signatures[fixture]:
+            raise ValueError(f"{stem} has duplicate timings")
+        timing_signatures[fixture].add(timing)
+        measurements[key] = result
     verdict = {}
     failed = []
     for fixture in FIXTURES:
@@ -134,8 +164,8 @@ def compare(manifest, artifacts):
         parent = []
         candidate = []
         for pair in range(1, pairs + 1):
-            master = score(artifacts, fixture, pair, "parent", ceilings, cpu)
-            wave = score(artifacts, fixture, pair, "candidate", ceilings, cpu)
+            master = measurements[fixture, pair, "parent"]
+            wave = measurements[fixture, pair, "candidate"]
             if not equivalent_work(master["workload"], wave["workload"]):
                 failed.append(f"{fixture} pair {pair} did not match the recorded workload")
             if wave["p99_ms_per_tick"] > tail_limit or wave["rss_kib"] > rss_limit:
@@ -143,7 +173,7 @@ def compare(manifest, artifacts):
             parent.append(master["median_ticks_per_sec"])
             candidate.append(wave["median_ticks_per_sec"])
             if fixture == "perf_10k" and pair == 1:
-                absolute = score(artifacts, fixture, "absolute", "candidate", ceilings, cpu)
+                absolute = measurements[fixture, "absolute", "candidate"]
                 if (absolute["median_ticks_per_sec"] < 150.0
                         or absolute["p99_ms_per_tick"] > tail_limit
                         or absolute["rss_kib"] > rss_limit
