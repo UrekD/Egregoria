@@ -1,5 +1,5 @@
 use crate::{Scenario, ScenarioCtx};
-use geom::{vec2, vec3, Vec2};
+use geom::{vec2, Vec2};
 use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKind, GarageKind};
 use simulation::map::{
     BuildingID, Density, LanePatternBuilder, MapProject, ProjectFilter, ProjectKind, ZoneCell,
