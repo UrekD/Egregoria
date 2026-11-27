@@ -63,36 +63,138 @@ pub const EDITS: (Scenario, SimulationOptions) = (
 );
 
 fn run_basic(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    let (from, to) = {
-        let map = ctx.sim.map();
-        (
-            map.pick_path_ground(20_000, 18_000)
-                .ok_or("invalid path start")?,
-            map.pick_path_ground(29_000, 18_000)
-                .ok_or("invalid path end")?,
-        )
+    use prototypes::Tick;
+    use simulation::map::{PathEndpoint, PathKind, RoadID};
+    use simulation::map_dynamic::Itinerary;
+
+    let ground = |map: &simulation::map::Map, x, y| {
+        map.pick_path_ground(x, y)
+            .ok_or("invalid walking fixture ground")
     };
-    ctx.submit(&[WorldCommand::MapMakeWalkingPath {
-        from,
-        to,
-        control: None,
-    }]);
-    ctx.run_ticks(1);
-    let road = ctx
-        .sim
-        .read::<CommandOutcomes>()
-        .walking_path(0)
-        .ok_or("missing walking path receipt")?
-        .map_err(|reason| format!("{reason:?}"))?;
+    fn join(sim: &mut Simulation, from: PathEndpoint, to: PathEndpoint) -> Result<RoadID, String> {
+        sim.apply_commands([&WorldCommand::MapMakeWalkingPath {
+            from,
+            to,
+            control: None,
+        }]);
+        sim.read::<CommandOutcomes>()
+            .walking_path(0)
+            .ok_or("missing walking path receipt".to_owned())?
+            .map_err(|reason| format!("{reason:?}"))
+    }
+    let tip = |map: &simulation::map::Map, road: RoadID, start: bool| {
+        let segment = map.get(road).ok_or("missing walking fixture segment")?;
+        let joint = if start { segment.src } else { segment.dst };
+        let position = map
+            .get(joint)
+            .ok_or("missing walking fixture junction")?
+            .pos;
+        map.pick_path_attachment(simulation::map::ProjectKind::Intersection(joint), position)
+            .ok_or("invalid walking fixture junction")
+    };
+    let [a, b, c, d, entry, exit] = {
+        let map = ctx.sim.map();
+        [
+            ground(&map, 20_000, 18_000)?,
+            ground(&map, 20_000, 31_000)?,
+            ground(&map, 32_000, 31_000)?,
+            ground(&map, 32_000, 18_000)?,
+            ground(&map, 17_700, 18_000)?,
+            ground(&map, 34_300, 18_000)?,
+        ]
+    };
+    let west = join(&mut ctx.sim, a, b)?;
+    let b = tip(&ctx.sim.map(), west, false)?;
+    let north = join(&mut ctx.sim, b, c)?;
+    let c = tip(&ctx.sim.map(), north, false)?;
+    let east = join(&mut ctx.sim, c, d)?;
+    let entry_end = tip(&ctx.sim.map(), west, true)?;
+    let entry = join(&mut ctx.sim, entry, entry_end)?;
+    let exit_start = tip(&ctx.sim.map(), east, false)?;
+    let exit = join(&mut ctx.sim, exit_start, exit)?;
+    let ends = {
+        let map = ctx.sim.map();
+        (tip(&map, west, true)?, tip(&map, east, false)?)
+    };
+    let cohorts: Vec<_> = {
+        let map = ctx.sim.map();
+        (0..20)
+            .map(|index| {
+                let offset = 2.0 + index as f32 * 0.45;
+                let left = map.roads()[entry].points().point_along(offset);
+                let right = map.roads()[exit]
+                    .points()
+                    .point_along(map.roads()[exit].length() - offset);
+                (left, right)
+            })
+            .collect()
+    };
+    let walk = |sim: &Simulation| {
+        let map = sim.map();
+        cohorts
+            .iter()
+            .map(|&(start, end)| {
+                let mut travel = Itinerary::route(Tick(0), start, end, &map, PathKind::Pedestrian)?;
+                let mut position = start;
+                for step in 1..=1_200 {
+                    position = travel.update(position, 0.5, Tick(step), 0, &map);
+                    if position.distance2(end) < 0.25 {
+                        return Some(step);
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+    };
+    let control = walk(&ctx.sim);
+    let bays = ctx.sim.map().parking.all_spots().count();
+    let shortcut = join(&mut ctx.sim, ends.0, ends.1)?;
+    let candidate = walk(&ctx.sim);
+    let cutoff = 400;
+    let reached = |steps: &[Option<u64>]| {
+        steps
+            .iter()
+            .filter(|step| step.is_some_and(|n| n <= cutoff))
+            .count()
+    };
+    let total = cohorts.len();
+    let before = reached(&control);
+    let after = reached(&candidate);
+    let median = |mut steps: Vec<u64>| {
+        steps.sort_unstable();
+        steps.get(steps.len() / 2).copied()
+    };
+    let matched: Vec<_> = control
+        .into_iter()
+        .zip(candidate)
+        .filter_map(|(a, b)| a.zip(b))
+        .collect();
+    let control_median = median(matched.iter().map(|&(a, _)| a).collect());
+    let shortcut_median = median(matched.iter().map(|&(_, b)| b).collect());
+    if before * 100 > total * 85
+        || after * 100 < total * 95
+        || after.saturating_sub(before) * 100 < total * 15
+        || shortcut_median
+            .zip(control_median)
+            .is_none_or(|(short, long)| short >= long)
+    {
+        return Err(format!(
+            "walking shortcut reached {after}/{total} versus {before}/{total}, median {shortcut_median:?} versus {control_median:?}"
+        ));
+    }
+    if ctx.sim.map().parking.all_spots().count() != bays {
+        return Err("walking shortcut changed curb supply".into());
+    }
     ctx.sample("shortcut");
     let restored = ctx.round_tripped()?;
     if ctx.sim.hashes() != restored.hashes()
-        || restored.map().get(road).is_none_or(|road| {
+        || restored.map().get(shortcut).is_none_or(|road| {
             !road.is_walking_path() || road.lanes_iter().any(|(_, kind)| kind != LaneKind::Walking)
         })
     {
         return Err("walking shortcut diverged or has a vehicle lane".into());
     }
+    println!("PathPark shortcut: {after}/{total} within the cutoff versus {before}/{total}; median {shortcut_median:?} versus {control_median:?}");
     Ok(())
 }
 
