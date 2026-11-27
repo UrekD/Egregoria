@@ -949,11 +949,8 @@ fn routing_changed(
             router.steps.push(RoutingStep::GetInBuilding(building));
         }
 
-        router.last_error = if mode == TripMode::Walk {
-            parking_budget.as_ref().and_then(PropertyBudget::error)
-        } else {
-            None
-        };
+        // Callers use last_error to abort trips. A walking fallback is a committed route.
+        router.last_error = None;
         router.cur_dest = router.target_dest;
 
         router.steps.reverse();
@@ -2772,6 +2769,86 @@ mod tests {
             expired.error(),
             Some(RouterError::PropertyParkingBudgetExhausted)
         ));
+    }
+
+    #[test]
+    fn homebound_groceries_arrive_on_foot_after_parking_search_expires() {
+        use crate::map::{Density, Lot, ZoneCell, ZoneKind};
+        use crate::souls::household::HOMEBOUND_TRAVEL_LIMIT;
+        use crate::souls::human::HumanDecisionKind;
+
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(75.0, 100.0, 0.0), vec3(450.0, 100.0, 0.0)]);
+        let trip_origin = ctx.build_house_near(vec2(180.0, 135.0));
+        let lot = {
+            let map = ctx.g.map();
+            map.lots()
+                .values()
+                .filter(|lot| !Lot::footprint_obstructed(&map, lot.shape, false))
+                .min_by_key(|lot| lot.shape.center().distance2(vec2(280.0, 135.0)) as i32)
+                .unwrap()
+                .id
+        };
+        let home = ctx
+            .g
+            .place_zoned_growable(
+                lot,
+                ZoneCell {
+                    kind: ZoneKind::Residential,
+                    density: Density::Low,
+                },
+            )
+            .unwrap()
+            .building;
+        let human = spawn_human(&mut ctx.g, home).unwrap();
+        let car = ctx.g.world.humans[human].router.personal_car.unwrap();
+        assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 1);
+
+        let target = Destination::Building(home);
+        let groceries = ItemID::new("groceries");
+        let now = elapsed_ticks(ctx.g.world_res().1);
+        ctx.g.world.edit_human(human, |h| {
+            h.location = Location::Building(trip_origin);
+            h.household.carried.insert(groceries, 3);
+            h.household.homebound_until = Some(now.0 + HOMEBOUND_TRAVEL_LIMIT);
+            h.decision.kind = HumanDecisionKind::DepositAtHome;
+            h.decision.wait = 1;
+            h.router.go_to_for(target, TripPurpose::Home);
+        });
+        {
+            let mut infos = ctx.g.write::<BuildingInfos>();
+            infos.get_out(home, SoulID::Human(human));
+            infos.get_in(trip_origin, SoulID::Human(human));
+        }
+        ctx.g.write::<DrivewayTraffic>().properties.suspend_search(
+            human,
+            PendingPropertySearch {
+                target,
+                car,
+                expires: now,
+                work_left: 1,
+                checked: Vec::new(),
+                pickup: None,
+                selection: ParkingSelection::default(),
+                stage: ParkingSearchStage::Selection,
+            },
+        );
+
+        ctx.tick_fast();
+        let h = &ctx.g.world.humans[human];
+        assert_eq!(h.router.cur_dest, Some(target));
+        assert!(
+            h.router.last_error.is_none(),
+            "the walking fallback was marked as failed: {:?}",
+            h.router.last_error
+        );
+        assert!((0..8_000).any(|_| {
+            ctx.tick_fast();
+            let h = &ctx.g.world.humans[human];
+            h.location == Location::Building(home)
+                && h.household.on_hand.get(&groceries) == Some(&3)
+        }));
+        assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 1);
     }
 
     #[test]
