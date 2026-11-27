@@ -27,6 +27,7 @@ pub enum BuildingKind {
     TrainStation,
     ExternalTrading,
     ParkingGarage(crate::map::building_parking::GarageKind),
+    ParkingLot { width_blocks: u8 },
 }
 
 impl BuildingKind {
@@ -235,6 +236,15 @@ impl PreparedBuilding {
     ) {
         self.0.door_pos = door;
         self.0.mesh = crate::map::building_parking::garage_mesh(kind, self.0.obb, self.0.height);
+    }
+
+    pub(in crate::map) fn set_lot_appearance(
+        &mut self,
+        pad: crate::map::building_parking::LotFootprint,
+        door: Vec3,
+    ) {
+        self.0.door_pos = door;
+        self.0.mesh = crate::map::building_parking::surface_mesh(pad);
     }
 
     pub(in crate::map) fn insert(

@@ -588,7 +588,10 @@ fn parking_eligible(
     let Some(building) = map.get(site) else {
         return false;
     };
-    if matches!(building.kind, crate::map::BuildingKind::ParkingGarage(_)) {
+    if matches!(
+        building.kind,
+        crate::map::BuildingKind::ParkingGarage(_) | crate::map::BuildingKind::ParkingLot { .. }
+    ) {
         return true;
     }
     if target != Some(Destination::Building(site)) || building.is_abandoned_growable() {
@@ -649,7 +652,7 @@ fn routing_changed(
     } else {
         0
     };
-    let has_public_garages = driveways.properties.has_public_garages();
+    let has_public_parking = driveways.properties.has_public_parking();
 
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let h: &mut HumanEnt = h;
@@ -850,7 +853,7 @@ fn routing_changed(
         };
         if matches!(route, Err(RouterError::ReservingParkingSpot(_)))
             && !checked_property
-            && has_public_garages
+            && has_public_parking
             && router.vehicle.is_some()
             && router.vehicle == router.personal_car
             && !router.walk_only_pickup
@@ -892,8 +895,7 @@ fn routing_changed(
                 );
                 if !truck {
                     if h.location == Location::Vehicle(car) {
-                        let recover_in_place =
-                            checked_property || has_public_garages;
+                        let recover_in_place = checked_property || has_public_parking;
                         let exit_pos = world.vehicles.get(car).map_or(h.trans.pos, |v| {
                             if recover_in_place {
                                 exit_beside(map, v)
@@ -2185,7 +2187,7 @@ impl Router {
         };
         let mut selected = match budget.previous_candidate() {
             Some(ParkingCandidate::Facility(site))
-                if Some(site) == building || properties.is_public_garage(site) =>
+                if Some(site) == building || properties.is_public_parking(site) =>
             {
                 garage(site, properties, budget)
             }
@@ -2232,7 +2234,7 @@ impl Router {
                     match budget.selection.nearby.pop() {
                         Some(ParkingCandidate::Bay(spot)) => selected = bay(spot, parking, budget),
                         Some(ParkingCandidate::Facility(site)) => {
-                            if properties.is_public_garage(site) {
+                            if properties.is_public_parking(site) {
                                 selected = garage(site, properties, budget);
                             }
                         }
@@ -2249,7 +2251,7 @@ impl Router {
                 ParkingSource::DiscoverGarages => {
                     let limit = if allow_shared { 16 } else { 64 };
                     budget.selection.nearby = properties
-                        .nearby_public_garages(destination, limit)
+                        .nearby_public_parking(destination, limit)
                         .into_iter()
                         .filter(|&site| Some(site) != building)
                         .take(3)

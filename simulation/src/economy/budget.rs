@@ -296,6 +296,10 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
             BuildingKind::ParkingGarage(kind) => {
                 Some(i128::from(kind.daily_upkeep().inner()) * SPECIAL_BUILDING_UPKEEP_DIVISOR)
             }
+            BuildingKind::ParkingLot { width_blocks } => Some(
+                i128::from(Money::new_bucks(i64::from(width_blocks) * 4).inner())
+                    * SPECIAL_BUILDING_UPKEEP_DIVISOR,
+            ),
             BuildingKind::GoodsCompany(id) if !id.is_service() && !id.is_growable() => {
                 Government::special_building_price(building.kind)
                     .map(|price| i128::from(price.inner()))

@@ -97,6 +97,8 @@ fn register_ui_resources() {
     register_resource_noserialize::<TestFieldProperties>();
     register_world_resource::<ReceivedCommands>();
     register_world_resource::<RoadBuildResource>();
+    register_world_resource::<crate::gui::footpath::FootpathTool>();
+    register_world_resource::<crate::gui::surface_lot::SurfaceLotTool>();
     register_world_resource::<RoadEditorResource>();
     register_resource_noserialize::<crate::gui::traffic_repair::TrafficRepairUi>();
     register_world_reset(crate::gui::traffic_repair::reset);

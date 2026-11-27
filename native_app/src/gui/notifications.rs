@@ -685,6 +685,8 @@ fn command_label(command: &str) -> &'static str {
         "SetWarehouseRestock" => "Set warehouse restock levels",
         "SetFreightTerminalPolicy" => "Set freight terminal policy",
         "SetLotLayout" => "Change plot layout",
+        "MapMakeWalkingPath" => "Build footpath",
+        "MapPlaceParkingLot" => "Build parking lot",
         _ => "City action",
     }
 }
@@ -697,6 +699,15 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
     let message = match (command, reason) {
         (_, Rejection::InvalidCommandEncoding) => {
             "This action contains invalid or oversized input."
+        }
+        ("MapPlaceParkingLot", InvalidBuilding) => {
+            "The lot needs flat ground and at least one legal entrance and exit"
+        }
+        ("MapPlaceParkingLot", BusyConflict) => {
+            "A vehicle or another parking entrance blocks this lot"
+        }
+        ("MapPlaceParkingLot", StaleRoadQuote | StaleRoadEdit) => {
+            "The lot or its curb changed. Check the layout again."
         }
         ("MapPlaceParkingGarage", InvalidBuilding) => {
             "The selected curb needs a clear driveway and a dry, level footprint"

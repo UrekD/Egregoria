@@ -1864,7 +1864,10 @@ impl MapBuilders {
                     tint: LinearColor::WHITE,
                 });
             } else if !power_zone
-                && !matches!(building.kind, BuildingKind::ParkingGarage(_))
+                && !matches!(
+                    building.kind,
+                    BuildingKind::ParkingGarage(_) | BuildingKind::ParkingLot { .. }
+                )
                 && !building
                     .mesh
                     .faces

@@ -198,7 +198,11 @@ impl ReceivedCommands {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, input)| {
-                        if !matches!(input, WorldCommand::MapBuildSpecialBuilding { .. }) {
+                        if !matches!(
+                            input,
+                            WorldCommand::MapBuildSpecialBuilding { .. }
+                                | WorldCommand::MapPlaceParkingLot { .. }
+                        ) {
                             return None;
                         }
                         let outcome = if batch.accepted_indices.contains(&index) {

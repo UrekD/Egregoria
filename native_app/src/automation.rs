@@ -261,6 +261,12 @@ enum Assertion {
         parcel_center: [f32; 2],
         background_tower: Option<[f32; 2]>,
     },
+    PathPark {
+        footpaths: usize,
+        local_one_way: usize,
+        lot_capacity: u16,
+        vehicle_entrances: usize,
+    },
     BuildingCount {
         prototype: String,
         count: usize,
@@ -1465,6 +1471,55 @@ impl Assertion {
                         } else {
                             "sky-backed facade"
                         }
+                    ));
+                }
+            }
+            Self::PathPark {
+                footpaths,
+                local_one_way,
+                lot_capacity,
+                vehicle_entrances,
+            } => {
+                use simulation::map::building_parking::BuildingParkingKind;
+                use simulation::map::{LaneKind, SmallRoadPreset};
+
+                let map = sim.map();
+                let actual_paths = map
+                    .roads()
+                    .values()
+                    .filter(|road| road.is_walking_path())
+                    .count();
+                let local_pattern = SmallRoadPreset::LocalOneWay {
+                    curb_parking: false,
+                }
+                .lane_pattern();
+                let actual_local = map
+                    .roads()
+                    .values()
+                    .filter(|road| {
+                        road.is_one_way()
+                            && road.lanes_iter().any(|(_, kind)| kind == LaneKind::Driving)
+                            && road.pattern(map.lanes()) == local_pattern
+                    })
+                    .count();
+                let lots: Vec<_> = map
+                    .buildings()
+                    .values()
+                    .filter(|building| matches!(building.kind, BuildingKind::ParkingLot { .. }))
+                    .filter_map(|building| sim.building_parking(building.id))
+                    .filter_map(|summary| {
+                        let BuildingParkingKind::SurfaceLot(draft) = summary.kind else {
+                            return None;
+                        };
+                        Some((summary.capacity, draft.mouths.iter().flatten().count()))
+                    })
+                    .collect();
+                if actual_paths != footpaths
+                    || actual_local != local_one_way
+                    || lots != [(lot_capacity, vehicle_entrances)]
+                {
+                    return Err(format!(
+                        "PathPark fixture has {actual_paths} footpaths, {actual_local} local streets and parking (capacity, entrances) {lots:?}"
                     ));
                 }
             }

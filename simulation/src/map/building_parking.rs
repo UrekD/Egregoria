@@ -1,5 +1,13 @@
 //! Property parking is keyed by building identity. Garage capacity needs only a
 //! portal and the live cars and reservations using it.
+mod surface;
+use surface::SurfaceAccess;
+pub use surface::{
+    curb_edge, lot_footprint, lot_gate_position, lot_mouth_position, LotFootprint, LotFrame,
+    LotMouth, MouthUse, SurfaceLotDraft, BLOCK_SIZE, MAX_WIDTH_BLOCKS,
+};
+pub(super) use surface::{prepare_surface_layout, surface_mesh};
+
 use crate::map::{BuildingID, CurbAnchor, Map, ParkingSpotID, ProjectFilter, RoadID, RoadSide};
 use crate::map_dynamic::{DirectedEndpoint, DirectedPlan, Itinerary, ParkingManagement};
 use crate::transportation::{
@@ -100,6 +108,7 @@ pub enum BuildingParkingKind {
     RearLot,
     IntegratedGarage,
     PublicGarage(GarageKind),
+    SurfaceLot(SurfaceLotDraft),
 }
 
 impl BuildingParkingKind {
@@ -109,7 +118,12 @@ impl BuildingParkingKind {
             Self::RearLot => "Rear lot",
             Self::IntegratedGarage => "Integrated garage",
             Self::PublicGarage(kind) => kind.label(),
+            Self::SurfaceLot(_) => "Surface parking lot",
         }
+    }
+
+    fn is_public(self) -> bool {
+        matches!(self, Self::PublicGarage(_) | Self::SurfaceLot(_))
     }
 
     fn stores_inside(self) -> bool {
@@ -149,14 +163,16 @@ pub(crate) struct ParkingLayout {
     entrance: Vec3,
     approach: DirectedEndpoint,
     release: DirectedEndpoint,
-    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 8>")]
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 32>")]
     paths: Vec<StallPath>,
-    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 16>")]
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 32>")]
     masks: Vec<ParkingSpotID>,
     capacity: u16,
     bounds: AABB,
     door: Vec3,
     depth: f32,
+    #[serde(skip)]
+    surface: Option<Box<SurfaceAccess>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -170,18 +186,59 @@ impl ParkingLayout {
         self.paths[usize::from(slot)]
     }
 
+    fn access(&self, slot: u8) -> (DirectedEndpoint, DirectedEndpoint) {
+        self.surface
+            .as_ref()
+            .map_or((self.approach, self.release), |surface| {
+                surface.slots[usize::from(slot)]
+            })
+    }
+
+    fn anchors(&self) -> impl Iterator<Item = CurbAnchor> + '_ {
+        let other = match self.kind {
+            BuildingParkingKind::SurfaceLot(draft) => draft.mouths,
+            _ => [None; 2],
+        };
+        std::iter::once(self.anchor).chain(
+            other
+                .into_iter()
+                .flatten()
+                .map(|mouth| mouth.at)
+                .filter(|at| *at != self.anchor),
+        )
+    }
+
+    fn protected_roads(&self) -> impl Iterator<Item = RoadID> {
+        match self.kind {
+            BuildingParkingKind::SurfaceLot(draft) => Some(draft),
+            _ => None,
+        }
+        .into_iter()
+        .flat_map(SurfaceLotDraft::protected_roads)
+    }
+
+    pub(super) fn door(&self) -> Vec3 {
+        self.door
+    }
+
     pub(crate) fn bounds(&self) -> AABB {
         self.bounds
     }
 
-    pub(crate) fn pavement(&self) -> impl Iterator<Item = [Vec3; 2]> + '_ {
-        self.paths.iter().flat_map(|path| {
-            path.into.points.windows(2).filter_map(|p| {
-                // The driveway joins the outside edge of the existing sidewalk.
-                let outward = (self.paths[0].into.pose(MOTION_TICKS).pos - self.entrance).xy();
-                (outward.dot((p[0] - self.entrance).xy()) >= 0.0).then_some([p[0], p[1]])
+    pub(crate) fn pavement(&self) -> Vec<[Vec3; 2]> {
+        if let Some(surface) = &self.surface {
+            return surface.apron.clone();
+        }
+        self.paths
+            .iter()
+            .flat_map(|path| {
+                path.into.points.windows(2).filter_map(|p| {
+                    // The driveway joins the outside edge of the existing sidewalk.
+                    let outward = (self.paths[0].into.pose(MOTION_TICKS).pos - self.entrance).xy();
+                    (outward.dot((p[0] - self.entrance).xy()) >= 0.0).then_some([p[0], p[1]])
+                })
             })
-        })
+            .collect()
     }
 }
 
@@ -461,6 +518,7 @@ impl LayoutDraft {
             bounds: bounds.expand(CAR_RADIUS),
             door: self.door,
             depth: self.depth,
+            surface: None,
         })
     }
 }
@@ -473,6 +531,8 @@ pub(crate) struct BuildingParking {
     mouths: BTreeMap<RoadID, BTreeSet<(u32, BuildingID)>>,
     #[serde(skip)]
     swept_bounds: BTreeMap<(i32, i32), BTreeSet<BuildingID>>,
+    #[serde(skip)]
+    surface_roads: BTreeMap<RoadID, BTreeSet<BuildingID>>,
     #[serde(skip)]
     public_garages: BTreeMap<(i32, i32), BTreeSet<BuildingID>>,
     #[serde(skip)]
@@ -524,7 +584,12 @@ impl Site {
                 car == except
                     || sweep.segments().all(|segment| {
                         let occupied = self.layout.path(slot).into.pose(MOTION_TICKS).pos;
-                        segment.project(occupied).distance2(occupied) > 2.7_f32.powi(2)
+                        let clearance: f32 = if self.layout.surface.is_some() {
+                            2.15
+                        } else {
+                            2.7
+                        };
+                        segment.project(occupied).distance2(occupied) > clearance.powi(2)
                     })
             })
     }
@@ -693,19 +758,25 @@ impl BuildingParking {
         layout: &ParkingLayout,
         replacing: Option<BuildingID>,
     ) -> bool {
-        let station = layout.anchor.station_cm;
-        let nearby =
-            station.saturating_sub(MOUTH_SPACING_CM)..=station.saturating_add(MOUTH_SPACING_CM);
         (replacing.is_some_and(|id| self.sites.contains_key(&id)) || self.sites.len() < MAX_SITES)
             && layout.masks.iter().all(|&id| parking.is_unreserved(id))
-            && self.mouths.get(&layout.anchor.road).is_none_or(|mouths| {
-                mouths
-                    .range((nearby.start().to_owned(), BuildingID::default())..)
-                    .take_while(|(station, _)| nearby.contains(station))
-                    .all(|&(_, id)| {
-                        Some(id) == replacing
-                            || self.sites[&id].layout.anchor.side != layout.anchor.side
-                    })
+            && layout.anchors().all(|anchor| {
+                let station = anchor.station_cm;
+                let nearby = station.saturating_sub(MOUTH_SPACING_CM)
+                    ..=station.saturating_add(MOUTH_SPACING_CM);
+                self.mouths.get(&anchor.road).is_none_or(|mouths| {
+                    mouths
+                        .range((*nearby.start(), BuildingID::default())..)
+                        .take_while(|(station, _)| nearby.contains(station))
+                        .all(|&(station, id)| {
+                            Some(id) == replacing
+                                || self.sites[&id].layout.anchors().all(|other| {
+                                    other.road != anchor.road
+                                        || other.station_cm != station
+                                        || other.side != anchor.side
+                                })
+                        })
+                })
             })
     }
 
@@ -719,14 +790,19 @@ impl BuildingParking {
         for &spot in &layout.masks {
             parking.mask(spot);
         }
-        self.mouths
-            .entry(layout.anchor.road)
-            .or_default()
-            .insert((layout.anchor.station_cm, id));
+        for anchor in layout.anchors() {
+            self.mouths
+                .entry(anchor.road)
+                .or_default()
+                .insert((anchor.station_cm, id));
+        }
+        for road in layout.protected_roads() {
+            self.surface_roads.entry(road).or_default().insert(id);
+        }
         for cell in parking_bounds_cells(&layout.bounds) {
             self.swept_bounds.entry(cell).or_default().insert(id);
         }
-        if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
+        if layout.kind.is_public() {
             self.public_garages
                 .entry(garage_cell(layout.door))
                 .or_default()
@@ -746,11 +822,21 @@ impl BuildingParking {
     pub(crate) fn remove_empty(&mut self, id: BuildingID, parking: &mut ParkingManagement) {
         debug_assert!(!self.busy(id));
         if let Some(site) = self.sites.remove(&id) {
-            let anchor = site.layout.anchor;
-            let mouths = self.mouths.get_mut(&anchor.road).unwrap();
-            mouths.remove(&(anchor.station_cm, id));
-            if mouths.is_empty() {
-                self.mouths.remove(&anchor.road);
+            for anchor in site.layout.anchors() {
+                if let Some(mouths) = self.mouths.get_mut(&anchor.road) {
+                    mouths.remove(&(anchor.station_cm, id));
+                    if mouths.is_empty() {
+                        self.mouths.remove(&anchor.road);
+                    }
+                }
+            }
+            for road in site.layout.protected_roads() {
+                if let Some(sites) = self.surface_roads.get_mut(&road) {
+                    sites.remove(&id);
+                    if sites.is_empty() {
+                        self.surface_roads.remove(&road);
+                    }
+                }
             }
             for cell in parking_bounds_cells(&site.layout.bounds) {
                 let occupants = self.swept_bounds.get_mut(&cell).unwrap();
@@ -759,7 +845,7 @@ impl BuildingParking {
                     self.swept_bounds.remove(&cell);
                 }
             }
-            if matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_)) {
+            if site.layout.kind.is_public() {
                 let cell = garage_cell(site.layout.door);
                 let garages = self.public_garages.get_mut(&cell).unwrap();
                 garages.remove(&id);
@@ -811,6 +897,7 @@ impl BuildingParking {
         let layout = &site.layout;
         let daily_upkeep = match layout.kind {
             BuildingParkingKind::PublicGarage(kind) => kind.daily_upkeep(),
+            BuildingParkingKind::SurfaceLot(draft) => draft.daily_upkeep(),
             _ => Money::ZERO,
         };
         Some(BuildingParkingSummary {
@@ -848,7 +935,7 @@ impl BuildingParking {
 
     pub(crate) fn pedestrian_gate(&self, car: VehicleID) -> Option<Vec3> {
         let layout = &self.sites[&self.parked_at(car)?].layout;
-        layout.kind.stores_inside().then_some(layout.door)
+        (layout.kind.stores_inside() || layout.surface.is_some()).then_some(layout.door)
     }
 
     pub(crate) fn hidden(&self, car: VehicleID) -> bool {
@@ -862,25 +949,26 @@ impl BuildingParking {
     }
 
     pub(crate) fn release(&self, car: VehicleID) -> Option<DirectedEndpoint> {
-        Some(self.sites[&self.parked_at(car)?].layout.release)
+        let site = &self.sites[&self.parked_at(car)?];
+        Some(site.layout.access(site.occupied[&car]).1)
     }
 
-    pub(crate) fn has_public_garages(&self) -> bool {
+    pub(crate) fn has_public_parking(&self) -> bool {
         !self.public_garages.is_empty()
     }
 
-    pub(crate) fn is_public_garage(&self, id: BuildingID) -> bool {
+    pub(crate) fn is_public_parking(&self, id: BuildingID) -> bool {
         self.sites
             .get(&id)
-            .is_some_and(|site| matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_)))
+            .is_some_and(|site| site.layout.kind.is_public())
     }
 
-    pub(crate) fn nearby_public_garages(
+    pub(crate) fn nearby_public_parking(
         &self,
         destination: Vec3,
         inspections: usize,
     ) -> Vec<BuildingID> {
-        if !self.has_public_garages() {
+        if !self.has_public_parking() {
             return Vec::new();
         }
         let radius = 400.0;
@@ -920,7 +1008,7 @@ impl BuildingParking {
         let slot = site.free_slot()?;
         let path = site.layout.path(slot);
         site.sweep_clear(&path.into, car)
-            .then_some((site.layout.approach, site.layout.door))
+            .then_some((site.layout.access(slot).0, site.layout.door))
     }
 
     pub(crate) fn hold(&mut self, site: BuildingID, driver: HumanID, car: VehicleID) -> bool {
@@ -1040,14 +1128,16 @@ impl BuildingParking {
         };
         let id = arrival.site;
         let site = &self.sites[&id];
-        let path = site.layout.path(site.held[&car]);
+        let slot = site.held[&car];
+        let path = site.layout.path(slot);
         if site.closing
             || self.motions.contains_key(&id)
             || actor.collider.is_none()
             || actor.speed.0.abs() > 0.2
             || site
                 .layout
-                .approach
+                .access(slot)
+                .0
                 .transform(map)
                 .is_none_or(|approach| actor.trans.pos.distance2(approach.pos) > 1.5_f32.powi(2))
             || !site.sweep_clear(&path.into, car)
@@ -1080,9 +1170,10 @@ impl BuildingParking {
             return false;
         };
         let site = &self.sites[&id];
-        let path = site.layout.path(site.occupied[&car]);
+        let slot = site.occupied[&car];
+        let path = site.layout.path(slot);
         if self.motions.contains_key(&id)
-            || route.origin() != site.layout.release
+            || route.origin() != site.layout.access(slot).1
             || !site.sweep_clear(&path.out, car)
             || path.out.occupied(grid, None)
         {
@@ -1206,16 +1297,13 @@ impl BuildingParking {
     }
 
     pub(crate) fn protects_road(&self, road: RoadID, retire_vacant: bool) -> bool {
-        self.mouths.get(&road).is_some_and(|mouths| {
-            !retire_vacant
-                || mouths.iter().any(|&(_, id)| {
-                    self.busy(id)
-                        || matches!(
-                            self.sites[&id].layout.kind,
-                            BuildingParkingKind::PublicGarage(_)
-                        )
-                })
-        })
+        self.surface_roads.contains_key(&road)
+            || self.mouths.get(&road).is_some_and(|mouths| {
+                !retire_vacant
+                    || mouths
+                        .iter()
+                        .any(|&(_, id)| self.busy(id) || self.sites[&id].layout.kind.is_public())
+            })
     }
 
     pub(crate) fn protected_motion_roads(
@@ -1251,7 +1339,7 @@ impl BuildingParking {
             .map(|&(_, id)| id)
             .filter(|&id| {
                 let layout = &self.sites[&id].layout;
-                !self.busy(id) && !matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) && {
+                !self.busy(id) && !layout.kind.is_public() && {
                     let anchor = layout.anchor;
                     map.pick_curb(anchor.road, anchor.side, anchor.station_cm) != Some(anchor)
                         || layout.masks.iter().any(|&mask| !map.parking.contains(mask))
@@ -1305,10 +1393,31 @@ impl BuildingParking {
             return Err("invalid property parking search cursor".into());
         }
         for building in map.buildings().values() {
-            if matches!(building.kind, crate::map::BuildingKind::ParkingGarage(_))
-                && !self.sites.contains_key(&building.id)
+            if matches!(
+                building.kind,
+                crate::map::BuildingKind::ParkingGarage(_)
+                    | crate::map::BuildingKind::ParkingLot { .. }
+            ) && !self.sites.contains_key(&building.id)
             {
                 return Err("parking garage has no parking facility".into());
+            }
+        }
+
+        for (&id, site) in &mut self.sites {
+            let layout = &mut site.layout;
+            if let BuildingParkingKind::SurfaceLot(draft) = layout.kind {
+                let building = map.get(id).ok_or("missing surface parking lot")?;
+                let pad = lot_footprint(map, draft.frame, draft.width_blocks)
+                    .ok_or("invalid surface parking footprint")?;
+                if pad.shape.corners != building.obb.corners || building.door_pos != layout.door {
+                    return Err("surface parking footprint or door changed".into());
+                }
+                let expected = prepare_surface_layout(map, draft, pad)
+                    .map_err(|_| "invalid surface parking access")?;
+                layout.surface = expected.surface.clone();
+                if *layout != expected {
+                    return Err("surface parking geometry changed".into());
+                }
             }
         }
 
@@ -1331,8 +1440,16 @@ impl BuildingParking {
                     }
                     None
                 }
-                (BuildingParkingKind::PublicGarage(_), _)
-                | (_, crate::map::BuildingKind::ParkingGarage(_)) => {
+                (
+                    BuildingParkingKind::SurfaceLot(draft),
+                    crate::map::BuildingKind::ParkingLot { width_blocks },
+                ) if draft.width_blocks == width_blocks => None,
+                (BuildingParkingKind::PublicGarage(_) | BuildingParkingKind::SurfaceLot(_), _)
+                | (
+                    _,
+                    crate::map::BuildingKind::ParkingGarage(_)
+                    | crate::map::BuildingKind::ParkingLot { .. },
+                ) => {
                     return Err("invalid property parking building kind".into());
                 }
                 _ => {
@@ -1346,7 +1463,7 @@ impl BuildingParking {
             if building.connected_road != Some(layout.anchor.road)
                 || layout.capacity == 0
                 || layout.capacity > 256
-                || (!layout.kind.stores_inside() && layout.capacity > 8)
+                || (!layout.kind.stores_inside() && layout.surface.is_none() && layout.capacity > 8)
                 || !(1.0..=40.0).contains(&layout.depth)
                 || site.occupied.len() + site.held.len() > usize::from(layout.capacity)
                 || (!layout.kind.stores_inside() && {
@@ -1362,30 +1479,30 @@ impl BuildingParking {
             {
                 return Err("invalid property parking facility".into());
             }
-            let expected = LayoutDraft {
-                kind: layout.kind,
-                anchor: layout.anchor,
-                parcel: building.obb,
-                solid,
-                door: building.door_pos,
-                depth: layout.depth,
-                capacity: layout.capacity,
-            }
-            .prepare(map)
-            .map_err(|reason| {
-                format!(
-                    "could not rebuild {:?} parking for {id:?} on {:?}: {reason}",
-                    layout.kind, layout.anchor.road
-                )
-            })?;
-            if &expected != layout {
-                return Err(
+            if layout.surface.is_none() {
+                let expected = LayoutDraft {
+                    kind: layout.kind,
+                    anchor: layout.anchor,
+                    parcel: building.obb,
+                    solid,
+                    door: building.door_pos,
+                    depth: layout.depth,
+                    capacity: layout.capacity,
+                }
+                .prepare(map)
+                .map_err(|reason| {
                     format!(
+                        "could not rebuild {:?} parking for {id:?} on {:?}: {reason}",
+                        layout.kind, layout.anchor.road
+                    )
+                })?;
+                if &expected != layout {
+                    return Err(format!(
                         "property parking geometry for {id:?} on {:?} changed",
                         layout.anchor.road,
                     )
-                    .into(),
-                );
+                    .into());
+                }
             }
             if !self.fits(parking, layout, Some(id)) {
                 return Err(format!(
@@ -1393,14 +1510,19 @@ impl BuildingParking {
                     layout.anchor.road,
                 ).into());
             }
-            self.mouths
-                .entry(layout.anchor.road)
-                .or_default()
-                .insert((layout.anchor.station_cm, id));
+            for anchor in layout.anchors() {
+                self.mouths
+                    .entry(anchor.road)
+                    .or_default()
+                    .insert((anchor.station_cm, id));
+            }
+            for road in layout.protected_roads() {
+                self.surface_roads.entry(road).or_default().insert(id);
+            }
             for cell in parking_bounds_cells(&layout.bounds) {
                 self.swept_bounds.entry(cell).or_default().insert(id);
             }
-            if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
+            if layout.kind.is_public() {
                 self.public_garages
                     .entry(garage_cell(layout.door))
                     .or_default()
@@ -1477,11 +1599,14 @@ impl BuildingParking {
                 return Err("invalid property parking maneuver".into());
             }
             let (expected, phase) = match &motion.departure {
-                Some(route) if route.valid(map) && route.origin() == site.layout.release => {
+                Some(route) => {
                     let slot = *site
                         .occupied
                         .get(&motion.car)
                         .ok_or("missing property departure")?;
+                    if !route.valid(map) || route.origin() != site.layout.access(slot).1 {
+                        return Err("invalid property parking route".into());
+                    }
                     (
                         site.layout.path(slot).out.pose(motion.tick),
                         DrivewayPhase::Exiting,
@@ -1497,7 +1622,6 @@ impl BuildingParking {
                         DrivewayPhase::Entering,
                     )
                 }
-                _ => return Err("invalid property parking route".into()),
             };
             let actor = world
                 .vehicles
@@ -1658,7 +1782,7 @@ impl Simulation {
             .properties
             .sites
             .get(&id)
-            .map(|site| site.layout.pavement().collect())
+            .map(|site| site.layout.pavement())
             .unwrap_or_default()
     }
 }
