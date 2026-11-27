@@ -1038,7 +1038,16 @@ fn prepare_trip(sim: &Simulation, key: AlarmKey) -> Result<Assignment, FireRespo
     let fleet = sim.read::<FireFleet>();
     let station = fleet.stations.get(&id).ok_or(FireResponseBlocker::Staffing)?;
     let crew = dispatch_crew(sim, &fleet, id, station)?;
-    if map.service_apron_overlaps(&search.scene.envelope) {
+    let corridor = walking_corridor(search.scene.bay, search.scene.pocket, search.scene.door);
+    // Buildings and competing aprons can appear while the route search yields.
+    let mut geometry_work = APRON_WORK;
+    map.spatial_map()
+        .reserve_apron_query(corridor.bbox(), &mut geometry_work)
+        .map_err(|_| FireResponseBlocker::SceneAccess(AccessError::WorkLimit))?;
+    if !corridor_clear(&map, Some(site), corridor) {
+        return Err(FireResponseBlocker::SceneAccess(AccessError::MissingSidewalk));
+    }
+    if map.service_apron_overlaps(&search.scene.envelope) || map.service_apron_overlaps(&corridor) {
         return Err(FireResponseBlocker::SceneAccess(AccessError::OccupiedCurb));
     }
     Ok((id, crew, search.scene, best.outbound, best.inbound))
