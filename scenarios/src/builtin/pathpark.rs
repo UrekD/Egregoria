@@ -456,6 +456,9 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             offers.len(),
         ));
     }
+    // Drain existing routes while holding the authored housing and cohort in
+    // place. The test districts have no permanent utilities.
+    ctx.retain_systems(|name| !matches!(name, "residence_update" | "update_decision_system"));
     let close: Vec<_> = garages
         .iter()
         .map(|&building| WorldCommand::SetBuildingParkingOpen {
@@ -471,36 +474,82 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 person.router.go_to(Destination::Building(trip.home));
             });
     }
-    for _ in 0..50 {
-        freeze_scale_drivers(ctx, &offers);
-        ctx.run_ticks(200);
-    }
-    let returned = offers
-        .iter()
-        .filter(|trip| {
-            let human = &ctx.sim.world().humans[trip.driver];
-            let vehicle = &ctx.sim.world().vehicles[trip.car];
+    let returned = |sim: &Simulation, trip: &ScaleTrip| {
+        sim.world().humans.get(trip.driver).is_some_and(|human| {
             human.location == Location::Building(trip.home)
                 && human.router.personal_car == Some(trip.car)
-                && vehicle.vehicle.state.is_parked()
+                && sim.world().vehicles.get(trip.car)
+                    .is_some_and(|car| car.vehicle.state.is_parked())
         })
-        .count();
-    if returned != offers.len()
-        || garages.iter().any(|&garage| {
-            ctx.sim
-                .building_parking(garage)
-                .is_none_or(|parking| parking.occupied + parking.held != 0)
+    };
+    let garages_empty = |sim: &Simulation| {
+        garages.iter().all(|&garage| {
+            sim.building_parking(garage)
+                .is_some_and(|parking| parking.occupied + parking.held == 0)
         })
-    {
-        return Err(format!(
-            "only {returned}/{} original cars returned after drain",
-            offers.len()
-        ));
+    };
+    // A curb return on the opposite sidewalk can require walking around
+    // most of a 1,110 m block. At the slowest 0.8 m/s walking speed that
+    // is nearly 70,000 ticks, before parking and door approach.
+    const DRAIN_LIMIT: usize = 80_000;
+    const DRAIN_BATCH: usize = 200;
+    let mut drain_ticks = 0;
+    let mut home_followups = 0;
+    loop {
+        ctx.run_ticks(DRAIN_BATCH as u64);
+        drain_ticks += DRAIN_BATCH;
+        if garages_empty(&ctx.sim) {
+            if offers.iter().all(|trip| returned(&ctx.sim, trip)) {
+                break;
+            }
+            // Closure can send a driver who already walked home to retrieve
+            // a car at the garage door. Finish that driver's scripted trip
+            // once closure has moved the car to a legal space.
+            for trip in &offers {
+                if !ctx.sim.world().vehicles.get(trip.car)
+                    .is_some_and(|car| car.vehicle.state.is_parked())
+                {
+                    continue;
+                }
+                ctx.sim.world_mut_unchecked().edit_human(trip.driver, |human| {
+                    let home = Destination::Building(trip.home);
+                    if human.router.personal_car == Some(trip.car)
+                        && human.location != Location::Building(trip.home)
+                        && human.router.target_dest != Some(home)
+                    {
+                        human.router.go_to(home);
+                        home_followups += 1;
+                    }
+                });
+            }
+        }
+        if drain_ticks == DRAIN_LIMIT {
+            let missing: Vec<_> = offers
+                .iter()
+                .filter(|trip| !returned(&ctx.sim, trip))
+                .map(|trip| {
+                    let world = ctx.sim.world();
+                    let driver = world.humans.get(trip.driver).map(|human| {
+                        (&human.location, human.router.target_dest, human.router.personal_car)
+                    });
+                    let car = world.vehicles.get(trip.car).map(|car| &car.vehicle.state);
+                    (trip.driver, trip.car, driver, car)
+                })
+                .collect();
+            return Err(format!(
+                "drain timed out at {drain_ticks} ticks, missing {missing:?}, garages empty = {}",
+                garages_empty(&ctx.sim)
+            ));
+        }
     }
     ctx.sample_perf_with_extra(
         "drained",
         POPULATION,
-        BTreeMap::from([("tagged_returns".to_owned(), returned as f64)]),
+        BTreeMap::from([
+            ("tagged_returns".to_owned(), offers.len() as f64),
+            ("drain_ticks".to_owned(), drain_ticks as f64),
+            ("home_followups".to_owned(), f64::from(home_followups)),
+        ]),
         true,
     );
     Ok(())

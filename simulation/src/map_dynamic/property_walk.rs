@@ -1,14 +1,14 @@
 use super::Itinerary;
 use crate::map::{
-    LaneID, LaneKind, Map, ProjectFilter, ProjectKind, RoadID, Traversable, TraverseDirection,
+    LaneID, LaneKind, Map, ParkingWalkRoadCursor, RoadID, Traversable, TraverseDirection,
     TraverseKind, TurnID,
 };
-use geom::{Circle, PolyLine3, Segment3, Shape, Vec3};
+use geom::{PolyLine3, Segment3, Vec3};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use std::collections::{btree_set, BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-const WALK_ALGORITHM: u8 = 1;
+const WALK_ALGORITHM: u8 = 2;
 const MAX_WALK_WORK: usize = 2_048;
 const SIDEWALK_RADIUS: f32 = 24.0;
 type Revision = (u64, u64);
@@ -277,42 +277,8 @@ fn line_point(points: &PolyLine3, reverse: bool, index: usize) -> Vec3 {
 }
 
 #[derive(Default)]
-struct WalkRoads {
-    roads: Option<btree_set::IntoIter<RoadID>>,
-}
-
-impl WalkRoads {
-    fn next(&mut self, map: &Map, position: Vec3, work: &mut usize) -> Result<Option<RoadID>, ()> {
-        if self.roads.is_none() {
-            let bounds = Circle {
-                center: position.xy(),
-                radius: SIDEWALK_RADIUS,
-            }
-            .bbox();
-            let spatial = map.spatial_map();
-            let mut remaining = *work;
-            // The shared broad-phase API reserves the full local scan. Keep
-            // the result in ID order across resumption and index rebuilds.
-            spatial
-                .reserve_construction_query(bounds, &mut remaining)
-                .map_err(|_| ())?;
-            let roads: BTreeSet<_> = spatial
-                .construction_candidates(bounds, ProjectFilter::ROAD)
-                .filter_map(|project| match project {
-                    ProjectKind::Road(id) => Some(id),
-                    _ => None,
-                })
-                .collect();
-            self.roads = Some(roads.into_iter());
-            *work = remaining;
-        }
-        Ok(self.roads.as_mut().unwrap().next())
-    }
-}
-
-#[derive(Default)]
 struct SidewalkSearch {
-    roads: WalkRoads,
+    roads: ParkingWalkRoadCursor,
     road: Option<RoadID>,
     lane: usize,
     project: Option<ProjectLine>,
@@ -328,7 +294,11 @@ impl SidewalkSearch {
     ) -> Result<Option<Anchor>, ()> {
         loop {
             if self.road.is_none() {
-                self.road = self.roads.next(map, position, work)?;
+                self.road = map.spatial_map().next_parking_walk_road(
+                    position.xy(),
+                    &mut self.roads,
+                    work,
+                )?;
             }
             let Some(road) = self.road else {
                 return Ok(self.best);

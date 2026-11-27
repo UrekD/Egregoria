@@ -369,6 +369,10 @@ impl ScenarioCtx {
         self.queued.extend_from_slice(cmds);
     }
 
+    pub(crate) fn retain_systems(&mut self, keep: impl FnMut(&str) -> bool) {
+        self.sched.retain_systems(keep);
+    }
+
     pub fn run_ticks(&mut self, n: u64) {
         self.run_ticks_observed(n, |_| {});
     }

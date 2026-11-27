@@ -99,6 +99,15 @@ pub trait SpatialMapObject {
     }
 }
 
+/// Cursor for a single 24 m sidewalk query on an unchanged map.
+#[derive(Default)]
+pub(crate) struct ParkingWalkRoadCursor {
+    cells: Option<Vec<CellIdx>>,
+    cell: usize,
+    after: Option<RoadID>,
+    seen: FastSet<RoadID>,
+}
+
 pub struct SpatialMap {
     broad: BroadGrid,
     occupancy: AABBGrid<ProjectKind, AABB>,
@@ -342,6 +351,49 @@ impl SpatialMap {
                 (seen.insert(road) && bounds.intersects(&self.broad.objects[*handle].aabb))
                     .then_some(road)
             })
+    }
+
+    /// Advance one local sidewalk query, charging each raw membership and
+    /// end-of-cell check before examining it.
+    pub(crate) fn next_parking_walk_road(
+        &self,
+        center: Vec2,
+        cursor: &mut ParkingWalkRoadCursor,
+        work: &mut usize,
+    ) -> Result<Option<RoadID>, ()> {
+        const RADIUS: f32 = 24.0;
+        let bounds = Circle {
+            center,
+            radius: RADIUS,
+        }
+        .bbox();
+        let cells = cursor.cells.get_or_insert_with(|| {
+            let mut cells: Vec<_> = CellRange::checked(bounds)
+                .into_iter()
+                .flat_map(CellRange::iter)
+                .collect();
+            let (cx, cy) = self.broad.storage.cell_id(center);
+            cells.sort_unstable_by_key(|&(x, y)| (x.abs_diff(cx).max(y.abs_diff(cy)), x, y));
+            cells
+        });
+        while let Some(&key) = cells.get(cursor.cell) {
+            *work = work.checked_sub(1).ok_or(())?;
+            let entry = self.broad.storage.cell(key).and_then(|cell| {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let start = cursor.after.map_or(Unbounded, Excluded);
+                cell.roads.range((start, Unbounded)).next()
+            });
+            if let Some((&road, &handle)) = entry {
+                cursor.after = Some(road);
+                if cursor.seen.insert(road) && bounds.intersects(&self.broad.objects[handle].aabb) {
+                    return Ok(Some(road));
+                }
+            } else {
+                cursor.cell += 1;
+                cursor.after = None;
+            }
+        }
+        Ok(None)
     }
 
     pub fn insert(&mut self, obj: &impl SpatialMapObject) {
@@ -805,4 +857,90 @@ fn p7_spatial_projection_order_and_allocator() {
         map.project(pos, 1.0, ProjectFilter::ALL).kind,
         ProjectKind::Lot(last)
     );
+}
+
+#[cfg(test)]
+mod parking_walk_tests {
+    use super::*;
+
+    struct TestRoad(RoadID, Circle);
+
+    impl SpatialMapObject for TestRoad {
+        fn kind(&self) -> ProjectKind {
+            ProjectKind::Road(self.0)
+        }
+
+        fn shape(&self) -> ShapeEnum {
+            self.1.into()
+        }
+    }
+
+    #[test]
+    fn pathpark_pedestrian_road_cursor_counts_rejected_and_duplicate_memberships() {
+        let mut ids = slotmapd::HopSlotMap::<RoadID, ()>::with_key();
+        let mut grid = SpatialMap::default();
+        let center = Vec2::new(25., 25.);
+        for _ in 0..130 {
+            let id = ids.insert(());
+            grid.insert(&TestRoad(
+                id,
+                Circle {
+                    center: Vec2::splat(0.25),
+                    radius: 0.1,
+                },
+            ));
+        }
+        let lane_road = ids.insert(());
+        grid.insert(&TestRoad(lane_road, Circle { center, radius: 1. }));
+        assert!(!grid
+            .parking_roads(center, 24.)
+            .any(|road| road == lane_road));
+
+        let mut cursor = ParkingWalkRoadCursor::default();
+        for slice in [1, 64, 65] {
+            let mut work = slice;
+            assert_eq!(
+                grid.next_parking_walk_road(center, &mut cursor, &mut work),
+                Err(())
+            );
+            assert_eq!(work, 0);
+        }
+        let mut one = 1;
+        assert_eq!(
+            grid.next_parking_walk_road(center, &mut cursor, &mut one),
+            Ok(Some(lane_road))
+        );
+        assert_eq!(one, 0);
+        assert_eq!(
+            grid.next_parking_walk_road(center, &mut cursor, &mut 1),
+            Ok(None)
+        );
+
+        let boundary = Vec2::splat(50.);
+        let mut grid = SpatialMap::default();
+        grid.insert(&TestRoad(
+            lane_road,
+            Circle {
+                center: boundary,
+                radius: 1.,
+            },
+        ));
+        let mut cursor = ParkingWalkRoadCursor::default();
+        let mut work = 1;
+        assert_eq!(
+            grid.next_parking_walk_road(boundary, &mut cursor, &mut work),
+            Ok(Some(lane_road))
+        );
+        // The same road belongs to four cells. Each duplicate and each cell
+        // completion still costs a unit.
+        let mut work = 6;
+        assert_eq!(
+            grid.next_parking_walk_road(boundary, &mut cursor, &mut work),
+            Err(())
+        );
+        assert_eq!(
+            grid.next_parking_walk_road(boundary, &mut cursor, &mut 1),
+            Ok(None)
+        );
+    }
 }
