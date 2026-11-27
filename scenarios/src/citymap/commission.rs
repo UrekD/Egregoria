@@ -53,6 +53,10 @@ const SERVICES: [ServiceKind; 6] = [
 ];
 const SAMPLE_TICKS: u64 = TICKS_PER_MINUTE / 2;
 const SOAK_DAYS: u64 = 3;
+// Lesce Town owner decision, 2026-11-27: raise the mean cap from 1.00 h.
+// Two trajectories differing by the 55 m West bakery footpath averaged 1.0034 h
+// and 0.9515 h. The 1.0034 h run filled 12,137 of 12,141 baskets.
+const MAX_MEAN_FOOD_STOCKOUT_HOURS: f64 = 1.05;
 // CM2 final supersedes the original opening size and basket targets.
 const MIN_OPENING_POPULATION: u64 = 2500;
 const MIN_BASKETS_FILLED_PERCENT: u128 = 94;
@@ -2290,7 +2294,7 @@ fn food_stockouts_pass(days: &[(u64, u64)]) -> bool {
         .map(|&(stockout, residents)| food_stockout_hours(stockout, residents))
         .sum();
     // Allow rounding at equality, below the resolution of a stockout tick.
-    sum <= SOAK_DAYS as f64 + 2.0 * f64::EPSILON
+    sum <= MAX_MEAN_FOOD_STOCKOUT_HOURS * SOAK_DAYS as f64 + 2.0 * f64::EPSILON
 }
 
 fn service_covered(served: u64, residents: u64) -> bool {
@@ -4505,7 +4509,7 @@ pub fn check_loaded_opening(
             food_stockout_hours(stockout, residents)
         }).sum::<f64>() / SOAK_DAYS as f64;
         failures.push(format!(
-            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, 1.00 mean)",
+            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, {MAX_MEAN_FOOD_STOCKOUT_HOURS:.2} mean)",
             hours.join(", ")
         ));
     }
@@ -5042,8 +5046,9 @@ mod tests {
         let accepts = |days: [u64; 3]| food_stockouts_pass(&days.map(|stockout| (stockout, 2400)));
         assert!(accepts([91, 95, 113]));
         assert!(accepts([90, 90, 120]));
+        assert!(accepts([95, 100, 120]));
         assert!(!accepts([89, 90, 121]));
-        assert!(!accepts([91, 90, 120]));
+        assert!(!accepts([96, 100, 120]));
         assert!(food_stockouts_pass(&[(90, 2400), (90, 2400), (240, 4800)]));
         assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400), (0, 0)]));
         assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400)]));
