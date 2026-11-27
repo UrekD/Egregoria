@@ -254,7 +254,7 @@ impl Encoder for Bincode {
 }
 
 /// Command compatibility is versioned separately from the snapshot schema.
-pub const COMMAND_PROTOCOL_REVISION: &str = "commands.2";
+pub const COMMAND_PROTOCOL_REVISION: &str = "commands.4";
 
 pub struct CompressedBincode;
 

@@ -134,7 +134,8 @@ fn p4_world_replacement_clears_world_identity_and_requires_fresh_input() {
         dontclear: true,
     };
     uiw.write::<FollowEntity>().0 = Some(entity);
-    let cmd = WorldCommand::MapRemoveBuilding(building);
+    let quote = simulation::souls::demolition::demolition_quote(&sim, building).unwrap().quote;
+    let cmd = WorldCommand::MapStartDemolition { site: building, quote };
     uiw.commands().push(cmd.clone());
     *uiw.write::<ReceivedCommands>() =
         ReceivedCommands::new(WorldCommands::from(vec![cmd.clone()]));

@@ -1125,11 +1125,11 @@ mod tests {
             .write::<crate::map_dynamic::BuildingInfos>()
             .add_resident(second_home, SoulID::Human(id));
         test.g.world_mut_unchecked().humans[id].home.house = second_home;
-        test.apply(&[WorldCommand::MapRemoveBuilding(first_home)]);
+        test.remove_fixture_building(first_home);
         assert_eq!(test.g.get(id).unwrap().household.on_hand[&retail], 3);
         assert!(test.g.read::<Market>().household_losses().is_empty());
 
-        test.apply(&[WorldCommand::MapRemoveBuilding(second_home)]);
+        test.remove_fixture_building(second_home);
         let h = test.g.get(id).unwrap();
         assert_eq!(h.home.house, third_home);
         assert!(h.household.on_hand.is_empty());
@@ -1160,7 +1160,7 @@ mod tests {
         test.tick_fast();
         assert!(test.g.get(id).unwrap().household.basket.is_some());
 
-        test.apply(&[WorldCommand::MapRemoveBuilding(store)]);
+        test.remove_fixture_building(store);
         for _ in 0..5 {
             test.tick_fast();
         }

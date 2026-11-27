@@ -183,14 +183,14 @@ fn elapsed_tick(sim: &mut Simulation) -> u64 {
 }
 
 fn install_loop(sim: &mut Simulation) -> Result<LineID, String> {
-    // Serve the residential and employment blocks on a short one-way loop.
+    // Cross the west residential blocks and the occupied jobs along rows 2 and 3.
     let legs = [
-        ((1, 1), (2, 1)),
-        ((3, 1), (4, 1)),
+        ((0, 2), (1, 2)),
+        ((2, 2), (3, 2)),
         ((4, 2), (4, 3)),
         ((4, 3), (3, 3)),
-        ((2, 3), (1, 3)),
-        ((1, 3), (1, 2)),
+        ((3, 3), (2, 3)),
+        ((1, 3), (0, 3)),
     ];
     let commands = {
         let map = sim.map();

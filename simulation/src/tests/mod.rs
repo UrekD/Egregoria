@@ -24,6 +24,7 @@ mod p5_placement;
 mod p5_spine_followups;
 mod p6_water;
 mod p7_road_edit;
+pub(crate) mod p9_fire;
 mod population_scale;
 mod test_iso;
 mod vehicles;
@@ -504,6 +505,11 @@ impl TestCtx {
         }
     }
 
+    pub(crate) fn remove_fixture_building(&mut self, building: BuildingID) {
+        assert!(crate::souls::lifecycle::remove_site(&mut self.g, building));
+        crate::utils::scheduler::drain_commands(&mut self.g);
+    }
+
     pub(crate) fn tick_fast(&mut self) {
         self.g.tick(&mut self.sched, &[]);
     }
@@ -610,7 +616,7 @@ fn w0_water_removing_last_cut_contributor_restores_base() {
     let base = sim.map().environment().base_height(node);
     sim.map_mut().update();
     assert_ne!(sim.map().environment().true_height(node), base);
-    sim.apply_commands([&WorldCommand::MapRemoveBuilding(building)]);
+    assert!(crate::souls::lifecycle::remove_site(&mut sim, building));
     sim.edit_water(WaterEdit::FillLake {
         basin: WaterBasin::new(&[
             node + vec2(1.0, 1.0),

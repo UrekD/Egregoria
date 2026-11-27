@@ -594,6 +594,9 @@ pub(crate) fn prepare_upgrade(
     let [forward, backward] = road.directed_lanes();
     let same_geometry = pattern_matches(forward, &pattern.lanes_forward)
         && pattern_matches(backward, &pattern.lanes_backward);
+    if !same_geometry && map.active_service_road(id) {
+        return Err(Rejection::BusyConflict);
+    }
     let mut direction_edits = None;
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();

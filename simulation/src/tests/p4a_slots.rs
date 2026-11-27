@@ -181,7 +181,11 @@ fn p4a_integrated_loader_preserves_p6_golden_city() {
     let raw = CompressedBincode::decompress(&zip).unwrap();
     let (header, payload) = crate::snapshot_header(&raw).unwrap();
     header.check_load_compatibility().unwrap();
-    let loaded: Simulation = Bincode::decode(payload).unwrap();
+    assert!(Bincode::decode::<Simulation>(payload).is_err());
+    let loaded = Bincode::decode::<crate::SimulationDeser>(payload)
+        .unwrap()
+        .into_sim()
+        .unwrap();
     let mut expected = city.hashes();
     let mut actual = loaded.hashes();
     expected.remove("replay");
@@ -194,7 +198,7 @@ fn p4a_integrated_loader_preserves_p6_golden_city() {
     ));
     let saved = loaded.encode_slot(SnapshotRevision::new(0x12345679)).unwrap();
     let header = Simulation::compressed_snapshot_header(&saved.snapshot).unwrap();
-    assert_ne!(header.version, "0.11.1", "P7 must write a new save version");
+    assert_eq!(header.version, crate::VERSION);
 }
 
 #[test]
@@ -444,9 +448,18 @@ fn p7_snapshot_loads_p6_slot_with_recorded_replay() {
     assert!(replay.obsolete_recording_discarded());
     assert_eq!(replay.command_count(), 0);
     drop(replay);
-    city.save_to_slot(&root.0, &id, SnapshotRevision::new(2))
-        .unwrap();
-    let reopened = Simulation::load_from_slot(&root.0, &id).unwrap();
+    let original_snapshot = fs::read(&paths.zip).unwrap();
+    let original_replay = fs::read(&paths.replay).unwrap();
+    assert!(city.save_to_slot(&root.0, &id, SnapshotRevision::new(2)).is_err());
+    let migrated = SlotId::new("migrated").unwrap();
+    let cancelled = city.encode_slot(SnapshotRevision::new(2)).unwrap()
+        .publish_with_gate(&root.0, &migrated, || None::<()>);
+    assert!(cancelled.is_none());
+    assert_eq!(fs::read(&paths.zip).unwrap(), original_snapshot);
+    assert_eq!(fs::read(&paths.replay).unwrap(), original_replay);
+    city.save_to_slot(&root.0, &migrated, SnapshotRevision::new(3)).unwrap();
+    let reopened = Simulation::load_from_slot(&root.0, &migrated).unwrap();
+    assert!(reopened.read::<Replay>().migrated_city());
     assert_eq!(reopened.hashes(), city.hashes());
     assert!(!reopened
         .read::<crate::Replay>()
@@ -805,7 +818,7 @@ fn s5b_deliver_load_survives_slot_round_trip() {
             if *saved_destination == destination && *saved_load == load
     )));
 
-    crate::WorldCommand::MapRemoveBuilding(destination).apply(&mut restored);
+    assert!(crate::souls::lifecycle::remove_site(&mut restored, destination));
     assert!(matches!(
         restored.get(driver).unwrap().decision.kind,
         HumanDecisionKind::Yield

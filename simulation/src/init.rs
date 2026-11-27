@@ -32,12 +32,14 @@ use crate::map_dynamic::{
     UtilityFlow,
 };
 use crate::multiplayer::MultiplayerState;
-use crate::souls::events::{events_update, Fires};
+use crate::souls::demolition::{demolition_update, SiteRemnants};
+use crate::souls::events::{events_update, Fires, ServiceIncidents};
 use crate::souls::freight_station::{freight_station_system, RailTrips};
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
 use crate::souls::household::{household_update, HouseholdClaims};
 use crate::souls::human::update_decision_system;
+use crate::souls::service_dispatch::{advance_fire_trips, dispatch_fire, FireFleet};
 use crate::transportation::pedestrian_decision_system;
 use crate::transportation::road::{vehicle_decision_system, vehicle_state_update_system};
 use crate::transportation::road_throughput::{road_throughput_update, RoadThroughput};
@@ -236,7 +238,10 @@ fn register_systems_and_resources() {
         "residence_update",
         crate::souls::residence::residence_update,
     );
+    register_system_sim("advance_fire_trips", advance_fire_trips);
+    register_system_sim("events_update", events_update);
     register_system_sim("growth_update", crate::souls::growth::growth_update);
+    register_system_sim("demolition_update", demolition_update);
     register_system(
         "refresh_electricity_flow_system",
         crate::map_dynamic::refresh_electricity_flow_system,
@@ -245,7 +250,7 @@ fn register_systems_and_resources() {
     register_system_sim("coverage_update", coverage_update);
     register_system_sim("env_update", env_update);
     register_system_sim("happiness_update", happiness_update);
-    register_system_sim("events_update", events_update);
+    register_system_sim("dispatch_fire", dispatch_fire);
     register_system("train_reservations_update", train_reservations_update);
     register_system("freight_station", freight_station_system);
     register_system("random_vehicles", random_vehicles_update);
@@ -282,6 +287,36 @@ fn register_systems_and_resources() {
     register_resource_default::<EnvGrid, Bincode>("env_grid");
     register_resource_default::<Happiness, Bincode>("happiness");
     register_resource_default::<Fires, Bincode>("fires");
+    register_resource_default::<ServiceIncidents, Bincode>("service_incidents");
+    use crate::souls::events::FireScenarioRules;
+    register_resource_noserialize::<FireScenarioRules>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "fire_scenario_rules",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<FireScenarioRules>(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(Bincode::decode::<FireScenarioRules>(data)?);
+                Ok(())
+            }),
+        });
+    }
+    register_resource_default::<SiteRemnants, Bincode>("site_remnants");
+    register_resource_noserialize::<FireFleet>();
+    register_resource_noserialize::<crate::souls::service_dispatch::FireWorkTiming>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "fire_fleet",
+            optional: false,
+            save: Box::new(|sim, output| FireFleet::save(sim, output)),
+            load: Box::new(|sim, data| {
+                sim.insert(FireFleet::load(data)?);
+                Ok(())
+            }),
+        });
+    }
     register_resource_default::<Market, Bincode>("market");
     register_resource_default::<EcoStats, Bincode>("ecostats");
     register_resource_default::<CityStats, Bincode>("citystats");
@@ -299,7 +334,18 @@ fn register_systems_and_resources() {
     register_resource_default::<crate::souls::residence::Residences, Bincode>("residences");
     register_resource_default::<crate::economy::ZoneDemand, Bincode>("zone_demand");
     register_resource_default::<crate::economy::Budget, Bincode>("budget");
-    register_resource_default::<ParkingManagement, Bincode>("pmanagement");
+    register_resource_noserialize::<ParkingManagement>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "pmanagement",
+            optional: false,
+            save: Box::new(|sim, output| sim.read::<ParkingManagement>().save(output)),
+            load: Box::new(|sim, data| {
+                sim.insert(ParkingManagement::load(data)?);
+                Ok(())
+            }),
+        });
+    }
     register_resource_default::<BuildingInfos, Bincode>("binfos");
     register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(INITIAL_TICK)));
     register_transport_grid();

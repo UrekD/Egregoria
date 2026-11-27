@@ -182,7 +182,7 @@ fn zone2_switching_layout_regenerates_only_empty_lots_and_keeps_zoning() {
     }
 
     // A demolished house restores its original lot, whatever the current layout.
-    test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
+    test.remove_fixture_building(house);
     assert!(test
         .g
         .map()

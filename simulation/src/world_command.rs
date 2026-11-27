@@ -32,6 +32,9 @@ use crate::map::{
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
 use crate::multiplayer::MultiplayerState;
+use crate::souls::service_access::{is_fire_station, AccessError, FireApronPreview};
+use crate::souls::service_dispatch::{commission, prepare_new_apron, prepare_retrofit, FireApronQuote};
+use crate::souls::demolition::{prepare_demolition, start_demolition, DemolitionQuote, DemolitionReceipt};
 use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{spawn_train, RailWagonKind};
@@ -332,6 +335,14 @@ macro_rules! define_world_command {
                 expected_revision: u64,
                 limits: DepotRestock,
             },
+            MapStartDemolition {
+                site: BuildingID,
+                quote: DemolitionQuote,
+            },
+            MapRetrofitFireApron {
+                site: BuildingID,
+                quote: FireApronQuote,
+            },
         }
     };
 }
@@ -399,6 +410,11 @@ pub enum Rejection {
     RoadTopologyUnavailable,
     InvalidJunctionRules(JunctionRuleError),
     BusyConflict,
+    LegacyBuildingRemoval,
+    StaleDemolitionQuote,
+    DemolitionWorkLimit,
+    FireAccess(AccessError),
+    StaleFireApronQuote,
 }
 
 impl From<LandDenial> for Rejection {
@@ -435,6 +451,7 @@ impl Rejection {
             ConnectionError::WorkLimit => Self::WaterWorkLimit,
             ConnectionError::LandDenied(reason) => Self::LandDenied(reason),
             ConnectionError::InvalidEndpoint => Self::InvalidConnection,
+            ConnectionError::OccupiedServiceAccess => Self::BusyConflict,
             other => Self::WaterConnection(other),
         }
     }
@@ -444,6 +461,7 @@ pub struct PrepareBudget {
     guard_terraform: bool,
     reject_surface: bool,
     shared_topology: bool,
+    demolition_preparations: u8,
     remaining: usize,
 }
 
@@ -453,6 +471,7 @@ impl PrepareBudget {
             guard_terraform: false,
             reject_surface: false,
             shared_topology: false,
+            demolition_preparations: 32,
             remaining: work_units.min(MAX_WATER_BATCH_WORK),
         }
     }
@@ -484,6 +503,7 @@ impl PrepareBudget {
             shared_topology: commands.iter().any(|command| {
                 matches!(command, MapUpgradeRoad { .. } | MapSetJunctionRules { .. })
             }),
+            demolition_preparations: 32,
             remaining: MAX_WATER_BATCH_WORK,
         };
         if !guard_terraform || commands.len() < 2 {
@@ -611,7 +631,8 @@ pub(crate) enum PreparedAction<'a> {
         work: Option<WaterTopologyWork>,
         cost: Money,
     },
-    SpecialBuilding(crate::map::PreparedSpecialBuilding, Money),
+    SpecialBuilding(crate::map::PreparedSpecialBuilding, Option<Box<FireApronPreview>>, Money),
+    RetrofitFireApron(BuildingID, Box<FireApronPreview>, Money),
     RoadEdit(PreparedRoadEdit),
     JunctionEdit(PreparedJunctionEdit),
     Command(&'a WorldCommand, Money),
@@ -640,9 +661,16 @@ impl PreparedAction<'_> {
                     .map_err(Rejection::water_connection_error)?;
                 WorldCommand::charge_construction(sim, cost, construction);
             }
-            Self::SpecialBuilding(prepared, cost) => {
+            Self::SpecialBuilding(prepared, apron, cost) => {
                 let id = sim.map_mut().commit_special_building(prepared);
                 sim.write::<BuildingInfos>().insert(id);
+                if let Some(apron) = apron {
+                    commission(sim, id, *apron);
+                }
+                WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::RetrofitFireApron(site, apron, cost) => {
+                commission(sim, site, *apron);
                 WorldCommand::charge_construction(sim, cost, construction);
             }
             Self::RoadEdit(prepared) => {
@@ -697,6 +725,7 @@ pub struct CommandOutcomes {
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
     road_edits: BTreeMap<usize, Result<EditReceipt, Rejection>>,
     junction_edits: BTreeMap<usize, Result<JunctionEditReceipt, Rejection>>,
+    demolitions: BTreeMap<usize, Result<DemolitionReceipt, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -756,6 +785,10 @@ impl CommandOutcomes {
         self.junction_edits.get(&index)
     }
 
+    pub fn demolition(&self, index: usize) -> Option<Result<DemolitionReceipt, Rejection>> {
+        self.demolitions.get(&index).copied()
+    }
+
     /// Discards the completed batch's outcomes while preserving its sequence.
     pub fn clear(&mut self) {
         self.last.clear();
@@ -768,6 +801,7 @@ impl CommandOutcomes {
         self.tile_purchases.clear();
         self.road_edits.clear();
         self.junction_edits.clear();
+        self.demolitions.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -1043,8 +1077,8 @@ impl WorldCommands {
         self.commands.push(MapRemoveRoad(id))
     }
 
-    pub fn map_remove_building(&mut self, id: BuildingID) {
-        self.commands.push(MapRemoveBuilding(id))
+    pub fn map_start_demolition(&mut self, site: BuildingID, quote: DemolitionQuote) {
+        self.commands.push(MapStartDemolition { site, quote })
     }
 
     pub fn map_build_house(&mut self, id: LotID) {
@@ -1106,6 +1140,8 @@ impl WorldCommand {
                 | BuyTile { .. }
                 | MapUpgradeRoad { .. }
                 | MapSetJunctionRules { .. }
+                | MapStartDemolition { .. }
+                | MapRetrofitFireApron { .. }
         )
     }
 
@@ -1119,6 +1155,26 @@ impl WorldCommand {
         construction: BudgetCategory,
         water: &mut PrepareBudget,
     ) -> Option<Rejection> {
+        if let MapStartDemolition { site, quote } = *self {
+            let result = if water.demolition_preparations == 0 {
+                Err(Rejection::DemolitionWorkLimit)
+            } else {
+                water.demolition_preparations -= 1;
+                start_demolition(sim, site, quote, &mut water.remaining)
+            };
+            return match result {
+                Ok(receipt) => {
+                    let mut outcomes = sim.write::<CommandOutcomes>();
+                    let index = outcomes.command_ranges.len();
+                    outcomes.demolitions.insert(index, Ok(receipt));
+                    None
+                }
+                Err(reason) => {
+                    self.reject_unadmitted(sim, reason);
+                    Some(reason)
+                }
+            };
+        }
         if let EditWater(edit) = self {
             let outcome = if water.reject_surface {
                 Err(WaterEditError::Limit)
@@ -1244,6 +1300,9 @@ impl WorldCommand {
         {
             return Some(Ok(Rejection::WaterWorkLimit));
         }
+        if matches!(self, MapRemoveBuilding(_)) {
+            return Some(Ok(Rejection::LegacyBuildingRemoval));
+        }
         let finite_pattern = |pattern: &LanePattern| {
             pattern.lanes_forward.len() <= 32
                 && pattern.lanes_backward.len() <= 32
@@ -1360,7 +1419,8 @@ impl WorldCommand {
             Init(_)
             | MapRemoveIntersection(_)
             | MapRemoveRoad(_)
-            | MapRemoveBuilding(_)
+            | MapStartDemolition { .. }
+            | MapRetrofitFireApron { .. }
             | MapBuildHouse(_)
             | SpawnRandomCars { .. }
             | MapLoadParis
@@ -1378,7 +1438,7 @@ impl WorldCommand {
                 ..
             }
             | BuyTile { .. } => true,
-            EditWater(_) => unreachable!(),
+            EditWater(_) | MapRemoveBuilding(_) => unreachable!(),
         };
         (!fits).then_some(Ok(Rejection::InvalidCommandEncoding))
     }
@@ -1468,6 +1528,11 @@ impl WorldCommand {
             let index = outcomes.command_ranges.len();
             outcomes.junction_edits.insert(index, Err(reason));
         }
+        if matches!(self, MapStartDemolition { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.demolitions.insert(index, Err(reason));
+        }
         if matches!(self, EditWater(_)) {
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -1489,6 +1554,8 @@ impl WorldCommand {
             MapRemoveIntersection(_) => "MapRemoveIntersection",
             MapRemoveRoad(_) => "MapRemoveRoad",
             MapRemoveBuilding(_) => "MapRemoveBuilding",
+            MapStartDemolition { .. } => "MapStartDemolition",
+            MapRetrofitFireApron { .. } => "MapRetrofitFireApron",
             MapBuildHouse(_) => "MapBuildHouse",
             Terraform { .. } => "Terraform",
             SendMessage { .. } => "SendMessage",
@@ -1573,26 +1640,20 @@ impl WorldCommand {
 
     fn validate(&self, map: &Map) -> Result<(), Rejection> {
         let exists = match self {
+            MapStartDemolition { site, .. } | MapRetrofitFireApron { site, .. } => map.get(*site).is_some(),
             MapUpgradeRoad { road, .. } => map.get(*road).is_some(),
             MapSetJunctionRules { junction, .. } => map.get(*junction).is_some(),
             MapRemoveIntersection(id) | MapUpdateIntersectionPolicy { inter: id, .. } => {
                 map.get(*id).is_some()
             }
             MapRemoveRoad(id) => map.get(*id).is_some(),
-            MapRemoveBuilding(id) => {
-                if map.get(*id).is_none() {
-                    return Err(Rejection::MissingReference);
-                }
-                map.authorize_land_effects(PreparedEffects::Building(*id))?;
-                map.authorize_building_removal(*id)?;
-                true
-            }
+            MapRemoveBuilding(_) => return Err(Rejection::LegacyBuildingRemoval),
             MapLoadParis | MapLoadTestField { .. } | SpawnRandomCars { .. }
                 if map.land_ownership().is_tiled() =>
             {
                 return Err(LandDenial::ForbiddenOperation.into());
             }
-            MapLoadParis | MapLoadTestField { .. } if map.has_junction_rules() => {
+            MapLoadParis | MapLoadTestField { .. } if map.has_junction_rules() || !map.service_frontages.is_empty() => {
                 return Err(Rejection::RoadTopologyUnavailable);
             }
             SetLotLayout(layout)
@@ -1622,6 +1683,9 @@ impl WorldCommand {
             }
             MapBuildHouse(id) => {
                 let lot = map.get(*id).ok_or(Rejection::MissingReference)?;
+                if map.service_apron_overlaps(&lot.shape) {
+                    return Err(Rejection::BuildingOverlap);
+                }
                 map.authorize_land_effects(PreparedEffects::Lot(*id))?;
                 map.authorize_new_building(&lot.shape, BuildingGen::House, None, Some(lot.parent))?;
                 let height = map.environment().height(lot.shape.center()).unwrap_or(0.0);
@@ -1689,6 +1753,7 @@ impl WorldCommand {
                     return Err(Rejection::InvalidBuilding);
                 }
                 let zoneable = match *kind {
+                    BuildingKind::SiteRemnant => return Err(Rejection::InvalidBuilding),
                     BuildingKind::GoodsCompany(id) => {
                         let proto = try_prototype(id).ok_or(Rejection::MissingReference)?;
                         if id.is_growable() {
@@ -1799,6 +1864,9 @@ impl WorldCommand {
         self.admitted(map.land_ownership().is_tiled(), &budget)?;
         drop(map);
         match self {
+            MapStartDemolition { site, quote } => Ok(ActionPreview::priced(
+                prepare_demolition(sim, *site, *quote, &mut budget.remaining)?,
+            )),
             EditWater(edit) => {
                 let water = sim
                     .preview_water_edit(edit)
@@ -1877,7 +1945,9 @@ impl WorldCommand {
                 PreparedAction::JunctionEdit(prepared) => {
                     Ok(ActionPreview::priced(prepared.preview.cost))
                 }
-                PreparedAction::SpecialBuilding(_, cost) | PreparedAction::Command(_, cost) => {
+                PreparedAction::SpecialBuilding(_, _, cost)
+                | PreparedAction::RetrofitFireApron(_, _, cost)
+                | PreparedAction::Command(_, cost) => {
                     Ok(ActionPreview::priced(cost))
                 }
             },
@@ -2034,8 +2104,21 @@ impl WorldCommand {
         {
             let building =
                 map.prepare_special_building(*pos, *kind, *gen, zone.clone(), *connected_road)?;
-            let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
-            return Ok(PreparedAction::SpecialBuilding(building, cost));
+            let (apron, extra) = if is_fire_station(*kind) {
+                let (road, door, footprint) = building.fire_frontage();
+                let (apron, price) = prepare_new_apron(sim, road, door, footprint, &mut budget.remaining)?;
+                (Some(Box::new(apron)), price)
+            } else {
+                (None, Money::ZERO)
+            };
+            let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim)
+                .and_then(|base| base.inner().checked_add(extra.inner()).map(Money::new_inner)))?;
+            return Ok(PreparedAction::SpecialBuilding(building, apron, cost));
+        }
+        if let MapRetrofitFireApron { site, quote } = *self {
+            let apron = prepare_retrofit(sim, site, quote, &mut budget.remaining)?;
+            let cost = Self::affordable_cost(sim, Some(quote.price))?;
+            return Ok(PreparedAction::RetrofitFireApron(site, Box::new(apron), cost));
         }
         match self {
             MapRemoveRoad(id) => map
@@ -2309,11 +2392,9 @@ impl WorldCommand {
                     .try_remove_road(id)
                     .map_err(Rejection::water_connection_error)?;
             }
-            MapRemoveBuilding(id) => {
-                if !crate::souls::lifecycle::remove_site(sim, id) {
-                    return Err(Rejection::MutationFailed);
-                }
-            }
+            MapRemoveBuilding(_) => return Err(Rejection::LegacyBuildingRemoval),
+            MapStartDemolition { .. } => unreachable!("handled by apply_in_batch"),
+            MapRetrofitFireApron { .. } => unreachable!("prepared fire apron"),
             MapBuildHouse(id) => {
                 let building = sim
                     .map_mut()

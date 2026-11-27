@@ -47,6 +47,10 @@ impl BuyFood {
         }
     }
 
+    pub(crate) fn references_store(&self, includes: impl FnOnce(BuildingID) -> bool) -> bool {
+        matches!(&self.state, BuyFoodState::BoughtAt(site) if includes(*site))
+    }
+
     pub(crate) fn forget_if(&mut self, removed: impl FnOnce(BuildingID) -> bool) {
         if matches!(self.state, BuyFoodState::BoughtAt(id) if removed(id)) {
             self.state = BuyFoodState::Empty;

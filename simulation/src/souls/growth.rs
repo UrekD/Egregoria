@@ -1665,7 +1665,7 @@ mod tests {
         for _ in 0..12 {
             hourly_check(&mut test.g);
         }
-        assert!(test.g.map().get(house).is_none());
+        assert!(test.g.map().is_ruined(house));
         assert!(!test
             .g
             .read::<residence::Residences>()
@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn p1b_collapse_restores_lot_after_exactly_twelve_abandoned_hours() {
+    fn p9_decline_retains_the_lot_until_clearance() {
         let mut test = street();
         let lot = front_lot(&test.g);
         let origin = test.g.map().get(lot).unwrap().shape;
@@ -1949,6 +1949,9 @@ mod tests {
         }
         assert!(test.g.map().get(house).is_some());
         hourly_check(&mut test.g);
+        assert!(test.g.map().is_ruined(house));
+        assert!(test.g.map().lot_origin(house).is_some());
+        clear_fixture_ruin(&mut test, house);
         assert!(test.g.map().get(house).is_none());
         assert!(test.g.map().lot_origin(house).is_none());
         assert!(!test
@@ -1957,6 +1960,14 @@ mod tests {
             .by_building
             .contains_key(&house));
         restored_lot(&test.g.map(), origin);
+    }
+
+    fn clear_fixture_ruin(test: &mut TestCtx, site: BuildingID) {
+        use crate::souls::demolition::{demolition_quote, demolition_update};
+        let quote = demolition_quote(&test.g, site).unwrap().quote;
+        test.g.apply_commands([&WorldCommand::MapStartDemolition { site, quote }]);
+        test.g.write::<GameTime>().tick.0 += u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE;
+        demolition_update(&mut test.g);
     }
 
     #[test]
@@ -1991,7 +2002,7 @@ mod tests {
                 }
             };
             assert_ne!(road, origin.parent);
-            test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
+            clear_fixture_ruin(&mut test, house);
             assert_eq!(restored_lot(&test.g.map(), origin.shape), road);
         }
     }

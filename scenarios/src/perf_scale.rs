@@ -53,6 +53,13 @@ pub fn benchmark_paris(case: PerfCase) -> Result<BenchmarkReport, String> {
     report(ctx, Workload::Paris { case }, window)
 }
 
+pub fn configure_background_fire(sim: &mut Simulation) -> Result<(), &'static str> {
+    simulation::souls::events::FireScenarioRules {
+        suppress_incidental_offers: true,
+        ..Default::default()
+    }.apply(sim)
+}
+
 pub fn bench_slot(
     root: &Path,
     id: &SlotId,
@@ -69,14 +76,28 @@ pub fn bench_slot_with_workers(
     measured_ticks: u64,
     workers: usize,
 ) -> Result<BenchmarkReport, String> {
+    bench_slot_with_fire_profile(root, id, warmup_ticks, measured_ticks, workers, false)
+}
+
+pub fn bench_slot_with_fire_profile(
+    root: &Path,
+    id: &SlotId,
+    warmup_ticks: u64,
+    measured_ticks: u64,
+    workers: usize,
+    background_fire: bool,
+) -> Result<BenchmarkReport, String> {
     validate_workers(workers)?;
     validate_window(measured_ticks)?;
     // Resolve paths before initialization changes the current working directory.
     let root = std::path::absolute(root).map_err(|error| error.to_string())?;
     ScenarioCtx::initialize();
     let start = Instant::now();
-    let sim = Simulation::load_from_slot(&root, id)
+    let mut sim = Simulation::load_from_slot(&root, id)
         .map_err(|error| format!("{} ({id}): {error}", root.display()))?;
+    if background_fire {
+        configure_background_fire(&mut sim)?;
+    }
     let load_ms = milliseconds(start.elapsed());
     let mut ctx = ScenarioCtx::from_sim(sim);
     let window = measure_windows(&mut ctx, warmup_ticks, measured_ticks, None, false)?;

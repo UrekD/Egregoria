@@ -342,6 +342,15 @@ impl Itinerary {
         }
     }
 
+    pub(crate) fn service_sweep(points: &[Vec3]) -> Self {
+        let terminal = *points.last().expect("a checked apron has swept waypoints");
+        Self {
+            kind: ItineraryKind::Simple(terminal),
+            reversed_local_path: points.iter().rev().copied().collect(),
+            ..Self::default()
+        }
+    }
+
     pub fn wait_until(x: f64) -> Self {
         Self {
             kind: ItineraryKind::WaitUntil(x),
@@ -421,6 +430,40 @@ impl Itinerary {
         let start = driving_lane_points(map, start_lane, start_offset)?.point_along(start_offset);
         let target = ItineraryTarget::DirectedLane(end_lane, end_offset);
         Self::route_from(tick, start, start_lane, target, map, PathKind::Vehicle)
+    }
+
+    /// Installs a checked, reversed lane/turn path without starting a second search.
+    pub(crate) fn service_drive(
+        map: &Map,
+        from: crate::souls::service_access::DirectedLaneAnchor,
+        to: crate::souls::service_access::DirectedLaneAnchor,
+        reversed_route: Vec<Traversable>,
+    ) -> Option<Self> {
+        let start = from.offset_cm as f32 / 100.0;
+        let end_offset = to.offset_cm as f32 / 100.0;
+        let points = driving_lane_points(map, from.lane, start)?;
+        let target = ItineraryTarget::DirectedLane(to.lane, end_offset);
+        let end_pos = driving_lane_points(map, to.lane, end_offset)?.point_along(end_offset);
+        let start_pos = points.point_along(start);
+        let mut local = if reversed_route.is_empty() {
+            directed_local_path(points, start_pos, end_offset, end_pos)?
+        } else {
+            directed_local_path(points, start_pos, points.length(), points.last())?
+        };
+        local.reverse();
+        Some(Self {
+            kind: ItineraryKind::Route(
+                Route {
+                    reversed_route,
+                    end_pos,
+                    cur: Traversable::new(TraverseKind::Lane(from.lane), TraverseDirection::Forward),
+                    target,
+                },
+                PathKind::Vehicle,
+            ),
+            reversed_local_path: local,
+            ..Self::default()
+        })
     }
 
     pub(crate) fn route_rail(
@@ -724,7 +767,8 @@ impl Itinerary {
             route,
             on_road_entry,
             None,
-            |_, _, _| true,
+            false,
+            None::<fn(Option<&Traversable>, Vec3, Vec3) -> bool>,
         )
     }
 
@@ -737,11 +781,20 @@ impl Itinerary {
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
         mut admission: Option<&mut MovementAdmission<'_>>,
-        mut move_on: impl FnMut(Traversable, Vec3, Vec3) -> bool,
+        guard_local: bool,
+        mut move_on: Option<impl FnMut(Option<&Traversable>, Vec3, Vec3) -> bool>,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
-            return self.advance_egress(map, position, dist_to_move);
+            return self.advance_egress(map, position, dist_to_move, |from, to| {
+                !guard_local || move_on.as_mut().is_none_or(|guard| guard(None, from, to))
+            });
         }
+        let mut segment_clear = |it: &Self, from, to| {
+            move_on.as_mut().is_none_or(|guard| {
+                let traversal = it.get_travers();
+                (!guard_local && traversal.is_none()) || guard(traversal, from, to)
+            })
+        };
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
             && !self.reversed_local_path.is_empty()
@@ -779,10 +832,7 @@ impl Itinerary {
                                 } else {
                                     position
                                 };
-                                if self
-                                    .get_travers()
-                                    .is_some_and(|&traversal| !move_on(traversal, position, next))
-                                {
+                                if !segment_clear(self, position, next) {
                                     return position;
                                 }
                                 self.observe_road_entry(position, next, map, &mut on_road_entry);
@@ -800,10 +850,7 @@ impl Itinerary {
             }
             // Coincident waypoints still advance after a tolerance snap.
             if dist <= (dist_to_move + snap).max(0.0) {
-                if self
-                    .get_travers()
-                    .is_some_and(|&traversal| !move_on(traversal, position, p))
-                {
+                if !segment_clear(self, position, p) {
                     return position;
                 }
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
@@ -840,10 +887,7 @@ impl Itinerary {
             }
 
             let next = position + (p - position).normalize_to(dist_to_move.max(0.0));
-            if self
-                .get_travers()
-                .is_some_and(|&traversal| !move_on(traversal, position, next))
-            {
+            if !segment_clear(self, position, next) {
                 return position;
             }
             self.observe_road_entry(position, next, map, &mut on_road_entry);
@@ -1193,7 +1237,13 @@ impl Itinerary {
         false
     }
 
-    fn advance_egress(&mut self, map: &Map, mut position: Vec3, mut distance: f32) -> Vec3 {
+    fn advance_egress(
+        &mut self,
+        map: &Map,
+        mut position: Vec3,
+        mut distance: f32,
+        mut move_on: impl FnMut(Vec3, Vec3) -> bool,
+    ) -> Vec3 {
         let ItineraryKind::PedestrianEgress(ref mut egress) = self.kind else {
             unreachable!();
         };
@@ -1210,7 +1260,11 @@ impl Itinerary {
             let segment = next - position;
             let length = segment.mag();
             if length > distance {
-                return position + segment * (distance / length);
+                let next = position + segment * (distance / length);
+                return if move_on(position, next) { next } else { position };
+            }
+            if !move_on(position, next) {
+                return position;
             }
             self.reversed_local_path.pop();
             position = next;
@@ -1483,10 +1537,20 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     // Boarding and routing have settled. Build grants from one frozen view
     // before any user's final itinerary movement.
     let mut junction_state = resources.write::<JunctionAdmission>();
+    let fleet = resources.read::<crate::souls::service_dispatch::FireFleet>();
+    let sweeps = fleet.has_sweeps();
+    use crate::souls::service_dispatch::FireWorkTiming;
+    let timing = sweeps && resources.read::<FireWorkTiming>().enabled;
+    let mut sweep_elapsed = std::time::Duration::ZERO;
     let mut junction_frame = if map.has_junction_controller() {
         let mut grid = resources.write::<TransportGrid>();
         grid.refresh_admission_colliders(world);
-        JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick)
+        let incidents = (fleet.has_outbound()
+            && resources.read::<crate::souls::events::FireScenarioRules>().emergency_junction_preference)
+            .then(|| resources.read::<crate::souls::events::ServiceIncidents>());
+        JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick, &|truck| {
+            incidents.as_ref().is_some_and(|incidents| fleet.is_live_outbound(world, incidents, truck))
+        })
     } else {
         junction_state.clear();
         JunctionFrame::default()
@@ -1537,20 +1601,40 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
             discharged: None,
         });
+        let sweep_owner = if sweeps { user } else { None };
+        let move_on = (sweep_owner.is_some() || truck.is_some()).then_some(
+            |traversal: Option<&Traversable>, from, to| {
+                if let Some(user) = sweep_owner {
+                    let start = timing.then(std::time::Instant::now);
+                    let clear = fleet.sweep_allows(user.owner, from, to, user.half_extent);
+                    if let Some(start) = start {
+                        sweep_elapsed += start.elapsed();
+                    }
+                    if !clear {
+                        return false;
+                    }
+                }
+                if let (Some(truck), Some(traversal)) = (truck, traversal) {
+                    freight.observe_truck_motion(truck, traversal.kind, from, to);
+                }
+                true
+            },
+        );
         *pos = it.update_guarded(
             *pos,
             speed * DELTA,
             time.seconds,
             map,
-            |start, target, kind| failures.route(time.tick, start, target, map, kind),
+            |start, target, kind| {
+                if truck.is_some_and(|truck| fleet.owns_truck(truck)) {
+                    return None;
+                }
+                failures.route(time.tick, start, target, map, kind)
+            },
             record,
             admission.as_mut(),
-            |traversal, from, to| {
-                if let Some(truck) = truck {
-                    freight.observe_truck_motion(truck, traversal.kind, from, to);
-                }
-                true
-            },
+            sweep_owner.is_some(),
+            move_on,
         );
         admission.map_or((None, None, None), |guard| {
             let observed_hold = match guard.user.owner {
@@ -1670,6 +1754,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     }
 
     let reservations = resources.read::<TrainReservations>();
+    if timing {
+        resources.write::<FireWorkTiming>().movement += sweep_elapsed;
+    }
     let lengths = world
         .trains
         .iter()
@@ -1687,7 +1774,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 |_, _, _| None,
                 None::<fn(RoadID, PathKind)>,
                 None,
-                |traversal, from, to| {
+                false,
+                Some(|traversal: Option<&Traversable>, from, to| {
+                    let traversal = *traversal.expect("train movement guard requires a traversal");
                     let Some(track) = traversal.raw_points(map) else {
                         return false;
                     };
@@ -1715,7 +1804,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                         freight.observe_motion(id, traversal.kind, from, to, tick);
                     }
                     true
-                },
+                }),
             );
         }
         if let Some(index) = &mut observed {
@@ -1881,7 +1970,7 @@ mod tests {
         use crate::map_dynamic::{Destination, RoutingStep};
         use crate::souls::human::HumanDecisionKind;
         use crate::transportation::spawn_driving_vehicle;
-        use crate::world_command::{CommandOutcomes, WorldCommand};
+        use crate::world_command::CommandOutcomes;
         use geom::Transform;
 
         let mut ctx = TestCtx::new();
@@ -1960,7 +2049,7 @@ mod tests {
         assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == door));
         assert!(human.it.get_point().is_some());
 
-        ctx.g.apply_commands([&WorldCommand::MapRemoveBuilding(target_house)]);
+        ctx.remove_fixture_building(target_house);
         assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
         let human = &ctx.g.world.humans[id];
         assert_eq!(human.location, Location::Outside);

@@ -421,6 +421,7 @@ impl JunctionFrame {
         grid: &TransportGrid,
         state: &mut JunctionAdmission,
         tick: u64,
+        outbound_fire: &impl Fn(VehicleID) -> bool,
     ) -> Self {
         let mut frame = Self::default();
         let mut waiting = BTreeMap::new();
@@ -548,6 +549,7 @@ impl JunctionFrame {
                 local,
                 &actors,
                 requests,
+                outbound_fire,
             );
         }
         // Keep the arbitration age across a dense sample. A Stop claimant
@@ -576,6 +578,7 @@ impl JunctionFrame {
         occupied: &mut Vec<Sweep>,
         actors: &[Actor<'_>],
         requests: Vec<EntryRequest>,
+        outbound_fire: &impl Fn(VehicleID) -> bool,
     ) {
         let mut eligible = Vec::new();
         let mut heads = BTreeMap::new();
@@ -624,16 +627,17 @@ impl JunctionFrame {
             eligible.push((
                 unaged,
                 unaged.then_some(request.role),
+                !unaged || !matches!(owner, EntryOwner::Vehicle(id) if outbound_fire(id)),
                 eligible_since,
                 owner,
                 request,
             ));
         }
         eligible
-            .sort_unstable_by_key(|&(unaged, role, since, owner, _)| (unaged, role, since, owner));
+            .sort_unstable_by_key(|&(unaged, role, emergency, since, owner, _)| (unaged, role, emergency, since, owner));
         let mut work = MAX_TURN_SEGMENT_PAIRS;
         let mut aged_holds = Vec::new();
-        for (unaged, _, _, owner, request) in eligible {
+        for (unaged, _, _, _, owner, request) in eligible {
             let sweep = Sweep {
                 owner: request.user,
                 crossing: request.crossing,

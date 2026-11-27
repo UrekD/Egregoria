@@ -476,7 +476,7 @@ impl HumanStorage {
         self.edit_guarded(id, |human| edit(human))
     }
 
-    fn edit_guarded<R>(
+    pub(crate) fn edit_guarded<R>(
         &mut self,
         id: HumanID,
         edit: impl FnOnce(&mut HumanEdit<'_>) -> R,

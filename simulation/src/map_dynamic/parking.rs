@@ -1,5 +1,7 @@
 use super::itinerary::RerouteFailures;
-use crate::map::{Lane, LaneKind, Map, ParkingSpot, ParkingSpotID, ParkingSpots, RoadID};
+use crate::map::{ Lane, LaneKind, Map, ParkingSpot, ParkingSpotID, ParkingSpots, RoadID};
+use crate::souls::service_dispatch::ServiceCurbOwner;
+use common::saveload::{Bincode, Encoder};
 use common::AccessCmp;
 use geom::Vec3;
 use serde::{Deserialize, Serialize};
@@ -12,9 +14,14 @@ pub(crate) const NEAR_PARKING_RADIUS: f32 = 100.0;
 #[repr(transparent)]
 pub struct SpotReservation(ParkingSpotID);
 
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct ParkingManagement {
     reserved_spots: BTreeSet<ParkingSpotID>,
+    #[serde(skip)]
+    service_spots: BTreeMap<ParkingSpotID, ServiceCurbOwner>,
+    #[serde(skip)]
+    tagged: bool,
     #[serde(skip)]
     pub(crate) reroute_failures: RerouteFailures,
     #[serde(skip)]
@@ -82,7 +89,76 @@ impl ParkingManagement {
     }
 
     pub fn is_spot_free(&self, spot: ParkingSpotID) -> bool {
-        !self.reserved_spots.contains(&spot)
+        !self.reserved_spots.contains(&spot) && !self.service_spots.contains_key(&spot)
+    }
+
+    pub(crate) fn save(&self, mut output: &mut dyn std::io::Write) -> std::io::Result<()> {
+        Bincode::encode_writer(self, &mut output)?;
+        Bincode::encode_writer(&self.service_spots, output)
+    }
+
+    pub(crate) fn load(mut input: &[u8]) -> std::io::Result<Self> {
+        let mut parking: Self = Bincode::decode_reader(&mut input)?;
+        if !input.is_empty() {
+            parking.service_spots = Bincode::decode(input)?;
+            parking.tagged = true;
+        }
+        Ok(parking)
+    }
+
+    pub(crate) fn restore_service_curb(
+        &mut self,
+        expected: BTreeMap<ParkingSpotID, ServiceCurbOwner>,
+        world: &crate::World,
+    ) -> Result<(), &'static str> {
+        if self.tagged && self.service_spots != expected {
+            return Err("service curb ownership does not match fire aprons");
+        }
+        if expected.is_empty() {
+            return Ok(());
+        }
+        if expected.keys().any(|spot| self.tagged == self.reserved_spots.contains(spot))
+            || world.vehicles.values().any(|vehicle| {
+                use crate::transportation::VehicleState::*;
+                match &vehicle.vehicle.state {
+                    Parked(spot) | RoadToPark(_, _, spot) | ReturningToDepot { spot, .. } =>
+                        expected.contains_key(&spot.id()),
+                    _ => false,
+                }
+            })
+            || world.humans.values().any(|human| human.router.has_reserved_spot(|spot|
+                expected.contains_key(&spot)))
+        {
+            return Err("service curb conflicts with ordinary parking");
+        }
+        if !self.tagged {
+            for spot in expected.keys() {
+                self.reserved_spots.remove(spot);
+            }
+            self.service_spots = expected;
+        }
+        self.tagged = true;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_service_curb(
+        &mut self,
+        owner: ServiceCurbOwner,
+        spots: &[ParkingSpotID],
+    ) -> bool {
+        if spots.iter().any(|&spot| !self.is_spot_free(spot)) {
+            return false;
+        }
+        self.service_spots.extend(spots.iter().map(|&spot| (spot, owner)));
+        true
+    }
+
+    pub(crate) fn release_service_curb(&mut self, owner: ServiceCurbOwner, spots: &[ParkingSpotID]) {
+        for spot in spots {
+            if self.service_spots.get(spot) == Some(&owner) {
+                self.service_spots.remove(spot);
+            }
+        }
     }
 
     pub fn reserve_random_free_spot(
@@ -94,7 +170,7 @@ impl ParkingManagement {
             let Some(spot) = spots.random_spot(rng.wrapping_add(i_try)) else {
                 continue;
             };
-            if self.reserved_spots.insert(spot) {
+            if self.is_spot_free(spot) && self.reserved_spots.insert(spot) {
                 return Some(SpotReservation(spot));
             }
         }
@@ -187,7 +263,7 @@ impl ParkingManagement {
                             map.parking
                                 .get(spot)
                                 .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
-                        }) && self.reserved_spots.insert(spot)
+                        }) && !self.service_spots.contains_key(&spot) && self.reserved_spots.insert(spot)
                         {
                             if let Some(stats) = observation {
                                 if lane.parent != start_road {

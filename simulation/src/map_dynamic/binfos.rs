@@ -197,13 +197,7 @@ impl BuildingInfos {
         self.vacancy_changes.insert(building);
     }
 
-    pub(crate) fn vacant_buildings(
-        &mut self,
-        map: &Map,
-        residences: &Residences,
-        immigrating: bool,
-        now: u64,
-    ) -> Vec<VacancyTarget> {
+    fn refresh_vacancies(&mut self, map: &Map, residences: &Residences) {
         if self.vacancies.is_none() {
             self.vacancy_changes.extend(self.assignment.keys());
         }
@@ -235,6 +229,21 @@ impl BuildingInfos {
                 vacancies.unowned.insert(id);
             }
         }
+    }
+
+    pub(crate) fn vacant_homes(&mut self, map: &Map, residences: &Residences) -> impl Iterator<Item = BuildingID> + '_ {
+        self.refresh_vacancies(map, residences);
+        self.vacancies.iter().flat_map(|vacancies| vacancies.homes.iter().copied())
+    }
+
+    pub(crate) fn vacant_buildings(
+        &mut self,
+        map: &Map,
+        residences: &Residences,
+        immigrating: bool,
+        now: u64,
+    ) -> Vec<VacancyTarget> {
+        self.refresh_vacancies(map, residences);
         let Some(vacancies) = &self.vacancies else {
             return Vec::new();
         };

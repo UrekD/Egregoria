@@ -319,7 +319,10 @@ impl SerializedMap {
             }
         }
         for (id, building) in self.buildings.iter() {
-            if building.obb.corners.iter().any(|point| !point.is_finite())
+            if building.id != id
+                || !building.door_pos.is_finite()
+                || !building.height.is_finite()
+                || building.obb.corners.iter().any(|point| !point.is_finite())
                 || !super::valid_building_index_bounds(building.obb.bbox())
                 || building
                     .zone
@@ -361,6 +364,10 @@ impl SerializedMap {
             junction.index_crosswalks();
         }
         let spatial_map = mk_spatial_map(&self);
+        let fire_cohorts = self.buildings.values()
+            .filter(|building| crate::souls::events::can_burn(building.kind))
+            .map(|building| crate::souls::events::cohort_key(building.id))
+            .collect();
         let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
         for (id, lot) in self.lots.iter() {
             lots_by_road.entry(lot.parent).or_default().insert(id);
@@ -370,6 +377,7 @@ impl SerializedMap {
             lanes: self.lanes,
             intersections: self.intersections,
             buildings: self.buildings,
+            fire_cohorts,
             spatial_map,
             lots: self.lots,
             lots_by_road,
@@ -414,6 +422,11 @@ impl SerializedMap {
         });
         m.migrated_roundabout_paths = previous_paths;
         m.electricity = ElectricityCache::build(&m);
+        for building in m.buildings.values() {
+            if building.kind == crate::map::BuildingKind::SiteRemnant {
+                m.electricity.remove_object(building.id);
+            }
+        }
         m.water_services = super::WaterServiceCache::from_map(&m);
         Ok(m)
     }

@@ -30,6 +30,7 @@ pub enum ConnectionError {
     WorkLimit,
     Stale,
     LandDenied(crate::map::LandDenial),
+    OccupiedServiceAccess,
 }
 
 impl fmt::Display for ConnectionError {
@@ -38,6 +39,7 @@ impl fmt::Display for ConnectionError {
             return write!(f, "Land edit denied: {reason:?}");
         }
         f.write_str(match self {
+            Self::OccupiedServiceAccess => "The road supports an occupied fire service bay",
             Self::InvalidEndpoint => "Invalid road or rail endpoint",
             Self::RoundaboutRailConflict => "A same-level railway conflicts with this roundabout",
             Self::OutOfBounds => "The crossing leaves the map",
