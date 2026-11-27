@@ -37,10 +37,10 @@
   {"Pointer": {"action": "Click", "world_pos": [4257, 4209.5, 10]}},
   {"Pointer": {"action": "Move", "world_pos": [4250, 4219, 10]}},
   {"WaitFrames": 6},
-  {"Screenshot": "pathpark-w3-parking-lot"},
   {"Pointer": {"action": "Click", "world_pos": [4250, 4219, 10]}},
   {"WaitFrames": 8},
   {"Assert": {"PathPark": {"footpaths": 1, "local_one_way": 1, "lot_capacity": 7, "vehicle_entrances": 2}}},
+  {"Screenshot": "pathpark-w3-parking-lot"},
   {"Assert": "NoRejections"},
   {"DumpState": "pathpark-w3-final"},
   "Exit"

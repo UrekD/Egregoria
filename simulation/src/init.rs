@@ -425,6 +425,15 @@ fn register_property_parking() {
     use crate::transportation::DrivewayTraffic;
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "surface_lots",
+            optional: true,
+            save: Box::new(|sim, output| Bincode::encode_writer(&sim.map().surface_lots, output)),
+            load: Box::new(|sim, data| {
+                let frontage = Bincode::decode(data)?;
+                sim.map_mut().load_surface_lots(frontage)
+            }),
+        });
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "property_parking",
             optional: true,
             save: Box::new(|sim, output| sim.read::<DrivewayTraffic>().properties.save(output)),

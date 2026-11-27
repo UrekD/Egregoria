@@ -19,7 +19,7 @@ use geom::{PolyLine3, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
-use slotmapd::{HopSlotMap, Key};
+use slotmapd::{new_key_type, HopSlotMap, Key, SlotMap};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -59,6 +59,56 @@ pub struct LotOrigin {
     growable: bool,
 }
 
+new_key_type! {
+    pub struct ParkingLotID;
+}
+
+const MAX_SURFACE_FRONTAGE: usize = 32;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SurfaceLots {
+    ids: SlotMap<ParkingLotID, BuildingID>,
+    #[serde(deserialize_with = "super::building_parking::bounded_parking_map::<_, _, _, 65536>")]
+    origins: BTreeMap<BuildingID, SurfaceFrontageOrigins>,
+    #[serde(deserialize_with = "super::building_parking::bounded_parking_map::<_, _, _, 65536>")]
+    stalls: BTreeMap<BuildingID, SurfaceStalls>,
+    #[serde(skip)]
+    by_building: BTreeMap<BuildingID, ParkingLotID>,
+    #[serde(skip)]
+    geometry: BTreeMap<BuildingID, super::building_parking::SurfaceGeometry>,
+    #[serde(skip)]
+    footprints: BTreeMap<BuildingID, super::building_parking::LotFootprint>,
+}
+
+impl SurfaceLots {
+    fn insert(&mut self, building: BuildingID) {
+        let lot = self.ids.insert(building);
+        self.by_building.insert(building, lot);
+    }
+
+    fn remove(&mut self, building: BuildingID) -> Option<SurfaceFrontageOrigins> {
+        let lot = self.by_building.remove(&building)?;
+        self.ids.remove(lot);
+        self.geometry.remove(&building);
+        self.footprints.remove(&building);
+        self.origins.remove(&building)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SurfaceFrontageOrigins(
+    #[serde(
+        deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_SURFACE_FRONTAGE>"
+    )]
+    Vec<LotOrigin>,
+);
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SurfaceStalls(
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 192>")]
+    Vec<ParkingSpotID>,
+);
+
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionEndpoint {
     pub pos: Vec3,
@@ -83,6 +133,8 @@ pub(crate) struct PreparedSpecialBuilding {
     building: super::PreparedBuilding,
     shape: OBB,
     kind: BuildingKind,
+    cleared_lots: Option<Vec<ProjectKind>>,
+    surface: Option<super::building_parking::SurfaceGeometry>,
 }
 
 /// Map-side placement validated against a specific live lot and frontage.
@@ -109,6 +161,8 @@ pub struct Map {
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    pub(crate) surface_lot_count: usize,
+    pub(crate) surface_lots: SurfaceLots,
     // Derived identity for caches whose lifetime can exceed this map's.
     pub(super) identity: u64,
     pub(crate) walking_topology_generation: u64,
@@ -178,6 +232,8 @@ impl Clone for Map {
             spatial_map,
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
+            surface_lot_count: self.surface_lot_count,
+            surface_lots: self.surface_lots.clone(),
             walking_topology_generation: self.walking_topology_generation,
             driving_policy_generation: self.driving_policy_generation,
             junction_policy_revision: self.junction_policy_revision,
@@ -215,6 +271,8 @@ impl Map {
             spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
+            surface_lot_count: 0,
+            surface_lots: SurfaceLots::default(),
             identity: NEXT_IDENTITY
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("map identities exhausted"),
@@ -851,12 +909,105 @@ impl Map {
         })
     }
 
+    pub(crate) fn load_surface_lots(&mut self, mut lots: SurfaceLots) -> std::io::Result<()> {
+        use geom::{Intersect, Shape};
+        for (lot, &building) in lots.ids.iter() {
+            if lots.by_building.insert(building, lot).is_some()
+                || self
+                    .get(building)
+                    .is_none_or(|b| !matches!(b.kind, BuildingKind::ParkingLot { .. }))
+            {
+                return Err(std::io::Error::other(
+                    "invalid surface parking lot identity",
+                ));
+            }
+        }
+        if lots.ids.len() != self.surface_lot_count {
+            return Err(std::io::Error::other(
+                "missing surface parking lot identity",
+            ));
+        }
+        let mut stalls = BTreeSet::new();
+        for (&building, ids) in &lots.stalls {
+            if !lots.by_building.contains_key(&building)
+                || ids.0.is_empty()
+                || ids.0.iter().any(|&id| {
+                    !stalls.insert(id)
+                        || self
+                            .parking
+                            .get(id)
+                            .is_none_or(|spot| !spot.parent.is_null())
+                })
+            {
+                return Err(std::io::Error::other(
+                    "invalid surface parking stall identity",
+                ));
+            }
+        }
+        if lots.stalls.len() != self.surface_lot_count
+            || !self.parking.restore_surface_count(stalls.len())
+        {
+            return Err(std::io::Error::other(
+                "missing surface parking stall identity",
+            ));
+        }
+        if lots.origins.iter().any(|(&id, origins)| {
+            self.get(id).is_none_or(|building| {
+                !matches!(building.kind, BuildingKind::ParkingLot { .. })
+                    || origins.0.iter().any(|origin| {
+                        !origin.shape.corners.iter().all(|point| point.is_finite())
+                            || origin.shape.axis().iter().any(|axis| {
+                                !(1.0..=super::MAX_LOT_SIZE + 0.1).contains(&axis.mag())
+                            })
+                            || !building.obb.bbox().intersects(&origin.shape.bbox())
+                    })
+            })
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid surface lot frontage",
+            ));
+        }
+        self.surface_lots = lots;
+        Ok(())
+    }
+
+    pub fn parking_lot_building(&self, lot: ParkingLotID) -> Option<BuildingID> {
+        self.surface_lots.ids.get(lot).copied()
+    }
+
+    pub fn parking_lot_stalls(&self, lot: ParkingLotID) -> Option<&[ParkingSpotID]> {
+        let building = self.parking_lot_building(lot)?;
+        Some(&self.surface_lots.stalls.get(&building)?.0)
+    }
+
+    pub fn public_parking_lot(&self, building: BuildingID) -> Option<ParkingLotID> {
+        self.surface_lots.by_building.get(&building).copied()
+    }
+
+    pub(crate) fn restore_legacy_parking_lot_ids(&mut self) {
+        for (building, data) in self.buildings.iter() {
+            if matches!(data.kind, BuildingKind::ParkingLot { .. }) {
+                self.surface_lots.insert(building);
+            }
+        }
+    }
+
     pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         info!("remove_building {:?}", b);
 
         self.authorize_building_removal(b).ok()?;
         let b = self.buildings.remove(b)?;
-        self.water_services.building_removed(&self.environment, b.id);
+        if matches!(b.kind, BuildingKind::ParkingLot { .. }) {
+            self.surface_lot_count -= 1;
+            if let Some(stalls) = self.surface_lots.stalls.remove(&b.id) {
+                for spot in stalls.0 {
+                    self.parking.remove_surface(spot);
+                }
+            }
+        }
+        self.water_services
+            .building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
         self.subscribers.dispatch(UpdateType::Building, &b);
 
@@ -873,6 +1024,25 @@ impl Map {
 
         if let Some(origin) = self.lot_origins.remove(&b.id) {
             Lot::try_restore(self, origin);
+        }
+        if let Some(origins) = self.surface_lots.remove(b.id) {
+            use geom::Shape;
+            let mut work = super::MAX_WATER_BATCH_WORK;
+            for origin in origins.0 {
+                let bounds = origin.shape.bbox().expand(15.0);
+                if self
+                    .spatial_map
+                    .reserve_construction_query(bounds, &mut work)
+                    .is_err()
+                    || self
+                        .spatial_map
+                        .reserve_lot_query(bounds, 8, 0, 1, &mut work)
+                        .is_err()
+                {
+                    break;
+                }
+                Lot::try_restore(self, origin);
+            }
         }
         self.check_invariants();
 
@@ -1692,8 +1862,17 @@ impl Map {
                 return Err(Rejection::InvalidBuilding);
             }
         }
-        if self.building_overlaps(obb) {
+        let is_surface_lot = matches!(kind, BuildingKind::ParkingLot { .. });
+        let overlap = if is_surface_lot {
+            self.building_overlaps(obb.expand(-0.025))
+        } else {
+            self.building_overlaps(obb)
+        };
+        if overlap {
             return Err(Rejection::BuildingOverlap);
+        }
+        if self.surface_access_obstructed_by(obb) {
+            return Err(Rejection::BusyConflict);
         }
         let building = Building::prepare(
             &self.environment,
@@ -1710,6 +1889,8 @@ impl Map {
             building,
             shape: obb,
             kind,
+            cleared_lots: None,
+            surface: None,
         })
     }
 
@@ -1785,12 +1966,10 @@ impl Map {
         ),
         crate::world_command::Rejection,
     > {
-        use super::building_parking::{
-            lot_footprint, prepare_surface_layout, LotFrame, MAX_WIDTH_BLOCKS,
-        };
+        use super::building_parking::{lot_footprint, prepare_surface_layout, MAX_WIDTH_BLOCKS};
         use crate::world_command::Rejection;
         use common::saveload::{Bincode, Encoder};
-        use geom::Shape;
+        use geom::{Intersect, Shape};
         let charge = |remaining: &mut usize, work| {
             spend_water_work(remaining, work).map_err(|_| Rejection::WaterWorkLimit)
         };
@@ -1805,24 +1984,20 @@ impl Map {
             .ok_or(Rejection::InvalidBuilding)?
             .at;
         let road = self.get(primary.road).ok_or(Rejection::MissingReference)?;
-        let frame_road = match draft.frame {
-            LotFrame::Curb(anchor) => Some(anchor.road),
-            LotFrame::Ground { .. } => None,
-        };
-        let refs = draft
-            .mouths
-            .iter()
-            .flatten()
-            .map(|mouth| mouth.at.road)
-            .chain(frame_road)
-            .chain(draft.foot_gate.and_then(super::PathEndpoint::road));
-        for id in refs {
-            let data = self.get(id).ok_or(Rejection::MissingReference)?;
-            charge(remaining, 48 * data.points().len())?;
+        if let Some(at) = draft.frame.curb() {
+            charge(
+                remaining,
+                self.get(at.road)
+                    .ok_or(Rejection::MissingReference)?
+                    .points()
+                    .len(),
+            )?;
         }
-        charge(remaining, 2_048 * usize::from(draft.width_blocks))?;
         let pad = lot_footprint(self, draft.frame, draft.width_blocks)
             .ok_or(Rejection::InvalidBuilding)?;
+        self.spatial_map
+            .reserve_construction_query(pad.shape.bbox(), remaining)
+            .map_err(|_| Rejection::WaterWorkLimit)?;
         let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
         for object in self.spatial_map.query(pad.shape.bbox(), filter) {
             let work = match object {
@@ -1833,7 +2008,9 @@ impl Map {
                 ProjectKind::Building(id) => {
                     if self.get(id).is_some_and(|building| {
                         matches!(building.kind, BuildingKind::ParkingLot { .. })
-                            && building.obb.corners == pad.shape.corners
+                            && self
+                                .surface_lot_footprint(id)
+                                .is_some_and(|placed| placed.same_paving(pad))
                     }) {
                         return Err(Rejection::StaleRoadQuote);
                     }
@@ -1843,25 +2020,81 @@ impl Map {
             };
             charge(remaining, work)?;
         }
-        // Avoid treating contact at the curb seam as an overlap.
-        if super::special_placement::placement_overlap(self, road, pad.shape.expand(-0.025))
-            .is_some()
-        {
-            return Err(Rejection::BuildingOverlap);
+        // Test the occupied blocks individually so an unpainted recess remains buildable.
+        let mut validate = |shape: OBB| {
+            self.spatial_map
+                .reserve_construction_query(shape.bbox().expand(24.0), remaining)
+                .map_err(|_| Rejection::WaterWorkLimit)?;
+            if super::special_placement::placement_overlap(self, road, shape.expand(-0.025))
+                .is_some()
+            {
+                return Err(Rejection::BuildingOverlap);
+            }
+            self.authorize_new_building(
+                &shape,
+                BuildingGen::NoWalkway {
+                    door_pos: Vec2::ZERO,
+                },
+                None,
+                Some(primary.road),
+            )?;
+            if self.surface_access_obstructed_by(shape) {
+                return Err(Rejection::BusyConflict);
+            }
+            Ok(())
+        };
+        let painted = draft.frame.painted_rows().is_some();
+        if painted {
+            for block in pad.blocks() {
+                validate(block)?;
+            }
+        } else {
+            validate(pad.shape)?;
         }
-        let layout = prepare_surface_layout(self, draft, pad)?;
-        let mut prepared = self.prepare_special_building(
+        let layout = prepare_surface_layout(self, draft, pad, None, remaining)?;
+        self.spatial_map
+            .reserve_lot_query(pad.shape.bbox(), 8, 1, 0, remaining)
+            .map_err(|_| Rejection::WaterWorkLimit)?;
+        let kind = BuildingKind::ParkingLot {
+            width_blocks: draft.width_blocks,
+        };
+        let mut building = Building::prepare(
+            &self.environment,
             pad.shape,
-            BuildingKind::ParkingLot {
-                width_blocks: draft.width_blocks,
-            },
+            kind,
             BuildingGen::NoWalkway {
                 door_pos: Vec2::ZERO,
             },
             None,
-            Some(primary.road),
-        )?;
-        prepared.building.set_lot_appearance(pad, layout.door());
+            Some(layout.anchor_road()),
+            None,
+        )
+        .ok_or(Rejection::InvalidBuilding)?;
+        let cleared: Vec<_> = self
+            .spatial_map
+            .query(pad.shape, ProjectFilter::LOT)
+            .filter(|&project| {
+                let ProjectKind::Lot(id) = project else {
+                    return false;
+                };
+                !painted
+                    || pad
+                        .blocks()
+                        .any(|block| block.expand(-0.025).intersects(&self.lots[id].shape))
+            })
+            .take(MAX_SURFACE_FRONTAGE + 1)
+            .collect();
+        if cleared.len() > MAX_SURFACE_FRONTAGE {
+            return Err(Rejection::WaterWorkLimit);
+        }
+        building.set_lot_appearance(pad, layout.door(), &layout.surface_stalls());
+        let prepared = PreparedSpecialBuilding {
+            building,
+            shape: pad.shape,
+            kind,
+            cleared_lots: Some(cleared),
+            surface: Some(layout.surface_geometry(pad)),
+        };
         let material = Bincode::encode(&layout).map_err(|_| Rejection::InvalidBuilding)?;
         let quote = common::hash_u64((
             material,
@@ -1879,6 +2112,8 @@ impl Map {
             building,
             shape,
             kind,
+            cleared_lots,
+            surface,
         } = prepared;
         let id = building.insert(
             &mut self.buildings,
@@ -1886,13 +2121,51 @@ impl Map {
             &mut self.electricity,
             &mut self.roads,
         );
-        self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
-        self.clear_construction_trees(shape.expand(10.0));
-        queue_construction_cut(
-            &mut self.pending_construction_cuts,
-            &self.environment,
-            &self.buildings[id],
-        );
+        let cleared_lots = cleared_lots
+            .unwrap_or_else(|| self.spatial_map.query(shape, ProjectFilter::LOT).collect());
+        if matches!(kind, BuildingKind::ParkingLot { .. }) {
+            self.surface_lot_count += 1;
+            self.surface_lots.insert(id);
+            let mut parcels: Vec<_> = cleared_lots
+                .iter()
+                .filter_map(|project| {
+                    let ProjectKind::Lot(id) = *project else {
+                        return None;
+                    };
+                    let lot = &self.lots[id];
+                    Some((
+                        id,
+                        LotOrigin {
+                            parent_road: lot.parent,
+                            shape: lot.shape,
+                            growable: false,
+                        },
+                    ))
+                })
+                .collect();
+            parcels.sort_unstable_by_key(|&(id, _)| id);
+            if !parcels.is_empty() {
+                self.surface_lots.origins.insert(
+                    id,
+                    SurfaceFrontageOrigins(parcels.into_iter().map(|(_, origin)| origin).collect()),
+                );
+            }
+        }
+        self.clean_lots_inner(cleared_lots);
+        if let Some(surface) = surface {
+            self.install_surface_stalls(id, &surface.stalls);
+            for block in surface.pad.blocks() {
+                self.clear_construction_trees(block);
+            }
+            self.install_surface_geometry(id, surface);
+        } else {
+            self.clear_construction_trees(shape.expand(10.0));
+            queue_construction_cut(
+                &mut self.pending_construction_cuts,
+                &self.environment,
+                &self.buildings[id],
+            );
+        }
         self.water_services
             .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         self.subscribers
@@ -1955,6 +2228,10 @@ impl Map {
         appearance: Option<PreparedGrowableAppearance>,
     ) -> Result<PreparedGrowable, GrowableLotError> {
         let attachment = self.growable_attachment(lot)?;
+        if self.surface_access_obstructed_by(lot.shape) {
+            return Err(GrowableLotError::Obstructed);
+        }
+
         self.authorize_new_building(&lot.shape, generator, None, Some(lot.parent))
             .map_err(GrowableLotError::LandDenied)?;
         let building = Building::prepare(
@@ -1992,6 +2269,9 @@ impl Map {
             || self.growable_attachment(lot)? != prepared.attachment
         {
             return Err(GrowableLotError::MissingRoad);
+        }
+        if self.surface_access_obstructed_by(lot.shape) {
+            return Err(GrowableLotError::Obstructed);
         }
         lot.check_growable_footprint(self, prepared.generator)?;
         self.authorize_new_building(&lot.shape, prepared.generator, None, Some(lot.parent))
@@ -3247,11 +3527,98 @@ impl Map {
         &self.spatial_map
     }
 
+    pub(super) fn install_surface_stalls(
+        &mut self,
+        building: BuildingID,
+        poses: &[geom::Transform],
+    ) {
+        let stalls = poses
+            .iter()
+            .map(|&pose| self.parking.insert_surface(pose))
+            .collect();
+        self.surface_lots
+            .stalls
+            .insert(building, SurfaceStalls(stalls));
+    }
+
+    pub(super) fn verify_surface_stalls(
+        &self,
+        building: BuildingID,
+        poses: &[geom::Transform],
+    ) -> Option<bool> {
+        let ids = &self.surface_lots.stalls.get(&building)?.0;
+        Some(
+            ids.len() == poses.len()
+                && ids.iter().zip(poses).all(|(&id, &pose)| {
+                    self.parking
+                        .get(id)
+                        .is_some_and(|spot| spot.parent.is_null() && spot.trans == pose)
+                }),
+        )
+    }
+
+    pub(super) fn install_surface_geometry(
+        &mut self,
+        building: BuildingID,
+        geometry: super::building_parking::SurfaceGeometry,
+    ) {
+        self.install_surface_footprint(building, geometry.pad);
+        self.surface_lots.geometry.insert(building, geometry);
+    }
+
+    pub(super) fn install_surface_footprint(
+        &mut self,
+        id: BuildingID,
+        pad: super::building_parking::LotFootprint,
+    ) {
+        self.surface_lots.footprints.insert(id, pad);
+    }
+
+    pub(super) fn surface_lot_footprint(
+        &self,
+        id: BuildingID,
+    ) -> Option<super::building_parking::LotFootprint> {
+        self.surface_lots.footprints.get(&id).copied()
+    }
+
+    pub(crate) fn surface_access_obstructed_by(&self, footprint: OBB) -> bool {
+        use geom::{Intersect, Shape};
+        if self.surface_lot_count == 0 {
+            return false;
+        }
+        self.spatial_map
+            .construction_candidates(footprint.bbox().expand(24.0), ProjectFilter::BUILDING)
+            .filter_map(|kind| kind.as_building())
+            .any(|id| {
+                let building = &self.buildings[id];
+                if !matches!(building.kind, BuildingKind::ParkingLot { .. }) {
+                    return false;
+                }
+                self.surface_lots.geometry.get(&id).map_or_else(
+                    || {
+                        super::building_parking::gate_corridor(building.obb, building.door_pos.xy())
+                            .intersects(&footprint)
+                    },
+                    |geometry| {
+                        geometry.gate.intersects(&footprint)
+                            || geometry
+                                .apron
+                                .iter()
+                                .any(|apron| apron.intersects(&footprint))
+                    },
+                )
+            })
+    }
+
     pub fn building_overlaps(&self, obb: OBB) -> bool {
+        use geom::Intersect;
         self.spatial_map
             .query(obb, ProjectFilter::BUILDING)
-            .next()
-            .is_some()
+            .filter_map(|kind| kind.as_building())
+            .any(|id| {
+                self.surface_lot_footprint(id)
+                    .is_none_or(|pad| pad.blocks().any(|block| block.intersects(&obb)))
+            })
     }
 
     pub fn find_road(&self, src: IntersectionID, dst: IntersectionID) -> Option<RoadID> {

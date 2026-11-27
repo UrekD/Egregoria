@@ -15,12 +15,14 @@ pub(crate) struct FootpathTool {
     curved: bool,
     start: Option<PathEndpoint>,
     end: Option<PathEndpoint>,
+    quoted_cost: Option<prototypes::Money>,
 }
 
 impl FootpathTool {
     pub(crate) fn cancel(&mut self) -> bool {
         let had_start = self.start.take().is_some();
         self.end = None;
+        self.quoted_cost = None;
         had_start
     }
 }
@@ -41,7 +43,11 @@ pub(crate) fn properties(uiw: &UiWorld) {
                 (Some(_), None) => "Choose the end · Hold Shift for precision snapping",
                 _ => "Choose a start on the ground, a footpath, or a sidewalk",
             };
-            textc(on_secondary_container(), instruction);
+            let color = on_secondary_container();
+            textc(color, instruction);
+            if let Some(cost) = state.quoted_cost {
+                textc(color, format!("Construction {cost}"));
+            }
         });
     });
 }
@@ -157,6 +163,7 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
     let markers = [marker_position(&map, from, a), marker_position(&map, to, b)];
     drop(map);
     let preview = command.preview(sim);
+    state.quoted_cost = preview.as_ref().ok().map(|preview| preview.cost);
     let choosing_end = state.curved && state.end.is_none();
     let color = if preview.is_ok() || choosing_end {
         success

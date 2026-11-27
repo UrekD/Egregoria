@@ -6,7 +6,7 @@ pub use surface::{
     curb_edge, lot_footprint, lot_gate_position, lot_mouth_position, LotFootprint, LotFrame,
     LotMouth, MouthUse, SurfaceLotDraft, BLOCK_SIZE, MAX_WIDTH_BLOCKS,
 };
-pub(super) use surface::{prepare_surface_layout, surface_mesh};
+pub(super) use surface::{gate_corridor, prepare_surface_layout, surface_mesh};
 
 use crate::map::{BuildingID, CurbAnchor, Map, ParkingSpotID, ProjectFilter, RoadID, RoadSide};
 use crate::map_dynamic::{DirectedEndpoint, DirectedPlan, Itinerary, ParkingManagement};
@@ -163,7 +163,7 @@ pub(crate) struct ParkingLayout {
     entrance: Vec3,
     approach: DirectedEndpoint,
     release: DirectedEndpoint,
-    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 32>")]
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 192>")]
     paths: Vec<StallPath>,
     #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 32>")]
     masks: Vec<ParkingSpotID>,
@@ -181,7 +181,54 @@ struct StallPath {
     out: Sweep,
 }
 
+#[derive(Clone)]
+pub(super) struct SurfaceGeometry {
+    pub(super) pad: LotFootprint,
+    pub(super) gate: OBB,
+    pub(super) apron: Vec<geom::BoldLine>,
+    pub(super) stalls: Vec<Transform>,
+}
+
 impl ParkingLayout {
+    pub(super) fn surface_geometry(&self, pad: LotFootprint) -> SurfaceGeometry {
+        let apron = self
+            .paths
+            .iter()
+            .flat_map(|path| [&path.into, &path.out])
+            .filter_map(|sweep| {
+                let exterior: Vec<_> = sweep
+                    .points
+                    .iter()
+                    .map(|point| point.xy())
+                    .filter(|&point| !pad.shape.expand(-CAR_RADIUS).contains(point))
+                    .collect();
+                (exterior.len() >= 2)
+                    .then(|| geom::BoldLine::new(geom::PolyLine::new(exterior), CAR_RADIUS))
+            })
+            .collect();
+        SurfaceGeometry {
+            pad,
+            gate: pad.pedestrian_corridor(self.door.xy()),
+            apron,
+            stalls: self
+                .paths
+                .iter()
+                .map(|path| path.into.pose(MOTION_TICKS))
+                .collect(),
+        }
+    }
+
+    pub(super) fn anchor_road(&self) -> RoadID {
+        self.anchor.road
+    }
+
+    pub(super) fn surface_stalls(&self) -> Vec<Vec3> {
+        self.paths
+            .iter()
+            .map(|path| path.into.pose(MOTION_TICKS).pos)
+            .collect()
+    }
+
     fn path(&self, slot: u8) -> StallPath {
         self.paths[usize::from(slot)]
     }
@@ -222,7 +269,10 @@ impl ParkingLayout {
     }
 
     pub(crate) fn bounds(&self) -> AABB {
-        self.bounds
+        self.surface.as_ref().map_or(self.bounds, |surface| AABB {
+            ll: self.bounds.ll.min(surface.gate_bounds.ll),
+            ur: self.bounds.ur.max(surface.gate_bounds.ur),
+        })
     }
 
     pub(crate) fn pavement(&self) -> Vec<[Vec3; 2]> {
@@ -578,6 +628,23 @@ impl Site {
         })
     }
 
+    fn slot_available(&self, slot: u8) -> bool {
+        if self.closing
+            || self.occupied.len() + self.held.len() >= usize::from(self.layout.capacity)
+        {
+            return false;
+        }
+        if self.layout.kind.stores_inside() {
+            return slot == 0;
+        }
+        usize::from(slot) < self.layout.paths.len()
+            && !self
+                .occupied
+                .values()
+                .chain(self.held.values())
+                .any(|&taken| slot == taken)
+    }
+
     fn sweep_clear(&self, sweep: &Sweep, except: VehicleID) -> bool {
         self.layout.kind.stores_inside()
             || self.occupied.iter().all(|(&car, &slot)| {
@@ -799,7 +866,7 @@ impl BuildingParking {
         for road in layout.protected_roads() {
             self.surface_roads.entry(road).or_default().insert(id);
         }
-        for cell in parking_bounds_cells(&layout.bounds) {
+        for cell in parking_bounds_cells(&layout.bounds()) {
             self.swept_bounds.entry(cell).or_default().insert(id);
         }
         if layout.kind.is_public() {
@@ -838,7 +905,7 @@ impl BuildingParking {
                     }
                 }
             }
-            for cell in parking_bounds_cells(&site.layout.bounds) {
+            for cell in parking_bounds_cells(&site.layout.bounds()) {
                 let occupants = self.swept_bounds.get_mut(&cell).unwrap();
                 occupants.remove(&id);
                 if occupants.is_empty() {
@@ -892,14 +959,18 @@ impl BuildingParking {
         true
     }
 
-    pub(crate) fn summary(&self, id: BuildingID, world: &World) -> Option<BuildingParkingSummary> {
-        let site = self.sites.get(&id)?;
-        let layout = &site.layout;
-        let daily_upkeep = match layout.kind {
+    pub(crate) fn daily_upkeep(&self, id: BuildingID) -> Option<Money> {
+        Some(match self.sites.get(&id)?.layout.kind {
             BuildingParkingKind::PublicGarage(kind) => kind.daily_upkeep(),
             BuildingParkingKind::SurfaceLot(draft) => draft.daily_upkeep(),
             _ => Money::ZERO,
-        };
+        })
+    }
+
+    pub(crate) fn summary(&self, id: BuildingID, world: &World) -> Option<BuildingParkingSummary> {
+        let site = self.sites.get(&id)?;
+        let layout = &site.layout;
+        let daily_upkeep = self.daily_upkeep(id)?;
         Some(BuildingParkingSummary {
             kind: layout.kind,
             capacity: layout.capacity,
@@ -999,25 +1070,59 @@ impl BuildingParking {
         garages.into_iter().take(4).map(|(_, id)| id).collect()
     }
 
+    pub(crate) fn surface_free_slots(&self, id: BuildingID) -> Option<Vec<u8>> {
+        let site = self.sites.get(&id)?;
+        site.layout.surface.as_ref()?;
+        if site.closing {
+            return Some(Vec::new());
+        }
+        let mut taken = [false; 192];
+        for &slot in site.held.values().chain(site.occupied.values()) {
+            taken[usize::from(slot)] = true;
+        }
+        Some(
+            taken
+                .into_iter()
+                .take(usize::from(site.layout.capacity))
+                .enumerate()
+                .filter_map(|(slot, taken)| (!taken).then_some(slot as u8))
+                .collect(),
+        )
+    }
+
     pub(crate) fn arrival_target(
         &self,
         id: BuildingID,
         car: VehicleID,
-    ) -> Option<(DirectedEndpoint, Vec3)> {
+        slot: Option<u8>,
+    ) -> Option<(u8, DirectedEndpoint, Vec3)> {
         let site = self.sites.get(&id)?;
-        let slot = site.free_slot()?;
+        let slot = match slot {
+            Some(slot) if site.slot_available(slot) => slot,
+            Some(_) => return None,
+            None => site.free_slot()?,
+        };
         let path = site.layout.path(slot);
-        site.sweep_clear(&path.into, car)
-            .then_some((site.layout.access(slot).0, site.layout.door))
+        site.sweep_clear(&path.into, car).then_some((
+            slot,
+            site.layout.access(slot).0,
+            site.layout.door,
+        ))
     }
 
-    pub(crate) fn hold(&mut self, site: BuildingID, driver: HumanID, car: VehicleID) -> bool {
+    pub(crate) fn hold(
+        &mut self,
+        site: BuildingID,
+        slot: u8,
+        driver: HumanID,
+        car: VehicleID,
+    ) -> bool {
         let Some(target) = self.sites.get_mut(&site) else {
             return false;
         };
-        let Some(slot) = target.free_slot() else {
+        if !target.slot_available(slot) {
             return false;
-        };
+        }
         if self.arrivals.len() == MAX_LIVE_CLAIMS
             || self.parked.len() + self.arrivals.len() >= MAX_LIVE_CLAIMS
             || self.arrivals.contains_key(&car)
@@ -1356,11 +1461,22 @@ impl BuildingParking {
     }
 
     pub(crate) fn overlapping_road(&self, bounds: &AABB) -> Option<RoadID> {
+        self.overlapping_road_filtered(bounds, true)
+    }
+
+    pub(crate) fn overlapping_road_filtered(
+        &self,
+        bounds: &AABB,
+        include_surface: bool,
+    ) -> Option<RoadID> {
         let (left, bottom) = garage_cell(bounds.ll.z(0.0));
         let (right, top) = garage_cell(bounds.ur.z(0.0));
         let cells =
             (left.abs_diff(right) as usize + 1).saturating_mul(bottom.abs_diff(top) as usize + 1);
-        let overlaps = |site: &Site| site.layout.bounds.intersects(bounds);
+        let overlaps = |site: &Site| {
+            (include_surface || site.layout.surface.is_none())
+                && site.layout.bounds().intersects(bounds)
+        };
         if cells >= self.sites.len() {
             return self
                 .sites
@@ -1373,6 +1489,43 @@ impl BuildingParking {
             .filter_map(|ids| ids.iter().find(|id| overlaps(&self.sites[id])))
             .min()?;
         Some(self.sites[site].layout.anchor.road)
+    }
+
+    pub(crate) fn restore_surface_footprints(&self, map: &mut Map) -> Result<(), &'static str> {
+        let mut work = 16 * crate::map::MAX_WATER_BATCH_WORK;
+        for (&id, site) in &self.sites {
+            if let BuildingParkingKind::SurfaceLot(draft) = site.layout.kind {
+                if let Some(at) = draft.frame.curb() {
+                    let road = map
+                        .get(at.road)
+                        .ok_or("missing surface lot frontage road")?;
+                    crate::map::spend_water_work(&mut work, road.points().len())
+                        .map_err(|_| "surface parking load work limit exceeded")?;
+                }
+                let pad = lot_footprint(map, draft.frame, draft.width_blocks)
+                    .ok_or("invalid surface parking footprint")?;
+                map.install_surface_footprint(id, pad);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_surface_geometry(&self, map: &mut Map) -> Result<(), &'static str> {
+        for (&id, site) in &self.sites {
+            if matches!(site.layout.kind, BuildingParkingKind::SurfaceLot(_)) {
+                let pad = map
+                    .surface_lot_footprint(id)
+                    .expect("surface parking footprint checked during restore");
+                let geometry = site.layout.surface_geometry(pad);
+                match map.verify_surface_stalls(id, &geometry.stalls) {
+                    Some(true) => (),
+                    Some(false) => return Err("surface parking stall transform changed"),
+                    None => map.install_surface_stalls(id, &geometry.stalls),
+                }
+                map.install_surface_geometry(id, geometry);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn restore(
@@ -1403,17 +1556,24 @@ impl BuildingParking {
             }
         }
 
+        let mut surface_work = 16 * crate::map::MAX_WATER_BATCH_WORK;
         for (&id, site) in &mut self.sites {
             let layout = &mut site.layout;
             if let BuildingParkingKind::SurfaceLot(draft) = layout.kind {
                 let building = map.get(id).ok_or("missing surface parking lot")?;
-                let pad = lot_footprint(map, draft.frame, draft.width_blocks)
+                let pad = map
+                    .surface_lot_footprint(id)
                     .ok_or("invalid surface parking footprint")?;
                 if pad.shape.corners != building.obb.corners || building.door_pos != layout.door {
                     return Err("surface parking footprint or door changed".into());
                 }
-                let expected = prepare_surface_layout(map, draft, pad)
-                    .map_err(|_| "invalid surface parking access")?;
+                let expected = prepare_surface_layout(map, draft, pad, Some(id), &mut surface_work)
+                    .map_err(|error| match error {
+                        crate::world_command::Rejection::WaterWorkLimit => {
+                            "surface parking load work limit exceeded"
+                        }
+                        _ => "invalid surface parking access",
+                    })?;
                 layout.surface = expected.surface.clone();
                 if *layout != expected {
                     return Err("surface parking geometry changed".into());
@@ -1519,7 +1679,7 @@ impl BuildingParking {
             for road in layout.protected_roads() {
                 self.surface_roads.entry(road).or_default().insert(id);
             }
-            for cell in parking_bounds_cells(&layout.bounds) {
+            for cell in parking_bounds_cells(&layout.bounds()) {
                 self.swept_bounds.entry(cell).or_default().insert(id);
             }
             if layout.kind.is_public() {
@@ -1708,6 +1868,21 @@ impl Simulation {
         self.read::<crate::transportation::DrivewayTraffic>()
             .properties
             .summary(id, self.world())
+    }
+
+    pub fn building_parking_kind(&self, building: BuildingID) -> Option<BuildingParkingKind> {
+        let traffic = self.read::<crate::transportation::DrivewayTraffic>();
+        Some(traffic.properties.sites.get(&building)?.layout.kind)
+    }
+
+    /// Returns the active property hold and occupied site for this vehicle.
+    pub fn car_property_parking(&self, car: VehicleID) -> (Option<BuildingID>, Option<BuildingID>) {
+        let traffic = self.read::<crate::transportation::DrivewayTraffic>();
+        let parking = &traffic.properties;
+        (
+            parking.arrivals.get(&car).map(|hold| hold.site),
+            parking.parked_at(car),
+        )
     }
 
     pub fn car_stored_inside_garage(&self, id: VehicleID) -> bool {

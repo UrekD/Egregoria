@@ -365,7 +365,13 @@ impl SerializedMap {
         for (id, lot) in self.lots.iter() {
             lots_by_road.entry(lot.parent).or_default().insert(id);
         }
+        let surface_lot_count = self
+            .buildings
+            .values()
+            .filter(|building| matches!(building.kind, crate::map::BuildingKind::ParkingLot { .. }))
+            .count();
         let mut m = Map {
+            surface_lot_count,
             roads: self.roads,
             lanes: self.lanes,
             intersections: self.intersections,

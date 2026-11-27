@@ -42,6 +42,7 @@ const PROPERTY_SEARCH_DEADLINE: u64 = 64;
 enum ParkingCandidate {
     Facility(BuildingID),
     Bay(ParkingSpotID),
+    SurfaceStall(BuildingID, u8),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2145,23 +2146,35 @@ impl Router {
             return fallback();
         }
 
-        let garage = |site, properties: &mut BuildingParking, budget: &mut PropertyBudget| {
+        let garage = |site,
+                      resume_slot: Option<u8>,
+                      properties: &mut BuildingParking,
+                      budget: &mut PropertyBudget| {
             if Some(site) == source
                 || matches!(self.last_error, Some(RouterError::PropertyParkingUnavailable(id)) if id == site)
             {
                 return None;
             }
-            let candidate = ParkingCandidate::Facility(site);
-            budget.check(candidate)?;
-            let (target, gate) = properties.arrival_target(site, car)?;
-            let (drive, egress) =
-                budget.candidate_route(map, origin, target, candidate, gate, destination)?;
-            let egress = egress.into_itinerary(map)?;
-            properties.hold(site, driver, car).then_some((
-                drive,
-                RoutingStep::ParkProperty(car, site, Tick(0)),
-                RoutingStep::WalkProperty(destination, Box::new(egress)),
-            ))
+            let free = properties.surface_free_slots(site);
+            let mut select = |candidate, stall| {
+                budget.check(candidate)?;
+                let (slot, target, gate) = properties.arrival_target(site, car, stall)?;
+                let (drive, egress) =
+                    budget.candidate_route(map, origin, target, candidate, gate, destination)?;
+                let egress = egress.into_itinerary(map)?;
+                properties.hold(site, slot, driver, car).then_some((
+                    drive,
+                    RoutingStep::ParkProperty(car, site, Tick(0)),
+                    RoutingStep::WalkProperty(destination, Box::new(egress)),
+                ))
+            };
+            if let Some(free) = free {
+                free.into_iter()
+                    .filter(|&slot| slot >= resume_slot.unwrap_or(0))
+                    .find_map(|slot| select(ParkingCandidate::SurfaceStall(site, slot), Some(slot)))
+            } else {
+                select(ParkingCandidate::Facility(site), None)
+            }
         };
         let bay = |spot, parking: &mut ParkingManagement, budget: &mut PropertyBudget| {
             let candidate = ParkingCandidate::Bay(spot);
@@ -2189,7 +2202,12 @@ impl Router {
             Some(ParkingCandidate::Facility(site))
                 if Some(site) == building || properties.is_public_parking(site) =>
             {
-                garage(site, properties, budget)
+                garage(site, None, properties, budget)
+            }
+            Some(ParkingCandidate::SurfaceStall(site, slot))
+                if properties.is_public_parking(site) =>
+            {
+                garage(site, Some(slot), properties, budget)
             }
             Some(ParkingCandidate::Bay(spot)) if allow_shared => bay(spot, parking, budget),
             _ => None,
@@ -2209,7 +2227,7 @@ impl Router {
                     };
                     selected = building
                         .filter(|_| !retry)
-                        .and_then(|site| garage(site, properties, budget));
+                        .and_then(|site| garage(site, None, properties, budget));
                 }
                 ParkingSource::DiscoverCurb => {
                     // The bounded curb scan uses up to 192 projection and 48
@@ -2235,8 +2253,11 @@ impl Router {
                         Some(ParkingCandidate::Bay(spot)) => selected = bay(spot, parking, budget),
                         Some(ParkingCandidate::Facility(site)) => {
                             if properties.is_public_parking(site) {
-                                selected = garage(site, properties, budget);
+                                selected = garage(site, None, properties, budget);
                             }
+                        }
+                        Some(ParkingCandidate::SurfaceStall(..)) => {
+                            unreachable!("only facilities are queued")
                         }
                         None => {
                             budget.selection.source =

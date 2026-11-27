@@ -67,6 +67,51 @@ fn frame_traffic_edits<'a>(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LotPlacementReceipt {
+    pub frame: u64,
+    pub sender: u32,
+    pub command_index: usize,
+    pub local: bool,
+    pub quote: u64,
+    pub result: Result<simulation::map::ParkingLotID, simulation::world_command::Rejection>,
+}
+
+#[cfg(any(feature = "multiplayer", test))]
+fn frame_lot_placements<'a>(
+    frame: u64,
+    outcomes: &'a CommandOutcomes,
+    inputs: impl IntoIterator<Item = (u32, bool, &'a WorldCommands)> + 'a,
+) -> impl Iterator<Item = LotPlacementReceipt> + 'a {
+    inputs
+        .into_iter()
+        .flat_map(|(sender, local, commands)| {
+            commands
+                .iter()
+                .enumerate()
+                .map(move |(index, command)| (sender, local, index, command))
+        })
+        .enumerate()
+        .filter_map(
+            move |(flattened, (sender, local, command_index, command))| {
+                let WorldCommand::MapPlaceParkingLot { quote, .. } = command else {
+                    return None;
+                };
+                let result = outcomes
+                    .parking_lot(flattened)
+                    .or_else(|| outcomes.batch_rejection().map(Err))?;
+                Some(LotPlacementReceipt {
+                    frame,
+                    sender,
+                    command_index,
+                    local,
+                    quote: *quote,
+                    result,
+                })
+            },
+        )
+}
+
 pub fn is_singleplayer(uiw: &UiWorld) -> bool {
     matches!(*uiw.read::<NetworkState>(), NetworkState::Singleplayer(_))
 }
@@ -159,6 +204,7 @@ mod inner {
             let mut merged = WorldCommands::default();
             let mut purchases = Vec::new();
             let mut traffic_edits = Vec::new();
+            let mut lot_placements = Vec::new();
             let generation = state.uiw.read::<crate::session::SessionState>().generation;
             for frame_commands in inputs {
                 assert_eq!(frame_commands.frame.0, sim.get_tick() + 1);
@@ -190,6 +236,13 @@ mod inner {
                     &outcomes,
                     inputs.iter().map(|input| (input.sender, input.sent_by_me, &input.inp)),
                 ));
+                lot_placements.extend(super::frame_lot_placements(
+                    frame_commands.frame.0,
+                    &outcomes,
+                    inputs
+                        .iter()
+                        .map(|input| (input.sender, input.sent_by_me, &input.inp)),
+                ));
                 for (index, command) in local() {
                     if outcomes.accepted.contains(&index) {
                         merged.push(command.clone());
@@ -200,6 +253,7 @@ mod inner {
             crate::gui::traffic_repair::receive_network(&state.uiw, &traffic_edits);
             let mut received = ReceivedCommands::new(merged);
             received.traffic_edits = traffic_edits;
+            received.lot_placements = lot_placements;
             received.tile_purchases = purchases;
             *state.uiw.write::<ReceivedCommands>() = received;
         }
@@ -512,4 +566,65 @@ fn p7_receipt_keeps_local_rejection_and_remote_success_in_separate_frames() {
     assert_eq!((receipts[1].frame, receipts[1].sender, receipts[1].command_index, receipts[1].local), (3, Some(12), 0, false));
     assert!(matches!(&receipts[1].result, Ok(TrafficEditResult::Road(receipt)) if receipt.road == road && receipt.status == RoadEditStatus::Applied));
     assert!(receipts[0].sequence < receipts[1].sequence);
+}
+
+#[cfg(test)]
+#[test]
+fn pathpark_tools_lot_receipts_keep_rejected_original_input_indices() {
+    use simulation::map::building_parking::{
+        parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use simulation::map::{LanePatternBuilder, MapProject};
+
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let mut sim = simulation::Simulation::new_with_options(simulation::SimulationOptions {
+        terrain_size: 1,
+        save_replay: false,
+        ..simulation::SimulationOptions::LEGACY
+    });
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(geom::vec3(75., 100., 0.)),
+        to: MapProject::ground(geom::vec3(450., 100., 0.)),
+        inter: None,
+        pat: LanePatternBuilder::default().build(),
+    }]);
+    let at = parking_entrance_near(&sim.map(), geom::vec3(245., 115., 0.)).unwrap();
+    let draft = SurfaceLotDraft {
+        frame: LotFrame::Curb(at),
+        width_blocks: 2,
+        mouths: [
+            Some(LotMouth {
+                at,
+                mode: MouthUse::Both,
+            }),
+            None,
+        ],
+        foot_gate: None,
+    };
+    let (quote, _) = sim.quote_surface_lot(draft).unwrap();
+    let placement = WorldCommand::MapPlaceParkingLot { draft, quote };
+    let mut remote = WorldCommands::default();
+    remote.push(placement.clone());
+    let mut local = WorldCommands::default();
+    local.push(placement);
+    sim.apply_commands(remote.iter().chain(local.iter()));
+    let outcomes = sim.read::<CommandOutcomes>();
+    let receipts: Vec<_> =
+        frame_lot_placements(7, &outcomes, [(11, false, &remote), (22, true, &local)]).collect();
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts[0].result.is_ok());
+    assert_eq!(
+        (
+            receipts[1].frame,
+            receipts[1].sender,
+            receipts[1].command_index,
+            receipts[1].local
+        ),
+        (7, 22, 0, true)
+    );
+    assert_eq!(
+        receipts[1].result,
+        Err(simulation::world_command::Rejection::StaleRoadQuote)
+    );
 }

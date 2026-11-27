@@ -724,9 +724,16 @@ fn pathpark_wave3_surface_lot_quote_modes_and_reload() {
         .parking_lot(0)
         .unwrap()
         .unwrap();
+    let lot = id;
+    let id = ctx.g.map().parking_lot_building(lot).unwrap();
     let summary = ctx.g.building_parking(id).unwrap();
     assert_eq!(summary.kind, BuildingParkingKind::SurfaceLot(draft));
     assert_eq!(usize::from(summary.capacity), pad.stall_centers().count());
+    let stalls = ctx.g.map().parking_lot_stalls(lot).unwrap().to_vec();
+    assert_eq!(stalls.len(), usize::from(summary.capacity));
+    assert!(stalls
+        .iter()
+        .all(|&id| ctx.g.map().parking.get(id).is_some()));
     assert_eq!((summary.occupied, summary.held), (0, 0));
     assert_eq!(
         ctx.g.read::<crate::economy::Government>().money,
@@ -736,6 +743,11 @@ fn pathpark_wave3_surface_lot_quote_modes_and_reload() {
     let checkpoint = Bincode::encode(&ctx.g).unwrap();
     let mut restored: crate::Simulation = Bincode::decode(&checkpoint).unwrap();
     assert_eq!(ctx.g.hashes(), restored.hashes());
+    assert_eq!(restored.map().parking_lot_building(lot), Some(id));
+    assert_eq!(
+        restored.map().parking_lot_stalls(lot),
+        Some(stalls.as_slice())
+    );
     restored.apply_commands([&command]);
     assert!(restored
         .read::<CommandOutcomes>()
@@ -748,7 +760,18 @@ fn pathpark_wave3_surface_lot_quote_modes_and_reload() {
     );
     restored.apply_commands([&WorldCommand::MapRemoveBuilding(id)]);
     assert!(restored.building_parking(id).is_none());
-    assert!(restored.quote_surface_lot(draft).is_ok());
+    assert!(restored.map().parking_lot_building(lot).is_none());
+    assert!(stalls
+        .iter()
+        .all(|&id| restored.map().parking.get(id).is_none()));
+    let (quote, _) = restored.quote_surface_lot(draft).unwrap();
+    restored.apply_commands([&WorldCommand::MapPlaceParkingLot { draft, quote }]);
+    let rebuilt = restored
+        .read::<CommandOutcomes>()
+        .parking_lot(0)
+        .unwrap()
+        .unwrap();
+    assert_ne!(rebuilt, lot);
 }
 
 #[test]
@@ -793,6 +816,60 @@ fn pathpark_wave3_local_one_way_reverses_with_optional_curb_bays() {
             assert_eq!(old_bay.is_some(), curb_parking);
             (road.id, road.src, road.dst, old_bay)
         };
+        let house = ctx
+            .g
+            .write::<crate::map::Map>()
+            .build_special_building(
+                &geom::OBB::new(vec2(150., 122.), geom::Vec2::X, 8., 8.),
+                crate::map::BuildingKind::House,
+                prototypes::BuildingGen::House,
+                None,
+                Some(id),
+            )
+            .unwrap();
+        let mut pattern = {
+            let map = ctx.g.map();
+            map.get(id).unwrap().pattern(map.lanes())
+        };
+        for (kind, speed) in pattern
+            .lanes_forward
+            .iter_mut()
+            .chain(&mut pattern.lanes_backward)
+        {
+            if *kind == LaneKind::Driving {
+                *speed = 8.0;
+            }
+        }
+        let mut speed_budget = crate::world_command::PrepareBudget::for_preview(1_000_000);
+        let speed_stamp = road_edit_stamp(&ctx.g, id, &mut speed_budget).unwrap();
+        let speed_change = RoadUpgrade::Replace(pattern);
+        let speed_quote =
+            preview_road_upgrade(&ctx.g, id, speed_stamp, &speed_change, &mut speed_budget)
+                .unwrap();
+        ctx.g.apply_commands([&WorldCommand::MapUpgradeRoad {
+            road: id,
+            expected: speed_stamp,
+            change: speed_change,
+            quote: speed_quote.quote,
+        }]);
+        assert!(ctx
+            .g
+            .read::<crate::world_command::CommandOutcomes>()
+            .road_edit(0)
+            .unwrap()
+            .is_ok());
+
+        ctx.g
+            .write::<crate::map_dynamic::Transit>()
+            .lines
+            .insert_with_key(|id| crate::map_dynamic::TransitLine {
+                id,
+                stops: Vec::new(),
+                target_vehicles: 0,
+                fare: prototypes::Money::ZERO,
+                color: geom::Color::WHITE,
+                suspended: true,
+            });
         let change = RoadUpgrade::ReverseOneWay;
         let mut budget = crate::world_command::PrepareBudget::for_preview(1_000_000);
         let expected = road_edit_stamp(&ctx.g, id, &mut budget).unwrap();
@@ -831,6 +908,8 @@ fn pathpark_wave3_local_one_way_reverses_with_optional_curb_bays() {
             .find_map(|(id, k)| (k == LaneKind::Driving).then(|| map.get(id).unwrap()))
             .unwrap();
         assert_eq!((lane.src, lane.dst), (dst, src));
+        assert_eq!(lane.speed_limit, 8.0);
+        assert!(road.connected_buildings.contains(&house));
         if let Some(old_bay) = old_bay {
             assert!(map.parking.get(old_bay).is_none());
             let parking_lane = road
@@ -886,6 +965,7 @@ fn pathpark_wave3_surface_lot_parks_a_visible_car_and_releases_it_after_reload()
         .parking_lot(0)
         .unwrap()
         .unwrap();
+    let id = ctx.g.map().parking_lot_building(id).unwrap();
     ctx.g.world.edit_human(human, |actor| {
         actor
             .router
@@ -939,4 +1019,335 @@ fn pathpark_wave3_surface_lot_parks_a_visible_car_and_releases_it_after_reload()
     assert_eq!(ctx.g.building_parking(id).unwrap().occupied, 0);
     ctx.g.apply_commands([&WorldCommand::MapRemoveBuilding(id)]);
     assert!(ctx.g.map().get(id).is_none());
+}
+
+#[test]
+fn pathpark_wave3_rejects_building_across_path_end_gate_and_reloads() {
+    use crate::map::building_parking::{
+        lot_footprint, parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use crate::map::{BuildingKind, PathEndpoint};
+    use crate::world_command::{CommandOutcomes, Rejection, WorldCommand};
+    use common::saveload::{Bincode, Encoder};
+    use geom::{Vec2, OBB};
+    use prototypes::{BuildingGen, GoodsCompanyID};
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
+    let (mouth, pad, from, to) = {
+        let map = ctx.g.map();
+        let mouth = parking_entrance_near(&map, vec3(245., 115., 0.)).unwrap();
+        let pad = lot_footprint(&map, LotFrame::Curb(mouth), 2).unwrap();
+        let y = ((pad.front.xy() + pad.outward * 21.5).y * 100.0).round() as i32;
+        (
+            mouth,
+            pad,
+            map.pick_path_ground(20_500, y).unwrap(),
+            map.pick_path_ground(24_500, y).unwrap(),
+        )
+    };
+    ctx.g.apply_commands([&WorldCommand::MapMakeWalkingPath {
+        from,
+        to,
+        control: None,
+    }]);
+    let road = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    let foot_gate = {
+        let map = ctx.g.map();
+        let joint = map.get(road).unwrap().dst;
+        let point = map.get(joint).unwrap().pos;
+        let gate = map.pick_path_attachment(crate::map::ProjectKind::Intersection(joint), point);
+        assert!(matches!(gate, Some(PathEndpoint::PathEnd { .. })));
+        gate
+    };
+    let draft = SurfaceLotDraft {
+        frame: LotFrame::Curb(mouth),
+        width_blocks: 2,
+        mouths: [
+            Some(LotMouth {
+                at: mouth,
+                mode: MouthUse::Both,
+            }),
+            None,
+        ],
+        foot_gate,
+    };
+    let (quote, _) = ctx.g.quote_surface_lot(draft).unwrap();
+    ctx.g
+        .apply_commands([&WorldCommand::MapPlaceParkingLot { draft, quote }]);
+    let id = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .parking_lot(0)
+        .unwrap()
+        .unwrap();
+    let id = ctx.g.map().parking_lot_building(id).unwrap();
+    let building = WorldCommand::MapBuildSpecialBuilding {
+        pos: OBB::new(pad.front.xy() + pad.outward * 19.1, Vec2::X, 2.0, 1.4),
+        kind: BuildingKind::GoodsCompany(GoodsCompanyID::new("woodmill")),
+        gen: BuildingGen::CenteredDoor {
+            vertical_factor: 1.0,
+        },
+        zone: None,
+        connected_road: Some(mouth.road),
+    };
+    let before = ctx.g.hashes();
+    let bytes = Bincode::encode(&ctx.g).unwrap();
+    assert!(Bincode::decode::<crate::Simulation>(&bytes).is_ok());
+    ctx.g.apply_commands([&building]);
+    assert!(matches!(
+        ctx.g.read::<CommandOutcomes>().last.as_slice(),
+        [(_, Rejection::BusyConflict)]
+    ));
+    assert_eq!(ctx.g.hashes(), before);
+    let restored: crate::Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    assert!(restored.building_parking(id).is_some());
+}
+
+#[test]
+fn pathpark_wave3_surface_lots_share_a_boundary() {
+    use crate::map::building_parking::{
+        parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
+    for x in [245., 261.] {
+        let at = parking_entrance_near(&ctx.g.map(), vec3(x, 115., 0.)).unwrap();
+        let draft = SurfaceLotDraft {
+            frame: LotFrame::Curb(at),
+            width_blocks: 2,
+            mouths: [
+                Some(LotMouth {
+                    at,
+                    mode: MouthUse::Both,
+                }),
+                None,
+            ],
+            foot_gate: None,
+        };
+        let (quote, _) = ctx.g.quote_surface_lot(draft).unwrap();
+        ctx.g
+            .apply_commands([&WorldCommand::MapPlaceParkingLot { draft, quote }]);
+        assert!(ctx
+            .g
+            .read::<CommandOutcomes>()
+            .parking_lot(0)
+            .unwrap()
+            .is_ok());
+    }
+}
+
+#[test]
+fn pathpark_wave3_ground_lot_apron_cannot_cross_a_footpath() {
+    use crate::map::building_parking::{
+        parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 116., 0.), vec3(450., 116., 0.)]);
+    let (gate_from, gate_to) = {
+        let map = ctx.g.map();
+        (
+            map.pick_path_ground(20_500, 14_850).unwrap(),
+            map.pick_path_ground(24_800, 14_850).unwrap(),
+        )
+    };
+    ctx.g.apply_commands([&WorldCommand::MapMakeWalkingPath {
+        from: gate_from,
+        to: gate_to,
+        control: None,
+    }]);
+    let gate_road = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    let (draft, from, to) = {
+        let map = ctx.g.map();
+        let at = parking_entrance_near(&map, vec3(248., 127., 0.)).unwrap();
+        let road = map.get(gate_road).unwrap();
+        let joint = map.get(road.dst).unwrap();
+        let draft = SurfaceLotDraft {
+            frame: LotFrame::Ground {
+                front_block: [31, 16],
+                facing: 0,
+            },
+            width_blocks: 2,
+            mouths: [
+                Some(LotMouth {
+                    at,
+                    mode: MouthUse::Both,
+                }),
+                None,
+            ],
+            foot_gate: map
+                .pick_path_attachment(crate::map::ProjectKind::Intersection(joint.id), joint.pos),
+        };
+        assert!(draft.foot_gate.is_some());
+        (
+            draft,
+            map.pick_path_ground(22_500, 12_500).unwrap(),
+            map.pick_path_ground(27_500, 12_500).unwrap(),
+        )
+    };
+    assert!(
+        ctx.g.quote_surface_lot(draft).is_ok(),
+        "the approach is clear"
+    );
+    ctx.g.apply_commands([&WorldCommand::MapMakeWalkingPath {
+        from,
+        to,
+        control: None,
+    }]);
+    assert!(ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .is_ok());
+    assert!(
+        ctx.g.quote_surface_lot(draft).is_err(),
+        "vehicle apron crosses a footpath"
+    );
+}
+
+#[test]
+fn pathpark_wave3_grid_uses_two_rows_and_distinct_road_edges() {
+    use crate::map::building_parking::{
+        lot_footprint, parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
+    ctx.g.apply_commands([&WorldCommand::MapMakeConnection {
+        from: crate::map::MapProject::ground(vec3(75., 137., 0.)),
+        to: crate::map::MapProject::ground(vec3(450., 137., 0.)),
+        inter: None,
+        pat: crate::map::LanePatternBuilder::default().build(),
+    }]);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+    let draft = {
+        let map = ctx.g.map();
+        let front = parking_entrance_near(&map, vec3(245., 109., 0.)).unwrap();
+        let rear = parking_entrance_near(&map, vec3(245., 129., 0.)).unwrap();
+        assert_ne!(front.road, rear.road);
+        let frame = LotFrame::CurbGrid {
+            at: front,
+            depth_blocks: 2,
+        };
+        let pad = lot_footprint(&map, frame, 3).unwrap();
+        assert_eq!(pad.blocks().count(), 6);
+        assert_eq!(pad.stall_centers().count(), 14);
+        SurfaceLotDraft {
+            frame,
+            width_blocks: 3,
+            mouths: [
+                Some(LotMouth {
+                    at: front,
+                    mode: MouthUse::In,
+                }),
+                Some(LotMouth {
+                    at: rear,
+                    mode: MouthUse::Out,
+                }),
+            ],
+            foot_gate: None,
+        }
+    };
+    let (quote, _) = ctx.g.quote_surface_lot(draft).unwrap();
+    ctx.g
+        .apply_commands([&WorldCommand::MapPlaceParkingLot { draft, quote }]);
+    let lot = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .parking_lot(0)
+        .unwrap()
+        .unwrap();
+    let id = ctx.g.map().parking_lot_building(lot).unwrap();
+    let summary = ctx.g.building_parking(id).unwrap();
+    assert!(summary.capacity > 7, "both rows should have fitted spaces");
+}
+
+#[test]
+fn pathpark_wave3_accepts_parent_snapshot_and_uses_new_protocol() {
+    use common::saveload::{Bincode, Encoder, COMMAND_PROTOCOL_REVISION};
+
+    let original = TestCtx::new().g;
+    let current = Bincode::encode(&original).unwrap();
+    let mut saved: crate::SimulationDeser = Bincode::decode(&current).unwrap();
+    assert!(saved._header.version.ends_with("+pathpark.3"));
+    saved._header.version = crate::PROPERTY_PARKING_VERSION.to_owned();
+    saved.res.remove("surface_lots");
+    let restored = saved.into_sim().unwrap();
+    assert_eq!(restored.hashes(), original.hashes());
+    assert_eq!(COMMAND_PROTOCOL_REVISION, "commands.5");
+}
+
+#[test]
+fn pathpark_wave3_painted_lot_keeps_a_recess_buildable() {
+    use crate::map::building_parking::{
+        lot_footprint, parking_entrance_near, LotFrame, LotMouth, MouthUse, SurfaceLotDraft,
+    };
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+    use common::saveload::{Bincode, Encoder};
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
+    let at = parking_entrance_near(&ctx.g.map(), vec3(245., 115., 0.)).unwrap();
+    let rows = [0b1111, 0b1111, 0b0001, 0b0001, 0, 0, 0, 0];
+    let frame = LotFrame::Curb(at).paint(rows);
+    let pad = lot_footprint(&ctx.g.map(), frame, 4).unwrap();
+    assert_eq!(pad.blocks().count(), 10);
+    assert!(lot_footprint(
+        &ctx.g.map(),
+        LotFrame::Curb(at).paint([3, 3, 8, 0, 0, 0, 0, 0]),
+        4
+    )
+    .is_none());
+    let draft = SurfaceLotDraft {
+        frame,
+        width_blocks: 4,
+        mouths: [
+            Some(LotMouth {
+                at,
+                mode: MouthUse::Both,
+            }),
+            None,
+        ],
+        foot_gate: None,
+    };
+    let (quote, _) = ctx.g.quote_surface_lot(draft).unwrap();
+    ctx.g
+        .apply_commands([&WorldCommand::MapPlaceParkingLot { draft, quote }]);
+    let lot = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .parking_lot(0)
+        .unwrap()
+        .unwrap();
+    let pos = pad.front.xy() + pad.along * 12.0 + pad.outward * 27.0;
+    let build = WorldCommand::MapBuildSpecialBuilding {
+        pos: geom::OBB::new(pos, geom::Vec2::X, 2.0, 2.0),
+        kind: crate::map::BuildingKind::GoodsCompany(prototypes::GoodsCompanyID::new("woodmill")),
+        gen: prototypes::BuildingGen::CenteredDoor {
+            vertical_factor: 1.0,
+        },
+        zone: None,
+        connected_road: Some(at.road),
+    };
+    ctx.g.apply_commands([&build]);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+    let resumed: crate::Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    assert_eq!(resumed.hashes(), ctx.g.hashes());
+    assert!(resumed.map().parking_lot_building(lot).is_some());
 }

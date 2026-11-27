@@ -20,9 +20,12 @@ pub(crate) struct SurfaceLotTool {
     draft: Option<SurfaceLotDraft>,
     use_ground_grid: bool,
     facing: u8,
+    grid_depth: Option<u8>,
     mouth_mode: MouthUse,
     picking_gate: bool,
+    painting: bool,
     pending: Option<PendingLot>,
+    quoted_cost: Option<prototypes::Money>,
 }
 
 impl Default for SurfaceLotTool {
@@ -32,9 +35,12 @@ impl Default for SurfaceLotTool {
             draft: None,
             use_ground_grid: false,
             facing: 0,
+            grid_depth: None,
             mouth_mode: MouthUse::Both,
             picking_gate: false,
+            painting: false,
             pending: None,
+            quoted_cost: None,
         }
     }
 }
@@ -50,7 +56,9 @@ impl SurfaceLotTool {
         let had_frame = self.frame.take().is_some();
         self.draft = None;
         self.pending = None;
+        self.quoted_cost = None;
         self.picking_gate = false;
+        self.painting = false;
         had_frame
     }
 }
@@ -67,6 +75,10 @@ pub(crate) fn properties(uiw: &UiWorld) {
             match state.draft {
                 Some(draft) => {
                     minrow(8.0, || {
+                        if selectable_label_primary(state.painting, "Paint blocks").clicked {
+                            state.painting = !state.painting;
+                            state.picking_gate = false;
+                        }
                         textc(color, "Vehicle entrance");
                         for mode in [MouthUse::In, MouthUse::Out, MouthUse::Both] {
                             if selectable_label_primary(
@@ -76,11 +88,13 @@ pub(crate) fn properties(uiw: &UiWorld) {
                             .clicked
                             {
                                 state.mouth_mode = mode;
+                                state.painting = false;
                                 state.picking_gate = false;
                             }
                         }
                         if selectable_label_primary(state.picking_gate, "Pedestrian gate").clicked {
                             state.picking_gate = !state.picking_gate;
+                            state.painting = false;
                         }
                         if draft.foot_gate.is_some()
                             && selectable_label_primary(false, "Use entrance sidewalk").clicked
@@ -89,17 +103,22 @@ pub(crate) fn properties(uiw: &UiWorld) {
                             state.picking_gate = false;
                         }
                     });
-                    let help = if state.picking_gate {
+                    let help = if state.painting {
+                        "Click a block to add or remove it. Keep the lot connected."
+                    } else if state.picking_gate {
                         "Choose a sidewalk or footpath beside the lot"
                     } else {
                         "Choose up to two curb entrances, then click inside the lot to build"
                     };
                     textc(color, help);
+                    if let Some(cost) = state.quoted_cost {
+                        textc(color, format!("Construction {cost}"));
+                    }
                     textc(
                         color,
                         format!(
                             "{} blocks · {} vehicle entrances · {} daily upkeep",
-                            draft.width_blocks * 2,
+                            draft.block_count(),
                             draft.mouths.iter().flatten().count(),
                             draft.daily_upkeep()
                         ),
@@ -116,6 +135,18 @@ pub(crate) fn properties(uiw: &UiWorld) {
                             && selectable_label_primary(false, "Rotate").clicked
                         {
                             state.facing = (state.facing + 1) % 4;
+                        }
+                        for depth in [2, 4, 6, 8] {
+                            let label = format!("{depth} blocks deep");
+                            if selectable_label_primary(state.grid_depth == Some(depth), &label)
+                                .clicked
+                            {
+                                state.grid_depth = if state.grid_depth == Some(depth) {
+                                    None
+                                } else {
+                                    Some(depth)
+                                };
+                            }
                         }
                         textc(
                             color,
@@ -140,15 +171,29 @@ fn has_pointer_over_ui(input: &InputMap) -> bool {
 fn frame_at(state: &SurfaceLotTool, map: &Map, pointer: Vec3) -> Option<LotFrame> {
     if state.use_ground_grid {
         let block = pointer.xy() / BLOCK_SIZE;
-        return Some(LotFrame::Ground {
-            front_block: [block.x.round() as i32, block.y.round() as i32],
-            facing: state.facing,
+        let front_block = [block.x.round() as i32, block.y.round() as i32];
+        return Some(match state.grid_depth {
+            None => LotFrame::Ground {
+                front_block,
+                facing: state.facing,
+            },
+            Some(depth_blocks) => LotFrame::GroundGrid {
+                front_block,
+                facing: state.facing,
+                depth_blocks,
+            },
         });
     }
     let anchor = parking_entrance_near(map, pointer)?;
     let (edge, _) = curb_edge(map, anchor)?;
     ((edge.z - pointer.z).abs() < 0.8 && edge.xy().distance2(pointer.xy()) < 6.0_f32.powi(2))
-        .then_some(LotFrame::Curb(anchor))
+        .then_some(match state.grid_depth {
+            None => LotFrame::Curb(anchor),
+            Some(depth_blocks) => LotFrame::CurbGrid {
+                at: anchor,
+                depth_blocks,
+            },
+        })
 }
 
 fn width_at(pad: LotFootprint, pointer: Vec3) -> u8 {
@@ -178,13 +223,13 @@ fn outline(draw: &mut ImmediateDraw, pad: LotFootprint, color: LinearColor) {
 
 fn mouth_marker(
     draw: &mut ImmediateDraw,
-    pad: LotFootprint,
+    inward: geom::Vec2,
     at: Vec3,
     mode: MouthUse,
     color: LinearColor,
 ) {
     let edge = at.up(0.18);
-    let inward = pad.outward.z0();
+    let inward = inward.z0();
     draw.stroke_circle(edge, 1.15, 0.36).color(color);
     for sign in [-1.0, 1.0] {
         if (sign > 0.0 && mode == MouthUse::Out) || (sign < 0.0 && mode == MouthUse::In) {
@@ -195,7 +240,7 @@ fn mouth_marker(
         for side in [-1.0, 1.0] {
             draw.line(
                 tip,
-                tip - inward * sign + pad.along.z0() * side * 0.65,
+                tip - inward * sign + inward.xy().perpendicular().z0() * side * 0.65,
                 0.36,
             )
             .color(color);
@@ -215,7 +260,18 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
     if let Some(pending) = &mut state.pending {
         let matches = |command: &WorldCommand| matches!(command, WorldCommand::MapPlaceParkingLot { quote, .. } if *quote == pending.quote);
         let received = uiw.received_commands();
-        if let Some(outcome) = received.placement(pending.index, matches) {
+        let network_outcome = received
+            .lot_placements
+            .iter()
+            .find(|receipt| {
+                receipt.local
+                    && receipt.command_index == pending.index
+                    && receipt.quote == pending.quote
+            })
+            .map(|receipt| receipt.result.map(|_| ()).map_err(Some));
+        if let Some(outcome) =
+            network_outcome.or_else(|| received.placement(pending.index, matches))
+        {
             state.pending = None;
             match outcome {
                 Ok(()) => {
@@ -230,10 +286,6 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
                 Err(None) => {}
             }
         } else {
-            if received.iter().any(matches) {
-                state.cancel();
-                return;
-            }
             pending.frames += 1;
             if pending.frames < 240 {
                 return;
@@ -287,7 +339,30 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
     };
     let mut confirm = false;
     if let Some(pointer) = pointer {
-        if state.picking_gate {
+        if state.painting {
+            if click {
+                if let Some([x, y]) = pad.block_at(pointer) {
+                    let mut rows = draft.frame.painted_rows().unwrap_or_else(|| {
+                        let columns = ((1_u16 << draft.width_blocks) - 1) as u8;
+                        std::array::from_fn(|row| {
+                            if row < usize::from(draft.frame.depth_blocks()) {
+                                columns
+                            } else {
+                                0
+                            }
+                        })
+                    });
+                    rows[y] ^= 1 << x;
+                    let frame = draft.frame.paint(rows);
+                    if lot_footprint(&map, frame, draft.width_blocks).is_some() {
+                        draft.frame = frame;
+                    } else {
+                        *uiw.write::<ErrorTooltip>() =
+                            ErrorTooltip::new("Parking blocks need one connected footprint");
+                    }
+                }
+            }
+        } else if state.picking_gate {
             let hit = input
                 .ray
                 .and_then(|ray| {
@@ -327,7 +402,9 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
                 .and_then(|anchor| lot_mouth_position(&map, pad, anchor).map(|at| (anchor, at)))
                 .filter(|(_, at)| at.xy().distance2(pointer.xy()) < 4.0_f32.powi(2));
             if let Some((anchor, at)) = hovered {
-                mouth_marker(&mut draw, pad, at, state.mouth_mode, blue);
+                if let Some((_, inward)) = curb_edge(&map, anchor) {
+                    mouth_marker(&mut draw, inward, at, state.mouth_mode, blue);
+                }
                 if click {
                     if let Some(i) = selected {
                         let old = draft.mouths[i].unwrap();
@@ -351,7 +428,7 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
                     }
                 }
             } else {
-                confirm = click && pad.shape.contains(pointer.xy());
+                confirm = click && pad.contains(pointer);
             }
         }
     }
@@ -373,8 +450,8 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
         }
     }
     for mouth in draft.mouths.iter().flatten() {
-        if let Some(at) = lot_mouth_position(&map, pad, mouth.at) {
-            mouth_marker(&mut draw, pad, at, mouth.mode, success);
+        if let Some((at, inward)) = curb_edge(&map, mouth.at) {
+            mouth_marker(&mut draw, inward, at, mouth.mode, success);
         }
     }
     let gate = draft.foot_gate.or_else(|| {
@@ -391,6 +468,7 @@ pub(crate) fn update(sim: &Simulation, uiw: &UiWorld) {
     drop(map);
 
     let preview = sim.quote_surface_lot(draft);
+    state.quoted_cost = preview.as_ref().ok().map(|&(_, cost)| cost);
     let color = if preview.is_ok() {
         success
     } else if draft.mouths.iter().all(Option::is_none) {

@@ -491,15 +491,19 @@ impl ReplayJson {
                 JSON::decode(bytes)
             }
             Err(SaveLoadError::IncompatibleReplay { version })
-                if version == "0.12.0+commands.3" =>
+                if matches!(version.as_str(), "0.12.0+commands.3" | "0.12.0+commands.4") =>
             {
-                // Pre-property recordings have a different growth and routing model.
+                // This recording used earlier parking and command semantics.
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
                 let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
                 if discarded || legacy.registry.is_some() {
                     crate::check_snapshot_registry(
                         legacy.registry,
-                        crate::PRE_PROPERTY_PARKING_VERSION,
+                        if version.ends_with("+commands.4") {
+                            crate::PROPERTY_PARKING_VERSION
+                        } else {
+                            crate::PRE_PROPERTY_PARKING_VERSION
+                        },
                     )
                     .map_err(replay_decode_error)?;
                 }

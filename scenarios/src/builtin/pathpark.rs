@@ -1,6 +1,9 @@
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2};
-use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKind, GarageKind};
+use simulation::map::building_parking::{
+    parking_entrance_near, BuildingParkingKind, GarageKind, LotFrame, LotMouth, MouthUse,
+    SurfaceLotDraft,
+};
 use simulation::map::{
     BuildingID, Density, LaneKind, LanePatternBuilder, MapProject, ProjectFilter, ZoneCell, ZoneKind,
 };
@@ -36,6 +39,230 @@ pub const SCALE: (Scenario, SimulationOptions) = (
         ..super::perf::OPTIONS
     },
 );
+
+pub const BASIC: (Scenario, SimulationOptions) = (
+    Scenario {
+        name: "pathpark_basic",
+        run: run_basic,
+    },
+    OPTIONS,
+);
+pub const PRESSURE: (Scenario, SimulationOptions) = (
+    Scenario {
+        name: "pathpark_pressure",
+        run: run_pressure,
+    },
+    OPTIONS,
+);
+pub const EDITS: (Scenario, SimulationOptions) = (
+    Scenario {
+        name: "pathpark_edits",
+        run: run_edits,
+    },
+    OPTIONS,
+);
+
+fn run_basic(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    let (from, to) = {
+        let map = ctx.sim.map();
+        (
+            map.pick_path_ground(20_000, 18_000)
+                .ok_or("invalid path start")?,
+            map.pick_path_ground(29_000, 18_000)
+                .ok_or("invalid path end")?,
+        )
+    };
+    ctx.submit(&[WorldCommand::MapMakeWalkingPath {
+        from,
+        to,
+        control: None,
+    }]);
+    ctx.run_ticks(1);
+    let road = ctx
+        .sim
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .ok_or("missing walking path receipt")?
+        .map_err(|reason| format!("{reason:?}"))?;
+    ctx.sample("shortcut");
+    let restored = ctx.round_tripped()?;
+    if ctx.sim.hashes() != restored.hashes()
+        || restored.map().get(road).is_none_or(|road| {
+            !road.is_walking_path() || road.lanes_iter().any(|(_, kind)| kind != LaneKind::Walking)
+        })
+    {
+        return Err("walking shortcut diverged or has a vehicle lane".into());
+    }
+    Ok(())
+}
+
+fn place_surface_lot(
+    sim: &mut Simulation,
+    offset: Vec2,
+) -> Result<(BuildingID, WorldCommand), String> {
+    for (x, y) in [(150., 115.), (180., 115.), (190., 264.), (160., 264.)] {
+        let draft = {
+            let map = sim.map();
+            let at = |x| parking_entrance_near(&map, (offset + vec2(x, y)).z(0.0));
+            let Some((center, inward, outward)) = at(x)
+                .zip(at(x + 7.0))
+                .zip(at(x - 7.0))
+                .map(|((center, a), b)| (center, a, b))
+            else {
+                continue;
+            };
+            SurfaceLotDraft {
+                frame: LotFrame::Curb(center),
+                width_blocks: 3,
+                mouths: [
+                    Some(LotMouth {
+                        at: inward,
+                        mode: MouthUse::In,
+                    }),
+                    Some(LotMouth {
+                        at: outward,
+                        mode: MouthUse::Out,
+                    }),
+                ],
+                foot_gate: Some(simulation::map::PathEndpoint::Sidewalk(center)),
+            }
+        };
+        let Ok((quote, _)) = sim.quote_surface_lot(draft) else {
+            continue;
+        };
+        let command = WorldCommand::MapPlaceParkingLot { draft, quote };
+        sim.apply_commands([&command]);
+        let id = sim
+            .read::<CommandOutcomes>()
+            .parking_lot(0)
+            .ok_or("missing public lot receipt")?
+            .map_err(|reason| format!("surface lot placement: {reason:?}"))?;
+        let building = sim
+            .map()
+            .parking_lot_building(id)
+            .ok_or("missing public lot building")?;
+        return Ok((building, command));
+    }
+    Err(format!("no legal public lot near {offset:?}"))
+}
+
+fn run_pressure(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    run_surface_trip(ctx, false)
+}
+
+fn run_edits(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    run_surface_trip(ctx, true)
+}
+
+fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
+    let sites = setup(&mut ctx.sim, true)?;
+    ctx.sim
+        .apply_commands([&WorldCommand::MapRemoveBuilding(sites[4])]);
+    let (lot, placement) = place_surface_lot(&mut ctx.sim, Vec2::ZERO)?;
+    let (driver, home, car) = ctx
+        .sim
+        .world()
+        .humans
+        .iter()
+        .find_map(|(driver, person)| {
+            let home = person.home.house;
+            let parking = ctx.sim.building_parking(home)?;
+            (parking.kind == BuildingParkingKind::Driveway && parking.occupied > 0).then_some((
+                driver,
+                home,
+                person.router.personal_car?,
+            ))
+        })
+        .ok_or("missing tagged driveway driver")?;
+    let issue = |run: &mut ScenarioCtx, destination| {
+        run.sim.world_mut_unchecked().edit_human(driver, |person| {
+            person.router.go_to(destination);
+            person.decision.wait = u8::MAX;
+        });
+    };
+    issue(ctx, Destination::Building(lot));
+    let mut cut = false;
+    for _ in 0..10_000 {
+        ctx.sim
+            .world_mut_unchecked()
+            .edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.run_ticks(1);
+        if !cut && ctx.sim.car_property_parking(car).0 == Some(lot) {
+            cut = true;
+            if edits {
+                ctx.sim
+                    .apply_commands([&placement, &WorldCommand::MapRemoveBuilding(lot)]);
+                let outcomes = ctx.sim.read::<CommandOutcomes>();
+                if outcomes.parking_lot(0)
+                    != Some(Err(simulation::world_command::Rejection::StaleRoadQuote))
+                    || outcomes.rejections_for(1).first().map(|entry| entry.1)
+                        != Some(simulation::world_command::Rejection::BusyConflict)
+                {
+                    return Err(format!(
+                        "expected stale and busy denials, got {:?}",
+                        outcomes.last
+                    ));
+                }
+            }
+            let restored = ctx.round_tripped()?;
+            if ctx.sim.hashes() != restored.hashes()
+                || restored.car_property_parking(car).0 != Some(lot)
+            {
+                return Err("public-lot hold diverged on reload".into());
+            }
+            ctx.sample("public_held");
+        }
+        if ctx.sim.world().humans[driver].location == Location::Building(lot) {
+            break;
+        }
+    }
+    if !cut
+        || ctx.sim.car_property_parking(car).1 != Some(lot)
+        || ctx.sim.world().humans[driver].location != Location::Building(lot)
+    {
+        return Err("tagged driver did not park in the public lot and reach the gate".into());
+    }
+    ctx.sample("public_occupied");
+    if edits {
+        ctx.sim.apply_commands([
+            &WorldCommand::SetBuildingParkingOpen {
+                building: lot,
+                open: false,
+            },
+            &WorldCommand::SetBuildingParkingOpen {
+                building: lot,
+                open: true,
+            },
+        ]);
+        if ctx.sim.read::<CommandOutcomes>().accepted != [0, 1] {
+            return Err("public lot did not close and reopen".into());
+        }
+    }
+    issue(ctx, Destination::Building(home));
+    for _ in 0..12_000 {
+        ctx.sim
+            .world_mut_unchecked()
+            .edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.run_ticks(1);
+        if ctx.sim.world().humans[driver].location == Location::Building(home)
+            && ctx.sim.car_property_parking(car).1 == Some(home)
+        {
+            break;
+        }
+    }
+    if ctx.sim.car_property_parking(car) != (None, Some(home))
+        || ctx.sim.world().humans[driver].location != Location::Building(home)
+    {
+        return Err("tagged public-lot driver never cleared the apron and returned home".into());
+    }
+    ctx.sim
+        .apply_commands([&WorldCommand::MapRemoveBuilding(lot)]);
+    if ctx.sim.map().get(lot).is_some() {
+        return Err("cleared public lot could not be removed".into());
+    }
+    ctx.sample("public_rear_clear");
+    Ok(())
+}
 
 fn setup(sim: &mut Simulation, round_trip: bool) -> Result<Vec<BuildingID>, String> {
     setup_at(sim, round_trip, Vec2::ZERO)
@@ -301,6 +528,75 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Supply {
+    Curb,
+    PublicLot,
+    BuildingSurface,
+    Garage,
+}
+
+impl Supply {
+    const ALL: [Self; 4] = [
+        Self::Curb,
+        Self::PublicLot,
+        Self::BuildingSurface,
+        Self::Garage,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Curb => "curb",
+            Self::PublicLot => "public_lot",
+            Self::BuildingSurface => "building_surface",
+            Self::Garage => "garage",
+        }
+    }
+
+    fn property(sim: &Simulation, site: BuildingID) -> Option<Self> {
+        Some(match sim.building_parking_kind(site)? {
+            BuildingParkingKind::SurfaceLot(_) => Self::PublicLot,
+            BuildingParkingKind::Driveway | BuildingParkingKind::RearLot => Self::BuildingSurface,
+            _ => Self::Garage,
+        })
+    }
+}
+
+#[derive(Default)]
+struct TaggedSupply {
+    holds: [bool; 4],
+    occupancies: [bool; 4],
+    departures: [bool; 4],
+    previous: Option<Supply>,
+}
+
+impl TaggedSupply {
+    fn sample(&mut self, sim: &Simulation, car: VehicleID) {
+        let (hold, occupied) = sim.car_property_parking(car);
+        let Some(vehicle) = sim.world().vehicles.get(car) else {
+            return;
+        };
+        let hold = hold.and_then(|id| Supply::property(sim, id)).or_else(|| {
+            matches!(vehicle.vehicle.state, VehicleState::RoadToPark(..)).then_some(Supply::Curb)
+        });
+        let occupied = occupied
+            .and_then(|id| Supply::property(sim, id))
+            .or_else(|| {
+                matches!(vehicle.vehicle.state, VehicleState::Parked(_)).then_some(Supply::Curb)
+            });
+        if let Some(source) = hold {
+            self.holds[source as usize] = true;
+        }
+        if let Some(source) = occupied {
+            self.occupancies[source as usize] = true;
+        }
+        if let Some(source) = self.previous.filter(|&source| Some(source) != occupied) {
+            self.departures[source as usize] = true;
+        }
+        self.previous = occupied;
+    }
+}
+
 struct ScaleTrip {
     driver: HumanID,
     car: VehicleID,
@@ -321,10 +617,14 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut districts = Vec::new();
     for index in 0..DISTRICTS {
         let offset = vec2((index % 16) as f32 * 550.0, (index / 16) as f32 * 400.0);
-        districts.push(
-            setup_at(&mut ctx.sim, true, offset)
-                .map_err(|error| format!("parking district {index}: {error}"))?,
-        );
+        let mut sites = setup_at(&mut ctx.sim, true, offset)
+            .map_err(|error| format!("parking district {index}: {error}"))?;
+        if index % 4 == 0 {
+            ctx.sim
+                .apply_commands([&WorldCommand::MapRemoveBuilding(sites[4])]);
+            sites[4] = place_surface_lot(&mut ctx.sim, offset)?.0;
+        }
+        districts.push(sites);
     }
     let mut offers = Vec::new();
     for (index, sites) in districts.iter().enumerate() {
@@ -374,6 +674,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         .collect();
     ctx.sample("setup");
     let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
+    let mut supply: Vec<_> = offers.iter().map(|_| TaggedSupply::default()).collect();
     for trip in &offers {
         ctx.sim
             .world_mut_unchecked()
@@ -381,11 +682,22 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 person.router.go_to(trip.destination);
             });
     }
-    let advance = |run: &mut ScenarioCtx, ticks, workload: &mut crate::runner::ParkingWorkload| {
-        freeze_scale_drivers(run, &offers);
-        run.run_ticks_observed(ticks, |sim| workload.observe(sim));
+    let sample_supply = |sim: &Simulation, supply: &mut [TaggedSupply]| {
+        for (trip, supply) in offers.iter().zip(supply) {
+            supply.sample(sim, trip.car);
+        }
     };
-    advance(ctx, 8, &mut workload);
+    let advance = |run: &mut ScenarioCtx,
+                   ticks,
+                   workload: &mut crate::runner::ParkingWorkload,
+                   supply: &mut [TaggedSupply]| {
+        freeze_scale_drivers(run, &offers);
+        run.run_ticks_observed(ticks, |sim| {
+            workload.observe(sim);
+            sample_supply(sim, supply);
+        });
+    };
+    advance(ctx, 8, &mut workload, &mut supply);
     let holds = garages
         .iter()
         .filter_map(|&garage| ctx.sim.building_parking(garage))
@@ -399,17 +711,18 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     freeze_scale_drivers(&mut resumed, &offers);
     resumed.run_ticks(128);
     let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
-    advance(ctx, 128, &mut workload);
+    advance(ctx, 128, &mut workload, &mut supply);
     if ctx.sim.hashes() != resumed.sim.hashes() {
         return Err("mixed-supply resumed parking holds diverged".into());
     }
     drop(resumed);
     // Allow time for a turnaround and the walk from an alternate bay.
     for _ in 0..60 {
-        advance(ctx, 200, &mut workload);
+        advance(ctx, 200, &mut workload, &mut supply);
     }
     let mut curb = 0;
     let mut garage = 0;
+    let mut public_lot = 0;
     let mut curb_miss = None;
     for trip in &offers {
         let human = &ctx.sim.world().humans[trip.driver];
@@ -417,9 +730,13 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         match trip.destination {
             Destination::Building(building)
                 if human.location == Location::Building(building)
-                    && ctx.sim.car_stored_inside_garage(trip.car) =>
+                    && ctx.sim.car_property_parking(trip.car).1 == Some(building) =>
             {
-                garage += 1
+                match Supply::property(&ctx.sim, building) {
+                    Some(Supply::PublicLot) => public_lot += 1,
+                    Some(Supply::Garage) => garage += 1,
+                    _ => {}
+                }
             }
             Destination::Outside(door)
                 if human.location == Location::Outside
@@ -447,12 +764,20 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         ("tagged_offers".to_owned(), offers.len() as f64),
         ("tagged_garage_arrivals".to_owned(), f64::from(garage)),
         ("tagged_curb_arrivals".to_owned(), f64::from(curb)),
+        (
+            "tagged_public_lot_arrivals".to_owned(),
+            f64::from(public_lot),
+        ),
         ("simultaneous_garage_holds".to_owned(), holds as f64),
     ]));
     ctx.sample_perf_with_extra("measured", POPULATION, extra, true);
-    if curb == 0 || garage == 0 || (curb + garage) * 100 < offers.len() as i32 * 90 {
+    if curb == 0
+        || garage == 0
+        || public_lot == 0
+        || (curb + garage + public_lot) * 100 < offers.len() as i32 * 90
+    {
         return Err(format!(
-            "mixed-supply departures reached {curb} curb and {garage} garage destinations from {} tagged offers; first curb miss {curb_miss:?}",
+            "mixed-supply departures reached {curb} curb, {garage} garage and {public_lot} public-lot destinations from {} tagged offers; first curb miss {curb_miss:?}",
             offers.len(),
         ));
     }
@@ -496,7 +821,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut drain_ticks = 0;
     let mut home_followups = 0;
     loop {
-        ctx.run_ticks(DRAIN_BATCH as u64);
+        ctx.run_ticks_observed(DRAIN_BATCH as u64, |sim| sample_supply(sim, &mut supply));
         drain_ticks += DRAIN_BATCH;
         if garages_empty(&ctx.sim) {
             if offers.iter().all(|trip| returned(&ctx.sim, trip)) {
@@ -542,16 +867,41 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             ));
         }
     }
-    ctx.sample_perf_with_extra(
-        "drained",
-        POPULATION,
-        BTreeMap::from([
-            ("tagged_returns".to_owned(), offers.len() as f64),
-            ("drain_ticks".to_owned(), drain_ticks as f64),
-            ("home_followups".to_owned(), f64::from(home_followups)),
-        ]),
-        true,
-    );
+    if home_followups > offers.len() / 20 {
+        return Err(format!(
+            "mixed-supply drain needed {home_followups} follow-up requests for {} drivers",
+            offers.len()
+        ));
+    }
+    let mut drain = BTreeMap::from([
+        ("tagged_returns".to_owned(), offers.len() as f64),
+        ("drain_ticks".to_owned(), drain_ticks as f64),
+        ("home_followups".to_owned(), home_followups as f64),
+    ]);
+    let mut misses = Vec::new();
+    for source in Supply::ALL {
+        let index = source as usize;
+        let holds = supply.iter().filter(|trip| trip.holds[index]).count();
+        let occupied = supply.iter().filter(|trip| trip.occupancies[index]).count();
+        let departed = supply.iter().filter(|trip| trip.departures[index]).count();
+        for (metric, value) in [
+            ("holds", holds),
+            ("occupancies", occupied),
+            ("departures", departed),
+        ] {
+            drain.insert(format!("tagged_{}_{metric}", source.label()), value as f64);
+        }
+        if holds < 50 || occupied < 40 || departed < 30 {
+            misses.push(format!(
+                "{} has {holds} holds, {occupied} occupancies, {departed} rear-clear departures",
+                source.label()
+            ));
+        }
+    }
+    ctx.sample_perf_with_extra("drained", POPULATION, drain, true);
+    if !misses.is_empty() {
+        return Err(format!("mixed-supply floors missed: {}", misses.join(", ")));
+    }
     Ok(())
 }
 

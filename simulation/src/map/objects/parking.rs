@@ -3,7 +3,7 @@ use flat_spatial::Grid;
 use geom::{Transform, Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use slotmapd::{new_key_type, SecondaryMap, SlotMap};
+use slotmapd::{new_key_type, Key, SecondaryMap, SlotMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 new_key_type! {
@@ -30,6 +30,8 @@ pub struct ParkingSpots {
     pub(crate) reuse_spot: Grid<ParkingSpotID, Vec2>,
     #[serde(skip, default = "next_revision")]
     revision: u64,
+    #[serde(skip)]
+    surface_count: usize,
 }
 
 fn next_revision() -> u64 {
@@ -44,6 +46,7 @@ impl Default for ParkingSpots {
             lane_spots: Default::default(),
             reuse_spot: Grid::new(10),
             revision: next_revision(),
+            surface_count: 0,
         }
     }
 }
@@ -73,11 +76,40 @@ impl ParkingSpots {
     }
 
     pub fn random_spot(&self, rng: u64) -> Option<ParkingSpotID> {
-        if self.spots.is_empty() {
+        let count = self.spots.len() - self.surface_count;
+        if count == 0 {
             return None;
         }
-        let mut iter = self.spots.keys();
-        iter.nth(rng as usize % self.spots.len())
+        if self.surface_count == 0 {
+            return self.spots.keys().nth(rng as usize % count);
+        }
+        self.spots
+            .iter()
+            .filter_map(|(id, spot)| (!spot.parent.is_null()).then_some(id))
+            .nth(rng as usize % count)
+    }
+
+    pub(in crate::map) fn insert_surface(&mut self, trans: Transform) -> ParkingSpotID {
+        self.surface_count += 1;
+        self.spots.insert(ParkingSpot {
+            parent: LaneID::null(),
+            trans,
+        })
+    }
+
+    pub(in crate::map) fn remove_surface(&mut self, id: ParkingSpotID) {
+        if self.spots.remove(id).is_some() {
+            self.surface_count -= 1;
+        }
+    }
+
+    pub(in crate::map) fn restore_surface_count(&mut self, owned: usize) -> bool {
+        self.surface_count = self
+            .spots
+            .values()
+            .filter(|spot| spot.parent.is_null())
+            .count();
+        self.surface_count == owned
     }
 
     pub fn clean_reuse(&mut self) -> u32 {
@@ -158,6 +190,7 @@ impl ParkingSpots {
     pub fn clear(&mut self) {
         self.revision = next_revision();
         self.spots.clear();
+        self.surface_count = 0;
         self.lane_spots.clear();
         for _ in self.reuse_spot.clear() {}
     }
@@ -169,7 +202,7 @@ impl ParkingSpots {
     }
 
     pub fn all_spots(&self) -> impl Iterator<Item = (ParkingSpotID, &ParkingSpot)> + '_ {
-        self.spots.iter()
+        self.spots.iter().filter(|(_, spot)| !spot.parent.is_null())
     }
 
     pub(crate) fn curb_spots_near(

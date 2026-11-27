@@ -621,9 +621,15 @@ pub(crate) fn prepare_upgrade(
             .lanes()
             .any(|(kind, _, _)| kind == LaneKind::Parking);
         let local = super::SmallRoadPreset::LocalOneWay { curb_parking }.lane_pattern();
-        *pattern == local
-            || (pattern.lanes_forward == local.lanes_backward
-                && pattern.lanes_backward == local.lanes_forward)
+        let same_kinds = |a: &[(LaneKind, f32)], b: &[(LaneKind, f32)]| {
+            a.iter()
+                .map(|(kind, _)| kind)
+                .eq(b.iter().map(|(kind, _)| kind))
+        };
+        (same_kinds(&pattern.lanes_forward, &local.lanes_forward)
+            && same_kinds(&pattern.lanes_backward, &local.lanes_backward))
+            || (same_kinds(&pattern.lanes_forward, &local.lanes_backward)
+                && same_kinds(&pattern.lanes_backward, &local.lanes_forward))
     };
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
@@ -653,6 +659,9 @@ pub(crate) fn prepare_upgrade(
             edits,
         )
     } else {
+        if local_reversal {
+            return Err(Rejection::RoadTopologyUnavailable);
+        }
         let projection =
             super::prepare_road_replacement(&map, id, pattern, budget.road_work_remaining())
                 .map_err(|error| match error {
@@ -736,10 +745,10 @@ fn prepare_same_width_directions(
     // Local reversing keeps the deck and sidewalk lanes. Its curb lane can
     // move to the opposite side once all bays are clear.
     if road.width != pattern.width()
-        || !road.connected_buildings.is_empty()
-        || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
         || (!local_reversal
-            && (road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+            && (!road.connected_buildings.is_empty()
+                || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
+                || road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
                 || pattern
                     .lanes()
                     .any(|(kind, _, _)| kind == LaneKind::Parking)

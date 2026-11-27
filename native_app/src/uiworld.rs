@@ -168,6 +168,7 @@ pub struct ReceivedCommands {
     placements: Vec<PlacementResult>,
     pub tile_purchases: Vec<TilePurchaseReceipt>,
     pub(crate) traffic_edits: Vec<crate::gui::traffic_repair::TrafficEditReceipt>,
+    pub(crate) lot_placements: Vec<crate::network::LotPlacementReceipt>,
     pub(crate) rejections: Vec<(u64, Vec<(usize, &'static str, Rejection)>)>,
 }
 

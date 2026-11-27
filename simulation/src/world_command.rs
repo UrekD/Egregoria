@@ -694,7 +694,11 @@ impl PreparedAction<'_> {
                 let mut outcomes = sim.write::<CommandOutcomes>();
                 let index = outcomes.command_ranges.len();
                 if surface {
-                    outcomes.parking_lots.insert(index, Ok(id));
+                    let lot = sim
+                        .map()
+                        .public_parking_lot(id)
+                        .expect("new public lot identity");
+                    outcomes.parking_lots.insert(index, Ok(lot));
                 } else {
                     outcomes.parking_garages.insert(index, Ok(id));
                 }
@@ -753,7 +757,7 @@ pub struct CommandOutcomes {
     junction_edits: BTreeMap<usize, Result<JunctionEditReceipt, Rejection>>,
     walking_paths: BTreeMap<usize, Result<RoadID, Rejection>>,
     parking_garages: BTreeMap<usize, Result<BuildingID, Rejection>>,
-    parking_lots: BTreeMap<usize, Result<BuildingID, Rejection>>,
+    parking_lots: BTreeMap<usize, Result<crate::map::ParkingLotID, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -805,7 +809,7 @@ impl CommandOutcomes {
         self.tile_purchases.get(&index).copied()
     }
 
-    pub fn parking_lot(&self, index: usize) -> Option<Result<BuildingID, Rejection>> {
+    pub fn parking_lot(&self, index: usize) -> Option<Result<crate::map::ParkingLotID, Rejection>> {
         self.parking_lots.get(&index).copied()
     }
 
@@ -2098,7 +2102,22 @@ impl WorldCommand {
                 .map_err(|error| Rejection::water_error(&error))?;
         }
         let blocked = match self {
-            MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => touches_road(*road),
+            MapRemoveRoad(road) => touches_road(*road),
+            MapUpgradeRoad { road, change, .. } => {
+                let changes_geometry = match change {
+                    RoadUpgrade::Replace(pattern) => map.get(*road).is_some_and(|current| {
+                        let current = current.pattern(map.lanes());
+                        let kinds = |lanes: &[(LaneKind, f32)]| -> Vec<LaneKind> {
+                            lanes.iter().map(|(kind, _)| *kind).collect()
+                        };
+                        kinds(&current.lanes_forward) != kinds(&pattern.lanes_forward)
+                            || kinds(&current.lanes_backward) != kinds(&pattern.lanes_backward)
+                    }),
+                    RoadUpgrade::ReverseOneWay => true,
+                };
+                protects(*road) || (changes_geometry && touches_road(*road))
+            }
+
             MapRemoveIntersection(joint) => map
                 .get(*joint)
                 .is_some_and(|intersection| intersection.roads.iter().copied().any(touches_road)),
@@ -2146,12 +2165,14 @@ impl WorldCommand {
             }),
             MapBuildSpecialBuilding { pos, .. } => {
                 use geom::Shape;
-                traffic.overlaps(&pos.bbox())
+                traffic.overlaps_non_surface(&pos.bbox()) || map.surface_access_obstructed_by(*pos)
             }
             MapBuildHouse(lot) => {
                 use geom::Shape;
-                map.get(*lot)
-                    .is_some_and(|lot| traffic.overlaps(&lot.shape.bbox()))
+                map.get(*lot).is_some_and(|lot| {
+                    traffic.overlaps_non_surface(&lot.shape.bbox())
+                        || map.surface_access_obstructed_by(lot.shape)
+                })
             }
             _ => false,
         };

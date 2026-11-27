@@ -1143,6 +1143,13 @@ mod pathpark_driveway {
             self.properties.overlapping_road(bounds).is_some() || self.overlaps_proof_pad(bounds)
         }
 
+        pub(crate) fn overlaps_non_surface(&self, bounds: &AABB) -> bool {
+            self.properties
+                .overlapping_road_filtered(bounds, false)
+                .is_some()
+                || self.overlaps_proof_pad(bounds)
+        }
+
         pub(crate) fn overlaps_proof_pad(&self, bounds: &AABB) -> bool {
             self.facilities
                 .iter()

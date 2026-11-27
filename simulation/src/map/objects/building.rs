@@ -242,9 +242,10 @@ impl PreparedBuilding {
         &mut self,
         pad: crate::map::building_parking::LotFootprint,
         door: Vec3,
+        stalls: &[Vec3],
     ) {
         self.0.door_pos = door;
-        self.0.mesh = crate::map::building_parking::surface_mesh(pad);
+        self.0.mesh = crate::map::building_parking::surface_mesh(pad, stalls);
     }
 
     pub(in crate::map) fn insert(
