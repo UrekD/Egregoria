@@ -258,7 +258,10 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
             market.forget_human_buyer(trade.seller.0, id);
         }
     }
-    if let Some(car) = human.router.personal_car {
+    let removed_car = human.router.personal_car.filter(|&car| {
+        !sim.write::<crate::transportation::DrivewayTraffic>().properties.owner_dropped(car)
+    });
+    if let Some(car) = removed_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
     }
     human
@@ -279,7 +282,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
     let employers = clear_soul_references(sim, SoulID::Human(id));
     if let (Some(_), Some(car), Some(batch)) = (
         &employers,
-        human.router.personal_car,
+        removed_car,
         &mut sim.world.departing,
     ) {
         batch.removed_cars.insert(car);

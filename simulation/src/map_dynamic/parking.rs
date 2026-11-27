@@ -84,11 +84,45 @@ impl ParkingManagement {
     }
 
     pub fn is_spot_free(&self, spot: ParkingSpotID) -> bool {
-        self.is_unreserved(spot) && !self.masked_spots.contains_key(&spot)
+        self.is_unreserved(spot) && !self.is_masked(spot)
+    }
+
+    pub(crate) fn is_masked(&self, spot: ParkingSpotID) -> bool {
+        self.masked_spots.contains_key(&spot)
     }
 
     pub(crate) fn is_unreserved(&self, spot: ParkingSpotID) -> bool {
         !self.reserved_spots.contains(&spot)
+    }
+
+    pub(crate) fn reserve_exact(&mut self, spot: ParkingSpotID) -> Option<SpotReservation> {
+        (self.is_spot_free(spot) && self.reserved_spots.insert(spot)).then_some(SpotReservation(spot))
+    }
+
+    pub(crate) fn property_curb_candidates(&self, map: &Map, near: Vec3) -> Vec<ParkingSpotID> {
+        use crate::map::{ProjectFilter, ProjectKind};
+        use ordered_float::OrderedFloat;
+        let radius = 400.0_f32;
+        let mut candidates = Vec::new();
+        for hit in map.spatial_map().query_around(near.xy(), radius, ProjectFilter::ROAD).take(64) {
+            let ProjectKind::Road(id) = hit else { continue };
+            let Some(road) = map.get(id) else { continue };
+            for (lane, kind) in road.lanes_iter() {
+                if kind != LaneKind::Parking {
+                    continue;
+                }
+                let Some(spots) = map.parking.closest_spots(lane, near) else { continue };
+                for spot in spots.take(8).filter(|&spot| self.is_spot_free(spot)) {
+                    let point = map.parking.get(spot).unwrap().trans.pos;
+                    let distance = point.distance2(near);
+                    if distance <= radius.powi(2) && (point.z - near.z).abs() < 4.0 {
+                        candidates.push((OrderedFloat(distance), spot));
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.into_iter().take(32).map(|(_, spot)| spot).collect()
     }
 
     pub(crate) fn mask(&mut self, spot: ParkingSpotID) {

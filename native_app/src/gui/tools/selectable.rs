@@ -48,8 +48,7 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
         inspected.e = uiworld
             .write::<VehiclePicker>()
             .pick(sim, &inp)
-            .map(|hit| hit.entity)
-            .filter(|entity| !matches!(entity, AnyEntity::VehicleID(car) if sim.car_stored_inside_garage(*car)));
+            .map(|hit| hit.entity);
         if let Some(unproj) = inp.unprojected.filter(|_| inspected.e.is_none()) {
             for (id, human) in &sim.world().humans {
                 let dist2 = human.trans.pos.xy().distance2(unproj.xy());
@@ -340,6 +339,9 @@ impl VehiclePicker {
     ) -> Option<(VehicleHit, f32)> {
         let (entity, depth) = match part {
             AnyEntity::VehicleID(id) => {
+                if sim.car_stored_inside_garage(id) {
+                    return None;
+                }
                 let vehicle = sim.get(id)?;
                 let bounds = self.road_bounds(vehicle.vehicle.kind);
                 (part, instance_depth(ray, vehicle.trans, bounds)?)

@@ -1075,8 +1075,21 @@ mod pathpark_driveway {
                 .any(|f| f.claim.as_ref().is_some_and(|c| c.vehicle == vehicle))
         }
 
-        pub(crate) fn protected_roads(&self, map: &Map, retire_vacant: bool) -> BTreeSet<RoadID> {
+        pub(crate) fn proof_site_count(&self) -> usize {
+            self.facilities.len()
+        }
+
+        pub(crate) fn site_count(&self) -> usize {
+            self.proof_site_count() + self.properties.site_count()
+        }
+
+        pub(crate) fn protected_motion_roads(
+            &self,
+            map: &Map,
+            remaining: &mut usize,
+        ) -> Result<BTreeSet<RoadID>, WaterEditError> {
             let mut roads = BTreeSet::new();
+            crate::map::spend_water_work(remaining, self.facilities.len())?;
             for facility in &self.facilities {
                 roads.insert(facility.anchor.road);
                 if let Some(Claim {
@@ -1084,11 +1097,14 @@ mod pathpark_driveway {
                     ..
                 }) = &facility.claim
                 {
-                    roads.extend(route.roads(map));
+                    for road in route.roads(map) {
+                        crate::map::spend_water_work(remaining, 1)?;
+                        roads.insert(road);
+                    }
                 }
             }
-            self.properties.protected_roads(map, &mut roads, retire_vacant);
-            roads
+            self.properties.protected_motion_roads(map, &mut roads, remaining)?;
+            Ok(roads)
         }
 
         pub(crate) fn overlaps(&self, bounds: &AABB) -> bool {

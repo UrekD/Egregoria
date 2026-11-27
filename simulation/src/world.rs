@@ -855,12 +855,14 @@ impl Simulation {
             self.write::<Residences>().insert(building, home);
         }
         if let Some(spec) = parking {
-            crate::map::building_parking::refresh_property(
+            if let Ok(Some(layout)) = crate::map::building_parking::prepare_property_upgrade(
                 self,
                 building,
                 Some(spec),
                 home_parking,
-            );
+            ) {
+                crate::map::building_parking::commit_property_upgrade(self, building, Some(layout));
+            }
         }
         Ok(PlacedGrowable {
             building,

@@ -8,6 +8,7 @@ use crate::transportation::{
     MOTION_TICKS,
 };
 use crate::{HumanID, RandProvider, Simulation, VehicleID, World};
+use common::saveload::{Bincode, Encoder};
 use geom::{Intersect, Shape, Transform, Vec2, Vec3, AABB, OBB};
 use prototypes::{GrowableParking, Money};
 use serde::{Deserialize, Serialize};
@@ -122,11 +123,24 @@ pub struct BuildingParkingSummary {
     pub capacity: u16,
     pub occupied: u16,
     pub held: u16,
+    pub missing_owners: u16,
     pub entrance: CurbAnchor,
     pub entrance_pos: Vec3,
     pub daily_upkeep: Money,
     pub open: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct CurbParkingSummary {
+    pub road: RoadID,
+    pub capacity: usize,
+    pub occupied: usize,
+    pub reserved: usize,
+    pub masked: usize,
+    pub nearest_bay: Vec3,
+}
+
+pub(crate) struct CurbOnlyBenchmark;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ParkingLayout {
@@ -449,7 +463,9 @@ pub(crate) struct BuildingParking {
     #[serde(skip)]
     public_garages: BTreeSet<BuildingID>,
     #[serde(skip)]
-    closing_sites: BTreeSet<BuildingID>,
+    closing_cars: BTreeSet<VehicleID>,
+    #[serde(skip)]
+    drain_cursor: Option<VehicleID>,
     #[serde(deserialize_with = "bounded_parking_map::<_, _, _, MAX_LIVE_CLAIMS>")]
     parked: BTreeMap<VehicleID, Occupant>,
     #[serde(deserialize_with = "bounded_parking_map::<_, _, _, MAX_LIVE_CLAIMS>")]
@@ -519,12 +535,33 @@ struct Motion {
 }
 
 impl BuildingParking {
+    pub(crate) fn save(&self, output: impl std::io::Write) -> std::io::Result<()> {
+        if let Some(cursor) = self.drain_cursor {
+            Bincode::encode_writer(&(self, cursor), output)
+        } else {
+            Bincode::encode_writer(self, output)
+        }
+    }
+
+    pub(crate) fn load(data: &[u8]) -> std::io::Result<Self> {
+        if let Ok(parking) = Bincode::decode(data) {
+            return Ok(parking);
+        }
+        let (mut parking, cursor): (Self, VehicleID) = Bincode::decode(data)?;
+        parking.drain_cursor = Some(cursor);
+        Ok(parking)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.sites.is_empty()
     }
 
     pub(crate) fn site_count(&self) -> usize {
         self.sites.len()
+    }
+
+    pub(crate) fn has_site(&self, id: BuildingID) -> bool {
+        self.sites.contains_key(&id)
     }
 
     pub(crate) fn has_runtime_work(&self) -> bool {
@@ -591,7 +628,6 @@ impl BuildingParking {
                 self.mouths.remove(&anchor.road);
             }
             self.public_garages.remove(&id);
-            self.closing_sites.remove(&id);
             for spot in site.layout.masks {
                 parking.unmask(spot);
             }
@@ -610,14 +646,28 @@ impl BuildingParking {
         };
         site.closing = !open;
         if open {
-            self.closing_sites.remove(&id);
+            for car in site.occupied.keys() {
+                self.closing_cars.remove(car);
+            }
         } else {
-            self.closing_sites.insert(id);
+            self.closing_cars.extend(site.occupied.keys().copied());
+            let committed = self.motions.get(&id).map(|motion| motion.car);
+            site.held.retain(|car, _| {
+                if Some(*car) == committed {
+                    true
+                } else {
+                    self.arrivals.remove(car);
+                    false
+                }
+            });
+        }
+        if self.closing_cars.is_empty() {
+            self.drain_cursor = None;
         }
         true
     }
 
-    pub(crate) fn summary(&self, id: BuildingID) -> Option<BuildingParkingSummary> {
+    pub(crate) fn summary(&self, id: BuildingID, world: &World) -> Option<BuildingParkingSummary> {
         let site = self.sites.get(&id)?;
         let layout = &site.layout;
         let daily_upkeep = match layout.kind {
@@ -629,6 +679,9 @@ impl BuildingParking {
             capacity: layout.capacity,
             occupied: site.occupied.len() as u16,
             held: site.held.len() as u16,
+            missing_owners: site.occupied.keys().filter(|car| {
+                !world.humans.contains_key(self.parked[car].driver)
+            }).count() as u16,
             entrance: layout.anchor,
             entrance_pos: layout.entrance,
             daily_upkeep,
@@ -650,6 +703,11 @@ impl BuildingParking {
 
     pub(crate) fn parked_at(&self, car: VehicleID) -> Option<BuildingID> {
         self.parked.get(&car).map(|occupant| occupant.site)
+    }
+
+    pub(crate) fn pedestrian_gate(&self, car: VehicleID) -> Option<Vec3> {
+        let layout = &self.sites[&self.parked_at(car)?].layout;
+        layout.kind.stores_inside().then_some(layout.door)
     }
 
     pub(crate) fn hidden(&self, car: VehicleID) -> bool {
@@ -734,21 +792,37 @@ impl BuildingParking {
             .is_some_and(|motion| motion.car == car)
     }
 
-    pub(crate) fn closing_owners(
-        &self,
-        slice: u64,
-    ) -> impl Iterator<Item = (HumanID, VehicleID, BuildingID, Vec3)> + '_ {
-        self.closing_sites.iter().copied().flat_map(move |id| {
-            let site = &self.sites[&id];
-            site.occupied.keys().filter_map(move |&car| {
-                use slotmapd::Key;
-                (common::hash_u64((id.data().as_ffi(), car)) % 16 == slice % 16)
-                    .then(|| (self.parked[&car].driver, car, id, site.layout.door))
-            })
-        })
+    pub(crate) fn next_closing_owner(&mut self) -> Option<(HumanID, VehicleID, BuildingID, Vec3)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let car = self.drain_cursor.and_then(|cursor| {
+            self.closing_cars.range((Excluded(cursor), Unbounded)).next()
+        }).or_else(|| self.closing_cars.first()).copied()?;
+        self.drain_cursor = Some(car);
+        let occupant = &self.parked[&car];
+        Some((occupant.driver, car, occupant.site, self.sites[&occupant.site].layout.door))
+    }
+
+    pub(crate) fn closing_car_count(&self) -> usize {
+        self.closing_cars.len()
+    }
+
+    pub(crate) fn has_arrival(&self, car: VehicleID, site: BuildingID, driver: HumanID) -> bool {
+        self.arrivals.get(&car).is_some_and(|hold| hold.site == site && hold.driver == driver)
+            && self.sites.get(&site).is_some_and(|site| !site.closing)
+    }
+
+    pub(crate) fn owner_dropped(&mut self, car: VehicleID) -> bool {
+        let committed_ingress = self.arrivals.get(&car).is_some_and(|arrival| {
+            self.motions.get(&arrival.site).is_some_and(|motion| motion.car == car)
+        });
+        if !committed_ingress {
+            self.release_arrival(car);
+        }
+        committed_ingress || self.parked.contains_key(&car)
     }
 
     pub(crate) fn vehicle_removed(&mut self, car: VehicleID) {
+        self.closing_cars.remove(&car);
         self.release_arrival(car);
         if let Some(occupant) = self.parked.remove(&car) {
             self.sites
@@ -792,7 +866,8 @@ impl BuildingParking {
         let id = arrival.site;
         let site = &self.sites[&id];
         let path = site.layout.path(site.held[&car]);
-        if self.motions.contains_key(&id)
+        if site.closing
+            || self.motions.contains_key(&id)
             || actor.collider.is_none()
             || actor.speed.0.abs() > 0.2
             || site
@@ -898,6 +973,7 @@ impl BuildingParking {
             if let Some(route) = motion.departure.take() {
                 self.parked.remove(&motion.car);
                 site.occupied.remove(&motion.car);
+                self.closing_cars.remove(&motion.car);
                 actor.it = route.into_itinerary();
                 sync_actor(grid, actor);
             } else {
@@ -911,6 +987,9 @@ impl BuildingParking {
                         driver: arrival.driver,
                     },
                 );
+                if site.closing {
+                    self.closing_cars.insert(motion.car);
+                }
                 if let Some(collider) = actor.collider.take() {
                     grid.remove_maintain(collider.0);
                 }
@@ -937,27 +1016,28 @@ impl BuildingParking {
         });
     }
 
-    pub(crate) fn protected_roads(
+    pub(crate) fn protects_road(&self, road: RoadID, retire_vacant: bool) -> bool {
+        self.mouths.get(&road).is_some_and(|mouths| {
+            !retire_vacant || mouths.iter().any(|&(_, id)| {
+                self.busy(id) || self.public_garages.contains(&id)
+            })
+        })
+    }
+
+    pub(crate) fn protected_motion_roads(
         &self,
         map: &Map,
         roads: &mut BTreeSet<RoadID>,
-        retire_vacant: bool,
-    ) {
-        for (&id, site) in &self.sites {
-            if !retire_vacant
-                || self.busy(id)
-                || matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_))
-            {
-                roads.insert(site.layout.anchor.road);
+        remaining: &mut usize,
+    ) -> Result<(), crate::map::WaterEditError> {
+        crate::map::spend_water_work(remaining, self.motions.len())?;
+        for route in self.motions.values().filter_map(|motion| motion.departure.as_ref()) {
+            for road in route.roads(map) {
+                crate::map::spend_water_work(remaining, 1)?;
+                roads.insert(road);
             }
         }
-        for route in self
-            .motions
-            .values()
-            .filter_map(|motion| motion.departure.as_ref())
-        {
-            roads.extend(route.roads(map));
-        }
+        Ok(())
     }
 
     pub(crate) fn retire_invalidated_vacant(
@@ -1083,9 +1163,6 @@ impl BuildingParking {
             if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
                 self.public_garages.insert(id);
             }
-            if site.closing {
-                self.closing_sites.insert(id);
-            }
             for &mask in &layout.masks {
                 if !map.parking.contains(mask) || !parking.is_unreserved(mask) {
                     return Err("invalid property parking curb mask");
@@ -1093,6 +1170,9 @@ impl BuildingParking {
                 parking.mask(mask);
             }
             for (&car, &slot) in &site.occupied {
+                if site.closing {
+                    self.closing_cars.insert(car);
+                }
                 let Some(actor) = world.vehicles.get(car) else {
                     return Err("missing property parking vehicle");
                 };
@@ -1105,7 +1185,7 @@ impl BuildingParking {
                         || world
                             .humans
                             .get(occupant.driver)
-                            .is_none_or(|human| human.router.personal_car != Some(car))
+                            .is_some_and(|human| human.router.personal_car != Some(car))
                 }) || usize::from(slot) >= layout.paths.len()
                     || !matches!(actor.vehicle.kind, VehicleKind::Car)
                     || (!exiting
@@ -1134,10 +1214,10 @@ impl BuildingParking {
                         .get(car)
                         .is_none_or(|vehicle| !matches!(vehicle.vehicle.kind, VehicleKind::Car))
                     || (!entering
-                        && world.humans.get(arrival.driver).is_none_or(|human| {
+                        && (site.closing || world.humans.get(arrival.driver).is_none_or(|human| {
                             human.router.personal_car != Some(car)
                                 || !human.router.has_property_arrival(car, id)
-                        }))
+                        })))
                 {
                     return Err("invalid property parking hold");
                 }
@@ -1253,7 +1333,7 @@ impl Simulation {
     pub fn building_parking(&self, id: BuildingID) -> Option<BuildingParkingSummary> {
         self.read::<crate::transportation::DrivewayTraffic>()
             .properties
-            .summary(id)
+            .summary(id, self.world())
     }
 
     pub fn car_stored_inside_garage(&self, id: VehicleID) -> bool {
@@ -1262,13 +1342,12 @@ impl Simulation {
             .hidden(id)
     }
 
-    pub fn building_curb_parking(&self, id: BuildingID) -> Option<(usize, usize)> {
+    pub fn building_curb_parking(&self, id: BuildingID) -> Option<CurbParkingSummary> {
         let map = self.map();
         let building = map.get(id)?;
         let road = map.get(building.connected_road?)?;
         let reservations = self.read::<ParkingManagement>();
-        let mut capacity = 0;
-        let mut unavailable = 0;
+        let mut bays = Vec::new();
         for (lane, kind) in road.lanes_iter() {
             if kind != crate::map::LaneKind::Parking {
                 continue;
@@ -1280,15 +1359,35 @@ impl Simulation {
                 .flatten()
                 .take(20)
             {
-                if map.parking.get(spot).is_some_and(|spot| {
-                    spot.trans.pos.distance2(building.door_pos) <= 45.0_f32.powi(2)
-                }) {
-                    capacity += 1;
-                    unavailable += usize::from(!reservations.is_spot_free(spot));
+                let point = map.parking.get(spot)?.trans.pos;
+                let distance = point.distance2(building.door_pos);
+                if distance <= 45.0_f32.powi(2) {
+                    bays.push((ordered_float::OrderedFloat(distance), spot, point));
                 }
             }
         }
-        (capacity != 0).then_some((capacity, unavailable))
+        let nearest_bay = bays.iter().min_by_key(|&&(distance, id, _)| (distance, id))?.2;
+        let mut reserved: BTreeSet<_> = bays.iter().map(|&(_, spot, _)| spot)
+            .filter(|&spot| !reservations.is_unreserved(spot)).collect();
+        let masked = bays.iter().filter(|&&(_, spot, _)| reservations.is_masked(spot)).count();
+        let claimed = reserved.len();
+        for car in self.world().vehicles.values() {
+            if reserved.is_empty() {
+                break;
+            }
+            if let VehicleState::Parked(spot) = &car.vehicle.state {
+                reserved.remove(&spot.id());
+            }
+        }
+        Some(CurbParkingSummary {
+            road: road.id, capacity: bays.len(), occupied: claimed - reserved.len(),
+            reserved: reserved.len(), masked, nearest_bay,
+        })
+    }
+
+    /// Select the stock curb-only workload before a benchmark commissions its city.
+    pub fn use_curb_only_benchmark_parking(&mut self) {
+        self.resources.insert(CurbOnlyBenchmark);
     }
 
     pub fn parking_pavement(&self, id: BuildingID) -> Vec<[Vec3; 2]> {
@@ -1301,27 +1400,28 @@ impl Simulation {
     }
 }
 
-pub(crate) fn refresh_property(
+pub(crate) fn prepare_property_upgrade(
     sim: &Simulation,
     id: BuildingID,
     spec: Option<GrowableParking>,
     residential: bool,
-) {
+) -> Result<Option<ParkingLayout>, ()> {
     use crate::transportation::DrivewayTraffic;
     let map = sim.map();
-    let Some(site) = map.get(id) else { return };
+    let Some(site) = map.get(id) else { return Err(()) };
     let Some(lot) = map.lot_origin(id) else {
-        return;
+        return Ok(None);
     };
     let Some(shell) = site
         .development()
         .and_then(|site| site.frozen_shell.as_ref())
     else {
-        return;
+        return Ok(None);
     };
-    let mut traffic = sim.write::<DrivewayTraffic>();
-    let parking = &mut sim.write::<ParkingManagement>();
-    let properties = &mut traffic.properties;
+    let traffic = sim.read::<DrivewayTraffic>();
+    let parking = sim.read::<ParkingManagement>();
+    let properties = &traffic.properties;
+    let spec = spec.filter(|_| !sim.resources.contains::<CurbOnlyBenchmark>());
     let layout = spec.and_then(|spec| {
         prepare_property_parking(
             &map,
@@ -1331,20 +1431,34 @@ pub(crate) fn refresh_property(
             site.door_pos,
             spec,
             residential,
-            |layout| properties.fits(parking, layout, Some(id)),
+            |layout| properties.fits(&parking, layout, Some(id)),
         )
     });
     if properties.busy(id) {
-        let Some(layout) = layout else { return };
-        let current = &mut properties.sites.get_mut(&id).unwrap().layout;
-        if current.kind == layout.kind
-            && current.anchor == layout.anchor
-            && current.paths == layout.paths
-            && current.masks == layout.masks
-            && layout.capacity >= current.capacity
+        let Some(layout) = &layout else { return Err(()) };
+        let current = &properties.sites[&id].layout;
+        if current.kind != layout.kind
+            || current.anchor != layout.anchor
+            || current.paths != layout.paths
+            || current.masks != layout.masks
+            || layout.capacity < current.capacity
         {
-            current.capacity = layout.capacity;
+            return Err(());
         }
+    }
+    Ok(layout)
+}
+
+pub(crate) fn commit_property_upgrade(
+    sim: &Simulation,
+    id: BuildingID,
+    layout: Option<ParkingLayout>,
+) {
+    let parking = &mut sim.write::<ParkingManagement>();
+    let properties = &mut sim.write::<crate::transportation::DrivewayTraffic>().properties;
+    if properties.busy(id) {
+        let layout = layout.expect("busy parking upgrade has compatible geometry");
+        properties.sites.get_mut(&id).unwrap().layout.capacity = layout.capacity;
     } else if let Some(layout) = layout {
         let was_closed = properties.sites.get(&id).is_some_and(|site| site.closing);
         properties.install(id, layout, parking);

@@ -423,13 +423,17 @@ impl Upgrade {
                         |prototype| prototype.parking,
                     )
             });
+        let Ok(layout) = crate::map::building_parking::prepare_property_upgrade(sim, id, parking, residential)
+        else {
+            return;
+        };
         if !sim
             .map_mut()
             .update_growable_appearance(id, self.appearance)
         {
             return;
         }
-        crate::map::building_parking::refresh_property(sim, id, parking, residential);
+        crate::map::building_parking::commit_property_upgrade(sim, id, layout);
         if let Some(home) = self.home {
             sim.write::<Residences>().replace(id, home);
             sim.write::<BuildingInfos>().mark_vacancy_changed(id);

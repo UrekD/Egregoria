@@ -5,6 +5,8 @@ use simulation::map::{
     BuildingID, Density, LanePatternBuilder, MapProject, ProjectKind, ZoneCell, ZoneKind,
 };
 use simulation::souls::human::spawn_human;
+use simulation::map_dynamic::Destination;
+use simulation::transportation::Location;
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::{Simulation, SimulationOptions};
 use std::path::Path;
@@ -138,7 +140,50 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         summaries.len()
     );
     ctx.sample("property_opening");
-    ctx.run_ticks(220);
+    let (driver, home, car) = ctx.sim.world().humans.iter().find_map(|(driver, person)| {
+        let Location::Building(home) = person.location else { return None };
+        let parking = ctx.sim.building_parking(home)?;
+        (parking.kind == BuildingParkingKind::Driveway && parking.occupied != 0)
+            .then(|| Some((driver, home, person.router.personal_car?))).flatten()
+    }).ok_or("no tagged driver at an occupied driveway")?;
+    let garage = *sites.get(4).ok_or("missing tagged public garage")?;
+    ctx.sim.world_mut_unchecked().edit_human(driver, |person| {
+        person.router.go_to(Destination::Building(garage));
+    });
+    let mut occupied = false;
+    for _ in 0..4_000 {
+        ctx.sim.world_mut_unchecked().edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.run_ticks(1);
+        let person = &ctx.sim.world().humans[driver];
+        if person.location == Location::Building(garage) && ctx.sim.car_stored_inside_garage(car) {
+            occupied = true;
+            break;
+        }
+    }
+    if !occupied || ctx.sim.building_parking(home).is_none_or(|parking| parking.occupied != 0) {
+        return Err("tagged driver did not drive from the driveway to the public garage door".into());
+    }
+    ctx.sample("tagged_garage_arrival");
+    ctx.submit(&[WorldCommand::SetBuildingParkingOpen {
+        building: garage,
+        open: false,
+    }]);
+    let mut drained = false;
+    for _ in 0..5_000 {
+        ctx.sim.world_mut_unchecked().edit_human(driver, |person| person.decision.wait = u8::MAX);
+        ctx.run_ticks(1);
+        let person = &ctx.sim.world().humans[driver];
+        if person.location == Location::Building(home)
+            && ctx.sim.building_parking(garage).is_some_and(|parking| parking.occupied == 0)
+            && person.router.personal_car == Some(car)
+        {
+            drained = true;
+            break;
+        }
+    }
+    if !drained {
+        return Err("tagged driver did not retrieve the original car and return home".into());
+    }
     ctx.sample("property_live");
     Ok(())
 }

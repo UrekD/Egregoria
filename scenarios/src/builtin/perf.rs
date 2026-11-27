@@ -37,6 +37,7 @@ pub fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
 }
 
 pub fn run_10k(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    ctx.sim.use_curb_only_benchmark_parking();
     run_with_options(ctx, PERF_10K_OPTIONS)
 }
 
@@ -67,7 +68,14 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
     // perf_10k measures the 08:25–10:05 morning commute ramp in game time (fixed tick
     // counts, so the hourly passes at 09:00 and 10:00 fall inside the measured window).
     for (label, ticks) in [("setup", 0), ("warmup", 2_000), ("measured", 10_000)] {
-        ctx.run_ticks(ticks);
+        let workload = if label == "measured" && options.minimum_employment_percent.is_some() {
+            let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
+            ctx.run_ticks_observed(ticks, |sim| workload.observe(sim));
+            workload.finish(&ctx.sim)
+        } else {
+            ctx.run_ticks(ticks);
+            Default::default()
+        };
         let houses = ctx
             .sim
             .map()
@@ -76,7 +84,7 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
             .filter(|building| building.kind == BuildingKind::House)
             .count();
         let sample = if options.minimum_employment_percent.is_some() {
-            ctx.sample_perf(label, houses)
+            ctx.sample_perf_with_extra(label, houses, workload, false)
         } else {
             ctx.sample(label)
         };

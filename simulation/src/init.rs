@@ -428,10 +428,11 @@ fn register_property_parking() {
             name: "property_parking",
             optional: true,
             save: Box::new(|sim, output| {
-                Bincode::encode_writer(&sim.read::<DrivewayTraffic>().properties, output)
+                sim.read::<DrivewayTraffic>().properties.save(output)
             }),
             load: Box::new(|sim, data| {
-                sim.write::<DrivewayTraffic>().properties = Bincode::decode(data)?;
+                sim.write::<DrivewayTraffic>().properties =
+                    crate::map::building_parking::BuildingParking::load(data)?;
                 Ok(())
             }),
         });

@@ -23,6 +23,78 @@ pub const P99_MS_PER_TICK: &str = "p99_ms_per_tick";
 pub(crate) const P50_MS_PER_TICK: &str = "p50_ms_per_tick";
 pub(crate) const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
 
+pub(crate) struct ParkingWorkload {
+    initial_completed: u64,
+    initial_freight_completed: u64,
+    active_car_ticks: u64,
+    person_offers: u64,
+    freight_offers: u64,
+}
+
+impl ParkingWorkload {
+    pub(crate) fn new(sim: &Simulation) -> Self {
+        Self {
+            initial_completed: Self::completed(sim),
+            initial_freight_completed: Self::freight_completed(sim),
+            active_car_ticks: 0,
+            person_offers: 0,
+            freight_offers: 0,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, sim: &Simulation) {
+        use simulation::economy::TripPurpose;
+        let now = simulation::diagnostics::elapsed_tick(sim);
+        for human in sim.world().humans.values() {
+            if human.router.trip_start == Some(now) {
+                match human.router.trip_purpose {
+                    TripPurpose::FreightOutbound => self.freight_offers += 1,
+                    TripPurpose::FreightReturn => {}
+                    _ => self.person_offers += 1,
+                }
+            }
+            if human.router.personal_car
+                .and_then(|car| sim.world().vehicles.get(car))
+                .is_some_and(|vehicle| !vehicle.vehicle.state.is_parked())
+            {
+                self.active_car_ticks += 1;
+            }
+        }
+    }
+
+    pub(crate) fn finish(self, sim: &Simulation) -> BTreeMap<String, f64> {
+        [
+            ("active_personal_vehicle_ticks", self.active_car_ticks),
+            ("offered_person_trips", self.person_offers),
+            ("completed_person_trips", Self::completed(sim).saturating_sub(self.initial_completed)),
+            ("offered_freight_work", self.freight_offers),
+            ("completed_freight_work",
+                Self::freight_completed(sim).saturating_sub(self.initial_freight_completed)),
+        ].into_iter().map(|(key, count)| (key.to_owned(), count as f64)).collect()
+    }
+
+    fn completed(sim: &Simulation) -> u64 {
+        use simulation::economy::{DailyEconomyMetrics, TripPurpose, TripStats};
+        let trips = sim.read::<TripStats>();
+        let freight_trips: u64 = sim.read::<DailyEconomyMetrics>().days.values().map(|day| {
+            [TripPurpose::FreightOutbound, TripPurpose::FreightReturn].into_iter()
+                .filter_map(|purpose| day.trips_by_purpose.get(&purpose))
+                .map(|stats| stats.completed).sum::<u64>()
+        }).sum();
+        (trips.car.completed + trips.walk.completed + trips.transit.completed).saturating_sub(freight_trips)
+    }
+
+    fn freight_completed(sim: &Simulation) -> u64 {
+        use simulation::economy::{cargo::CargoBook, TICKS_PER_BUDGET_DAY};
+        let day = simulation::diagnostics::elapsed_tick(sim).0 / TICKS_PER_BUDGET_DAY;
+        let freight = sim.read::<CargoBook>();
+        (day.saturating_sub(2)..=day)
+            .filter_map(|day| freight.freight_day(day))
+            .map(|day| day.delivered_loads)
+            .sum()
+    }
+}
+
 const CHECKPOINT_INTERVAL: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -241,10 +313,6 @@ impl ScenarioCtx {
     /// Capture current world counts and tick throughput since the previous sample.
     pub fn sample(&mut self, label: &str) -> MetricSample {
         self.sample_with_extra(label, BTreeMap::new())
-    }
-
-    pub(crate) fn sample_perf(&mut self, label: &str, houses: usize) -> MetricSample {
-        self.sample_perf_with_extra(label, houses, BTreeMap::new(), false)
     }
 
     pub(crate) fn sample_perf_with_extra(
@@ -588,7 +656,7 @@ fn write_route_position(hash: &mut impl Hasher, pos: Vec3) {
 fn write_routing_step(hash: &mut impl Hasher, step: Option<&RoutingStep>) {
     match step {
         None => hash.write_u8(0),
-        Some(RoutingStep::WalkTo(pos)) => {
+        Some(RoutingStep::WalkTo(pos) | RoutingStep::WalkProperty(pos, _)) => {
             hash.write_u8(1);
             write_route_position(hash, *pos);
         }

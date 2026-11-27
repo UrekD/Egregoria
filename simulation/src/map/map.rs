@@ -1717,6 +1717,7 @@ impl Map {
         &self,
         kind: super::building_parking::GarageKind,
         entrance: super::CurbAnchor,
+        remaining: &mut usize,
     ) -> Result<
         (
             PreparedSpecialBuilding,
@@ -1725,10 +1726,28 @@ impl Map {
         crate::world_command::Rejection,
     > {
         use super::building_parking::{garage_footprint, prepare_public_garage};
+        use geom::Shape;
         use crate::world_command::Rejection;
+        let charge = |remaining: &mut usize, work| {
+            spend_water_work(remaining, work).map_err(|_| Rejection::WaterWorkLimit)
+        };
+        let road = self.get(entrance.road).ok_or(Rejection::MissingReference)?;
+        // The garage forms have fixed pad, sweep and land-sampling dimensions.
+        // Charge their fixed work and the variable road and overlap queries.
+        charge(remaining, 4_096 + 8 * road.interfaced_points().len())?;
         let (shape, mouth) =
             garage_footprint(self, kind, entrance).ok_or(Rejection::InvalidBuilding)?;
-        let road = self.get(entrance.road).ok_or(Rejection::MissingReference)?;
+        let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
+        for object in self.spatial_map.query(shape.bbox(), filter) {
+            let work = match object {
+                ProjectKind::Road(id) => self.roads.get(id).map_or(1, |road| road.points().len()),
+                ProjectKind::Intersection(id) => self.intersections.get(id).map_or(1, |joint| {
+                    128_usize.saturating_mul(joint.roads.len()).max(1)
+                }),
+                _ => 2,
+            };
+            charge(remaining, work)?;
+        }
         if super::special_placement::placement_overlap(self, road, shape).is_some() {
             return Err(Rejection::BuildingOverlap);
         }

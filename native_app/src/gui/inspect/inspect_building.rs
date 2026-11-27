@@ -58,6 +58,7 @@ pub(super) fn building_title(building: &Building) -> &'static str {
         BuildingKind::RailFreightStation(id) => &id.prototype().name,
         BuildingKind::TrainStation => "Train Station",
         BuildingKind::ExternalTrading => "External Trading",
+        BuildingKind::ParkingGarage(kind) => kind.label(),
     }
 }
 
@@ -909,6 +910,9 @@ fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
         }
         if !parking.open {
             label("Closed to arrivals");
+            if parking.missing_owners != 0 {
+                label(format!("Drain blocked · {} cars without owners", parking.missing_owners));
+            }
         }
         if uiw.can_author()
             && button_secondary(if parking.open {
@@ -924,10 +928,12 @@ fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
                 open: !parking.open,
             });
         }
-    } else if let Some((capacity, occupied)) = sim.building_curb_parking(building.id) {
+    } else if let Some(curb) = sim.building_curb_parking(building.id) {
+        label(format!("Curb bays nearby · {} occupied / {}", curb.occupied, curb.capacity));
+        label(format!("{} reserved · {} masked", curb.reserved, curb.masked));
         label(format!(
-            "Curb bays nearby · {} / {} unavailable",
-            occupied, capacity
+            "Serving curb {:?} · nearest bay {:.0}, {:.0}",
+            curb.road, curb.nearest_bay.x, curb.nearest_bay.y
         ));
     }
 }

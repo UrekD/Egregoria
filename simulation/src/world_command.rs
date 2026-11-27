@@ -1173,7 +1173,7 @@ impl WorldCommand {
         construction: BudgetCategory,
         water: &mut PrepareBudget,
     ) -> Option<Rejection> {
-        if let Err(reason) = self.guard_driveways(sim) {
+        if let Err(reason) = self.guard_driveways(sim, &mut water.remaining) {
             self.reject_unadmitted(sim, reason);
             return Some(reason);
         }
@@ -1889,8 +1889,8 @@ impl WorldCommand {
             return Err(error.unwrap_or_else(|error| Rejection::water_error(&error)));
         }
         let map = sim.map();
-        self.guard_driveways(sim)?;
         let mut budget = PrepareBudget::new(&[self], map.environment());
+        self.guard_driveways(sim, &mut budget.remaining)?;
         self.admitted(map.land_ownership().is_tiled(), &budget)?;
         drop(map);
         match self {
@@ -1986,7 +1986,7 @@ impl WorldCommand {
         }
     }
 
-    fn guard_driveways(&self, sim: &Simulation) -> Result<(), Rejection> {
+    fn guard_driveways(&self, sim: &Simulation, remaining: &mut usize) -> Result<(), Rejection> {
         use crate::transportation::DrivewayTraffic;
         use geom::AABB;
 
@@ -1994,15 +1994,32 @@ impl WorldCommand {
         if traffic.is_empty() {
             return Ok(());
         }
+        match self {
+            MapRemoveBuilding(id) => return if traffic.properties.busy(*id) {
+                Err(Rejection::BusyConflict)
+            } else {
+                Ok(())
+            },
+            MapLoadParis | MapLoadTestField { .. } => return Err(Rejection::BusyConflict),
+            MapRemoveRoad(_) | MapUpgradeRoad { .. } | MapRemoveIntersection(_)
+            | MapSetJunctionRules { .. } | MapUpdateIntersectionPolicy { .. }
+            | MapMakeConnection { .. } | MapMakeMultipleConnections(..)
+            | MapMakeWalkingPath { .. } | Terraform { .. }
+            | MapBuildSpecialBuilding { .. } | MapBuildHouse(_) => {}
+            _ => return Ok(()),
+        }
         let map = sim.map();
-        let protected = traffic.protected_roads(&map, matches!(self, MapRemoveRoad(_)));
+        let protected = traffic.protected_motion_roads(&map, remaining)
+            .map_err(|error| Rejection::water_error(&error))?;
+        let retire_vacant = matches!(self, MapRemoveRoad(_));
+        let protects = |road| protected.contains(&road) || traffic.properties.protects_road(road, retire_vacant);
         let touches_junction = |id| {
             map.get(id).is_some_and(|joint: &crate::map::Intersection| {
-                joint.roads.iter().any(|&road| protected.contains(&road))
+                joint.roads.iter().any(|&road| protects(road))
             })
         };
         let touches_road = |id| {
-            protected.contains(&id)
+            protects(id)
                 || map.get(id).is_some_and(|road: &crate::map::Road| {
                     touches_junction(road.src) || touches_junction(road.dst)
                 })
@@ -2022,8 +2039,17 @@ impl WorldCommand {
                 .expand(width),
             )
         };
+        if matches!(self, MapMakeConnection { .. } | MapMakeMultipleConnections(..)
+            | MapMakeWalkingPath { .. } | Terraform { .. } | MapBuildSpecialBuilding { .. }
+            | MapBuildHouse(_)) {
+            let checks = match self {
+                MapMakeMultipleConnections(_, links) => links.len(),
+                _ => 1,
+            };
+            crate::map::spend_water_work(remaining, traffic.site_count().saturating_mul(checks))
+                .map_err(|error| Rejection::water_error(&error))?;
+        }
         let blocked = match self {
-            MapRemoveBuilding(id) => traffic.properties.busy(*id),
             MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => touches_road(*road),
             MapRemoveIntersection(joint) => map
                 .get(*joint)
@@ -2079,7 +2105,6 @@ impl WorldCommand {
                 map.get(*lot)
                     .is_some_and(|lot| traffic.overlaps(&lot.shape.bbox()))
             }
-            MapLoadParis | MapLoadTestField { .. } => true,
             _ => false,
         };
         if blocked {
@@ -2148,8 +2173,10 @@ impl WorldCommand {
             }
             MapPlaceParkingGarage { kind, entrance } => {
                 let map = sim.map();
-                let (building, layout) = map.prepare_parking_garage(*kind, *entrance)?;
+                let (building, layout) = map.prepare_parking_garage(*kind, *entrance, &mut budget.remaining)?;
                 let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+                crate::map::spend_water_work(&mut budget.remaining, traffic.proof_site_count())
+                    .map_err(|error| Rejection::water_error(&error))?;
                 let parking = sim.read::<crate::map_dynamic::ParkingManagement>();
                 if traffic.overlaps_proof_pad(&layout.bounds())
                     || !traffic.properties.fits(&parking, &layout, None)

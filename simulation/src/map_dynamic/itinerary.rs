@@ -423,6 +423,25 @@ impl Itinerary {
         )
     }
 
+    pub(crate) fn property_walk(start: Vec3, end: Vec3, map: &Map) -> Option<Self> {
+        let local_sidewalk = |position: Vec3| {
+            let lane = map.nearest_lane(position, crate::map::LaneKind::Walking, Some(24.0))?;
+            (map.get(lane)?.points.project_dist2(position) <= 24.0_f32.powi(2)).then_some(lane)
+        };
+        let start_lane = local_sidewalk(start)?;
+        let end_lane = local_sidewalk(end)?;
+        Self::route_from_lanes(
+            start,
+            start_lane,
+            end_lane,
+            end,
+            ItineraryTarget::Position(end),
+            map,
+            PathKind::Pedestrian,
+            |start| PathKind::bounded_parking_walk(map, start, end_lane),
+        )
+    }
+
     pub(crate) fn route_between_lanes(
         tick: Tick,
         map: &Map,
@@ -482,6 +501,22 @@ impl Itinerary {
             ),
         };
 
+        Self::route_from_lanes(
+            start, start_lane, end_lane, end, target, map, pathkind,
+            |start| pathkind.path(map, tick, start, end_lane),
+        )
+    }
+
+    fn route_from_lanes(
+        start: Vec3,
+        start_lane: LaneID,
+        end_lane: LaneID,
+        end: Vec3,
+        target: ItineraryTarget,
+        map: &Map,
+        pathkind: PathKind,
+        path: impl FnOnce(Traversable) -> Option<Vec<Traversable>>,
+    ) -> Option<Itinerary> {
         let mut cur = Traversable::new(TraverseKind::Lane(start_lane), TraverseDirection::Forward);
 
         if start_lane == end_lane {
@@ -514,11 +549,8 @@ impl Itinerary {
             }
         }
 
-        let mut reversed_route: Vec<Traversable> = pathkind
-            .path(map, tick, cur, end_lane)?
-            .into_iter()
-            .rev()
-            .collect();
+        let mut reversed_route = path(cur)?;
+        reversed_route.reverse();
 
         reversed_route.pop(); // Remove start
 

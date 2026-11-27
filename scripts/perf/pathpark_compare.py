@@ -2,6 +2,7 @@
 """Compare three or more alternating PathPark stock performance pairs."""
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -9,6 +10,10 @@ import sys
 from pathlib import Path
 
 FIXTURES = ("perf_10k", "lesce_osm")
+OPENING_COUNTS = ("population", "personal_cars", "curb_occupied", "assigned_work")
+CORE_WORK = ("active_personal_vehicle_ticks", "offered_person_trips", "completed_person_trips")
+OTHER_WORK = ("offered_freight_work", "completed_freight_work",
+              "offered_service_work", "completed_service_work")
 
 
 def positive(value, label):
@@ -19,37 +24,104 @@ def positive(value, label):
     return value
 
 
-def score(artifacts, fixture, run, build):
+def count(value, label):
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def metric_count(value, label):
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return count(value, label)
+
+
+def digest(value, label):
+    if (not isinstance(value, str) or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)):
+        raise ValueError(f"{label} must be a SHA-256 digest")
+    return value
+
+
+def score(artifacts, fixture, run, build, pinned, cpu):
     stem = artifacts / f"{fixture}-{run}-{build}"
+    if int(stem.with_suffix(".status").read_text()) != 0:
+        raise ValueError(f"{stem} benchmark failed")
     payload = json.loads(stem.with_suffix(".json").read_text())
+    identity = json.loads(stem.with_suffix(".workload.json").read_text())
+    if (identity["fixture"], identity["run"], identity["build"]) != (fixture, run, build):
+        raise ValueError(f"{stem} has the wrong run identity")
+    if (identity["workers"], identity["cpu"]) != (1, cpu):
+        raise ValueError(f"{stem} must use the pinned CPU and one simulation worker")
+    inputs = pinned["inputs"][build]
+    keys = ["runner_sha256", "assets_sha256", "prototypes_sha256"]
+    if fixture == "lesce_osm":
+        keys.extend(("slot_sha256", "sidecar_sha256"))
+        if identity["slot_revision"] != inputs["slot_revision"]:
+            raise ValueError(f"{stem} has the wrong slot revision")
+    for key in keys:
+        if identity[key] != digest(inputs[key], key):
+            raise ValueError(f"{stem} has the wrong {key}")
+    # Tie the run sidecar to the exact timing report it describes.
+    if identity["report_sha256"] != hashlib.sha256(stem.with_suffix(".json").read_bytes()).hexdigest():
+        raise ValueError(f"{stem} workload sidecar belongs to another timing report")
+    for key in ("opening_sha256", "topology_sha256"):
+        if identity[key] != digest(pinned[key], key):
+            raise ValueError(f"{stem} has the wrong {key}")
+    for key in OPENING_COUNTS:
+        expected = count(pinned["opening"][key], key)
+        if expected == 0 or count(identity["opening"][key], key) != expected:
+            raise ValueError(f"{stem} has the wrong opening {key}")
+    for key in ("warmup_ticks", "measured_ticks"):
+        expected = count(pinned[key], key)
+        if expected == 0 or count(identity[key], key) != expected:
+            raise ValueError(f"{stem} has the wrong {key}")
     if fixture == "perf_10k":
-        samples = [row for row in payload[fixture] if row["label"] == "measured"]
-        if len(samples) != 1:
-            raise ValueError(f"{stem} must have exactly one measured sample")
-        sample = samples[0]
+        def phase(label):
+            samples = [row for row in payload[fixture] if row["label"] == label]
+            if len(samples) != 1:
+                raise ValueError(f"{stem} must have exactly one {label} sample")
+            return samples[0]
+
+        setup, warmup, sample = (phase(label) for label in ("setup", "warmup", "measured"))
+        if (warmup["tick"] - setup["tick"], sample["tick"] - warmup["tick"]) != (2_000, 10_000):
+            raise ValueError(f"{stem} did not run the stock Paris windows")
+        if (identity["warmup_ticks"], identity["measured_ticks"]) != (2_000, 10_000):
+            raise ValueError(f"{stem} has the wrong Paris workload windows")
     else:
         sample = payload
         if (sample["slot"], sample["workers"]) != (fixture, 1):
             raise ValueError(f"{stem} is not Lesce on one simulation worker")
+        if any(sample[key] != identity[key] for key in ("warmup_ticks", "measured_ticks")):
+            raise ValueError(f"{stem} timing report disagrees with its workload windows")
+
     extra = sample["extra"]
+    workload = {}
+    for key in CORE_WORK + OTHER_WORK:
+        floor = count(pinned["workload_floors"][key], key)
+        actual = metric_count(extra[key], key)
+        if (key in CORE_WORK and floor == 0) or actual < floor or (floor == 0 and actual != 0):
+            raise ValueError(f"{stem} violates the frozen workload floor for {key}")
+        workload[key] = actual
     return {
         "median_ticks_per_sec": positive(extra["median_ticks_per_sec"], stem),
         "p99_ms_per_tick": positive(extra["p99_ms_per_tick"], stem),
         "wall_ticks_per_sec": positive(sample["ticks_per_sec"], stem),
         "rss_kib": positive(int(stem.with_suffix(".rss-kib").read_text()), stem),
-        "activity": positive(extra["active_vehicles"], stem),
-        "opening": tuple(sample.get(k) for k in (
-            "initial_agents", "initial_population", "warmup_ticks", "measured_ticks",
-            "persons_per_agent", "lot_layout",
-        )),
-        "status": int(stem.with_suffix(".status").read_text()),
+        "workload": workload,
     }
+
+
+def equivalent_work(parent, candidate):
+    return all(abs(candidate[key] - baseline) * 100 <= baseline * 2
+               for key, baseline in parent.items())
 
 
 def compare(manifest, artifacts):
     pairs = manifest["pairs"]
     if type(pairs) is not int or pairs < 3:
         raise ValueError("at least three complete pairs are required")
+    cpu = count(manifest["cpu"], "cpu")
     verdict = {}
     failed = []
     for fixture in FIXTURES:
@@ -59,28 +131,33 @@ def compare(manifest, artifacts):
         parent = []
         candidate = []
         for pair in range(1, pairs + 1):
-            master = score(artifacts, fixture, pair, "parent")
-            wave = score(artifacts, fixture, pair, "candidate")
-            if master["opening"] != wave["opening"] or master["activity"] != wave["activity"]:
+            master = score(artifacts, fixture, pair, "parent", ceilings, cpu)
+            wave = score(artifacts, fixture, pair, "candidate", ceilings, cpu)
+            if not equivalent_work(master["workload"], wave["workload"]):
                 failed.append(f"{fixture} pair {pair} did not match the recorded workload")
             if wave["p99_ms_per_tick"] > tail_limit or wave["rss_kib"] > rss_limit:
                 failed.append(f"{fixture} pair {pair} exceeded a frozen tail or RSS ceiling")
-            if fixture == "lesce_osm" and (wave["status"] or master["status"]):
-                failed.append(f"{fixture} pair {pair} benchmark failed")
             parent.append(master["median_ticks_per_sec"])
             candidate.append(wave["median_ticks_per_sec"])
+            if fixture == "perf_10k" and pair == 1:
+                absolute = score(artifacts, fixture, "absolute", "candidate", ceilings, cpu)
+                if (absolute["median_ticks_per_sec"] < 150.0
+                        or absolute["p99_ms_per_tick"] > tail_limit
+                        or absolute["rss_kib"] > rss_limit
+                        or not equivalent_work(master["workload"], absolute["workload"])):
+                    failed.append("perf_10k independent absolute gate failed")
+            verdict.setdefault(fixture, {}).setdefault("wall_ticks_per_sec", []).append({
+                "parent": master["wall_ticks_per_sec"], "candidate": wave["wall_ticks_per_sec"],
+            })
         ratio = statistics.median(candidate) / statistics.median(parent)
-        verdict[fixture] = {
+        verdict[fixture].update({
             "parent_median": statistics.median(parent),
             "candidate_median": statistics.median(candidate),
             "ratio": ratio,
             "pairs": [wave / master for master, wave in zip(parent, candidate)],
-        }
+        })
         if ratio < 0.97:
             failed.append(f"{fixture} throughput is below 97% of master")
-    absolute = score(artifacts, "perf_10k", "absolute", "candidate")
-    if absolute["status"] != 0 or absolute["median_ticks_per_sec"] < 150.0:
-        failed.append("perf_10k independent absolute gate failed")
     return {"qualified": not failed, "fixtures": verdict, "failures": failed}
 
 

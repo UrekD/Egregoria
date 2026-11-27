@@ -883,6 +883,7 @@ impl Simulation {
                     WorldCommand::MapUpgradeRoad { .. }
                         | WorldCommand::MapSetJunctionRules { .. }
                         | WorldCommand::MapMakeWalkingPath { .. }
+                        | WorldCommand::MapPlaceParkingGarage { .. }
                 )
             })
         {
