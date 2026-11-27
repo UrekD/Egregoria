@@ -558,7 +558,7 @@ impl EntitySamples {
             }
         }
         for (id, v) in world.vehicles.iter() {
-            if v.vehicle.kind == VehicleKind::Car
+            if matches!(v.vehicle.kind, VehicleKind::Car)
                 && v.vehicle.state.is_parked()
                 && v.it.is_property_stored()
                 && sim.car_stored_inside_garage(id)
@@ -674,7 +674,7 @@ mod tests {
 
         let replacement = Map::empty();
         capture.replace_source(&replacement);
-        let latest = capture.capture(&replacement).unwrap();
+        let latest = capture.capture(&replacement, Map::render_snapshot).unwrap();
         assert!(latest.full_refresh);
         assert_eq!(
             (latest.generation, latest.base_epoch, latest.target_epoch),
