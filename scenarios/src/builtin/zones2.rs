@@ -706,23 +706,30 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         run_teardown_batch(live, &close, 1)?;
     }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
-    let staging_deadline = elapsed(&live.sim) + 6 * TICKS_PER_HOUR;
-    while !stage_teardown_hires(live)? {
-        if elapsed(&live.sim) >= staging_deadline {
-            return Err("staffed teardown needs a removable home for Mixed Use workers".into());
+    let mut next_stage = elapsed(&live.sim);
+    let staging_deadline = next_stage + 6 * TICKS_PER_HOUR;
+    let mut staged = 0;
+    let (roads, affected) = loop {
+        let missing = match staffed_teardown_frontage(&live.sim) {
+            Ok(frontage) => break frontage,
+            Err(missing) => missing,
+        };
+        let now = elapsed(&live.sim);
+        if now >= staging_deadline {
+            return Err(format!("{missing} after {staged} worker housing changes"));
         }
-        // A home with a departing car becomes removable only after rear clearance.
-        live.run_ticks(32);
-    }
-    let mut frontage = staffed_teardown_frontage(&live.sim);
-    for _ in 0..TICKS_PER_HOUR {
-        if frontage.is_ok() {
-            break;
+        if staged < 4 && now >= next_stage {
+            // A match can appear on the same tick as demolition or after the
+            // replacement house submits its first applications.
+            let changed = stage_teardown_hires(live)?;
+            staged += usize::from(changed);
+            next_stage = elapsed(&live.sim) + if changed { TICKS_PER_HOUR } else { 32 };
+            if changed {
+                continue;
+            }
         }
         live.run_ticks(1);
-        frontage = staffed_teardown_frontage(&live.sim);
-    }
-    let (roads, affected) = frontage?;
+    };
     let (endpoints, parcels) = {
         let map = live.sim.map();
         let endpoints: Vec<_> = roads
@@ -1016,6 +1023,9 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
         .lot_origin(home)
         .ok_or("hire staging house has no parcel")?;
     run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)?;
+    if staffed_teardown_frontage(&ctx.sim).is_ok() {
+        return Ok(true);
+    }
 
     // Refill the cleared parcel via the checked housing flow. Its new residents
     // submit ordinary job applications near the vacancy just advertised.
