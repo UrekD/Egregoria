@@ -2,7 +2,7 @@ use common::{FastMap, FastSet};
 use engine::{Context, LampLights, LightChunkID};
 use flat_spatial::AABBGrid;
 use geom::{Vec3, AABB3, V3};
-use simulation::map::{Map, ProjectFilter, ProjectKind, SubscriberChunkID};
+use simulation::map::{ProjectFilter, ProjectKind, RenderMap, SubscriberChunkID};
 
 pub struct LampsRender {
     lamp_memory: FastMap<LightChunkID, Vec<Vec3>>,
@@ -19,53 +19,53 @@ impl LampsRender {
         }
     }
 
-    pub(super) fn stage_chunk(&mut self, map: &Map, chunk: SubscriberChunkID) {
+    pub(super) fn stage_chunk(&mut self, map: &RenderMap, chunk: SubscriberChunkID) {
         let mut by_chunk: AABBGrid<(), AABB3> = AABBGrid::new(LampLights::LIGHTCHUNK_SIZE as i32);
 
-            let mut add_light = |p: Vec3| {
-                by_chunk.insert(AABB3::centered(p, Vec3::splat(64.0)), ());
-            };
+        let mut add_light = |p: Vec3| {
+            by_chunk.insert(AABB3::centered(p, Vec3::splat(64.0)), ());
+        };
 
-            let mut chunk_roads = vec![];
-            let mut chunk_inter = vec![];
+        let mut chunk_roads = vec![];
+        let mut chunk_inter = vec![];
 
-            map.spatial_map()
-                .query(chunk.bbox(), ProjectFilter::ROAD | ProjectFilter::INTER)
-                .for_each(|proj| {
-                    if SubscriberChunkID::new(proj.canonical_position(map)) != chunk {
-                        return;
-                    }
-                    match proj {
-                        ProjectKind::Road(rid) => chunk_roads.push(rid),
-                        ProjectKind::Intersection(iid) => chunk_inter.push(iid),
-                        _ => unreachable!(),
-                    }
-                });
-
-            let roads = map.roads();
-            let inters = map.intersections();
-
-            for road in chunk_roads {
-                let road = &roads[road];
-                if road.lanes_iter().all(|(_, kind)| kind.is_rail()) {
-                    continue;
+        map.spatial_map()
+            .query(chunk.bbox(), ProjectFilter::ROAD | ProjectFilter::INTER)
+            .for_each(|proj| {
+                if SubscriberChunkID::new(map.canonical_position(proj)) != chunk {
+                    return;
                 }
-                for (point, _) in road.points().equipoints_dir(45.0, true) {
-                    add_light(point + 8.0 * V3::Z);
+                match proj {
+                    ProjectKind::Road(rid) => chunk_roads.push(rid),
+                    ProjectKind::Intersection(iid) => chunk_inter.push(iid),
+                    _ => unreachable!(),
                 }
+            });
+
+        let roads = map.roads();
+        let inters = map.intersections();
+
+        for road in chunk_roads {
+            let road = &roads[road];
+            if road.lanes_iter().all(|(_, kind)| kind.is_rail()) {
+                continue;
             }
-            for i in chunk_inter {
-                let i = &inters[i];
-                if i.roads
-                    .iter()
-                    .filter_map(|&rid| map.roads().get(rid))
-                    .all(|r| r.lanes_iter().all(|(_, kind)| kind.is_rail()))
-                {
-                    continue;
-                }
-
-                add_light(i.pos + 8.0 * V3::Z);
+            for (point, _) in road.points().equipoints_dir(45.0, true) {
+                add_light(point + 8.0 * V3::Z);
             }
+        }
+        for i in chunk_inter {
+            let i = &inters[i];
+            if i.roads
+                .iter()
+                .filter_map(|&rid| map.roads().get(rid))
+                .all(|r| r.lanes_iter().all(|(_, kind)| kind.is_rail()))
+            {
+                continue;
+            }
+
+            add_light(i.pos + 8.0 * V3::Z);
+        }
 
         let mut lights = Vec::new();
         for (&(x, y), cell) in &by_chunk.storage().cells {

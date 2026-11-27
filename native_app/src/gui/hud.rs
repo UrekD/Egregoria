@@ -42,12 +42,6 @@ pub(crate) fn capture_problem_markers(
     problem_icons::capture(sim, camera, generation, map_epoch)
 }
 
-/// Panels that resolve live detail or author commands are built at a
-/// simulation boundary. The ordinary HUD consumes owned display inputs.
-pub(crate) fn needs_world_widgets(uiw: &UiWorld, sim: &Simulation) -> bool {
-    needs_live_world(uiw) || (session::world_interaction(uiw) && chat::needs_world(uiw, sim))
-}
-
 pub(crate) fn needs_live_world(uiw: &UiWorld) -> bool {
     if !session::playing(uiw) {
         return true;
@@ -67,7 +61,6 @@ pub(crate) fn needs_live_world(uiw: &UiWorld) -> bool {
     let panel_shortcut = [
         crate::inputmap::InputAction::OpenEconomyMenu,
         crate::inputmap::InputAction::OpenDebugMenu,
-        crate::inputmap::InputAction::OpenChat,
     ]
     .iter()
     .any(|action| input.just_act.contains(action));
@@ -125,8 +118,8 @@ pub(crate) fn render_newgui(
             return;
         }
         demand_bars::render(&hud.demand);
+        yakui::column(|| chat::render(uiworld, &hud.chat));
         if let Some(sim) = sim {
-            chat::chat(uiworld, sim);
             new_inspector(uiworld, sim);
             let mut gui = uiworld.write::<GuiState>();
             let show_unfinished_ui = gui.show_unfinished_ui;

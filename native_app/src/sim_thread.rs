@@ -20,9 +20,9 @@ use simulation::{Simulation, SimulationReplayLoader, SlotCapture};
 
 use crate::automation::{FixtureOp, FixtureOutcome};
 use crate::gui::traffic_repair::TrafficEditReceipt;
-use crate::rendering::world_snapshot::{SnapshotSource, ViewRequest, WorldUpdate};
+use crate::rendering::world_snapshot::{CaptureWork, SnapshotSource, ViewRequest, WorldUpdate};
 use crate::session::{save_coordinator::SavePermit, CityProgress};
-use engine::frame_profile::SimWaitTotals;
+use engine::frame_profile::SimWorkTotals;
 
 pub(crate) const BATCH_BYTES: usize = 256 * 1024;
 const BATCH_COMMANDS: usize = 256;
@@ -379,6 +379,11 @@ pub(crate) struct WorldView {
     reader_wait_ns: AtomicU64,
     redraw_wait_ns: AtomicU64,
     max_idle_ns: AtomicU64,
+    worker_snapshot_ns: AtomicU64,
+    client_snapshot_ns: AtomicU64,
+    actor_scans: AtomicU64,
+    actor_buffer_grows: AtomicU64,
+    actor_pool_bytes: AtomicU64,
 }
 
 #[derive(Default)]
@@ -419,6 +424,11 @@ impl WorldView {
             reader_wait_ns: AtomicU64::new(0),
             redraw_wait_ns: AtomicU64::new(0),
             max_idle_ns: AtomicU64::new(0),
+            worker_snapshot_ns: AtomicU64::new(0),
+            client_snapshot_ns: AtomicU64::new(0),
+            actor_scans: AtomicU64::new(0),
+            actor_buffer_grows: AtomicU64::new(0),
+            actor_pool_bytes: AtomicU64::new(0),
         }
     }
 
@@ -431,11 +441,16 @@ impl WorldView {
         self.profile_waits.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn wait_totals(&self) -> SimWaitTotals {
-        SimWaitTotals {
+    pub(crate) fn work_totals(&self) -> SimWorkTotals {
+        SimWorkTotals {
             read_lease_ns: self.reader_wait_ns.load(Ordering::Relaxed),
             redraw_turn_ns: self.redraw_wait_ns.load(Ordering::Relaxed),
             max_idle_ns: self.max_idle_ns.load(Ordering::Relaxed),
+            worker_snapshot_ns: self.worker_snapshot_ns.load(Ordering::Relaxed),
+            client_snapshot_ns: self.client_snapshot_ns.load(Ordering::Relaxed),
+            actor_scans: self.actor_scans.load(Ordering::Relaxed),
+            actor_buffer_grows: self.actor_buffer_grows.load(Ordering::Relaxed),
+            actor_pool_bytes: self.actor_pool_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -448,13 +463,32 @@ impl WorldView {
         mailbox.source.take()
     }
 
+    fn snapshot_timer(&self) -> Option<Instant> {
+        self.profile_waits
+            .load(Ordering::Relaxed)
+            .then(Instant::now)
+    }
+
+    fn record_capture(&self, start: Option<Instant>, counter: &AtomicU64, work: CaptureWork) {
+        if let Some(start) = start {
+            counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if work.actor_scan {
+                self.actor_scans.fetch_add(1, Ordering::Relaxed);
+                self.actor_buffer_grows
+                    .fetch_add(work.buffer_grows, Ordering::Relaxed);
+                self.actor_pool_bytes
+                    .store(work.actor_pool_bytes as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub(crate) fn capture_map(&self, sim: &Simulation, generation: u64) -> u64 {
         let replaced = self.render_replaced.swap(false, Ordering::Relaxed);
-        self.snapshots
-            .lock()
-            .unwrap()
-            .source
-            .capture_map(sim, generation, replaced)
+        let mut mailbox = self.snapshots.lock().unwrap();
+        let start = self.snapshot_timer();
+        let epoch = mailbox.source.capture_map(sim, generation, replaced);
+        self.record_capture(start, &self.client_snapshot_ns, CaptureWork::default());
+        epoch
     }
 
     pub(crate) fn capture_render(
@@ -468,9 +502,11 @@ impl WorldView {
         let mut mailbox = self.snapshots.lock().unwrap();
         mailbox.request = None;
         self.sample_requested.store(false, Ordering::Relaxed);
-        mailbox
+        let start = self.snapshot_timer();
+        let work = mailbox
             .source
             .capture_view(sim, boundary, request, paused, force);
+        self.record_capture(start, &self.client_snapshot_ns, work);
         mailbox.source.take()
     }
 
@@ -486,12 +522,14 @@ impl WorldView {
         };
         self.sample_requested.store(false, Ordering::Relaxed);
         let replaced = self.render_replaced.swap(false, Ordering::Relaxed);
+        let start = self.snapshot_timer();
         mailbox
             .source
             .capture_map(sim, boundary.generation, replaced);
-        mailbox
+        let work = mailbox
             .source
             .capture_view(sim, boundary, request, false, false);
+        self.record_capture(start, &self.worker_snapshot_ns, work);
     }
 
     /// Call with the frame's read lease to observe a replacement before drawing.

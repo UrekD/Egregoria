@@ -11,7 +11,7 @@ use crate::map::{
     LaneScoringPilot, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID,
     ParkingSpots, PreparedBuilding, PreparedEffects, PreparedGrowableAppearance,
     PreparedTopologyEdit, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap,
-    SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType, WaterEditError, Zone,
+    SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType, WaterEditError, Zone, ZoneCell,
     MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
@@ -174,11 +174,42 @@ pub struct Map {
 /// A detached, read-only source for presentation geometry.
 pub struct RenderMap(Map);
 
-impl Deref for RenderMap {
-    type Target = Map;
+impl RenderMap {
+    pub fn environment(&self) -> &Environment {
+        self.0.environment()
+    }
 
-    fn deref(&self) -> &Map {
-        &self.0
+    pub fn spatial_map(&self) -> &SpatialMap {
+        self.0.spatial_map()
+    }
+
+    pub fn roads(&self) -> &Roads {
+        self.0.roads()
+    }
+
+    pub fn lanes(&self) -> &Lanes {
+        self.0.lanes()
+    }
+
+    pub fn intersections(&self) -> &Intersections {
+        self.0.intersections()
+    }
+
+    pub fn buildings(&self) -> &Buildings {
+        self.0.buildings()
+    }
+
+    pub fn lots(&self) -> &Lots {
+        self.0.lots()
+    }
+
+    pub fn canonical_position(&self, object: ProjectKind) -> Vec2 {
+        object.canonical_position(&self.0)
+    }
+
+    pub fn check_growable_lot(&self, lot: &Lot, zone: ZoneCell) -> Result<(), GrowableLotError> {
+        // The footprint and initial form use only pinned map geometry.
+        crate::souls::growth::check_growable_lot(&self.0, lot, zone).map(|_| ())
     }
 }
 

@@ -2,7 +2,7 @@ use crate::uiworld::UiWorld;
 use engine::{AudioContext, AudioKind, Gain, GainControl};
 use geom::{lerp, Camera, Vec2, AABB};
 use oddio::{Cycle, Mixed};
-use simulation::map::Map;
+use simulation::map::RenderMap;
 
 /// Ambient sounds
 /// These are sounds that are played in the background
@@ -34,7 +34,7 @@ impl Ambient {
         Self { wind, forest }
     }
 
-    pub fn update(&mut self, map: &Map, uiworld: &UiWorld) {
+    pub fn update(&mut self, map: &RenderMap, uiworld: &UiWorld) {
         let eye = uiworld.read::<Camera>().eye();
 
         let h = eye.z;

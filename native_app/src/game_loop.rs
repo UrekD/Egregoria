@@ -185,6 +185,7 @@ struct WorldInputSample {
     input: WorldInput,
     pointer: engine::PointerFrame,
     ray: Option<geom::Ray3>,
+    vehicle_hit: Option<gui::selectable::VehicleHit>,
     press_events: Vec<egui::Event>,
     tool: Tool,
     company: Option<prototypes::GoodsCompanyID>,
@@ -389,14 +390,15 @@ impl engine::framework::State for State {
         let view_input = !scripted && self.prepare_input(ctx, false);
         self.update_warp();
         let at_max = driver_view.is_some() && self.sent_warp == MAX_WARP;
+        let live_widgets = self.needs_live_presentation();
         let mut frame_only = false;
         let mut reserve_read = true;
-        if surface_ready && at_max {
+        if surface_ready && at_max && !live_widgets {
             if let Some(automation) = &mut self.automation {
                 frame_only = automation
                     .advance_frame_wait(ctx, &self.uiw)
                     .unwrap_or_else(|error| crate::automation::fail(&error));
-            } else if !self.needs_live_world_at_max(ctx) {
+            } else if !self.needs_live_input_at_max(ctx) {
                 // Audio and hover still get a periodic live sample. A missed
                 // opportunistic sample leaves ordinary MAX redraws independent.
                 let age = self.last_live_ui.map(|at| at.elapsed());
@@ -457,7 +459,7 @@ impl engine::framework::State for State {
             if let Some((_, step, Some(at))) = self.sampled_step.filter(|s| s.0 == generation) {
                 profile.record_sim(at, generation, step, self.uiw.read::<Settings>().time_warp);
                 if let Some(view) = &driver_view {
-                    profile.record_sim_waits(view.wait_totals());
+                    profile.record_sim_work(view.work_totals());
                 }
             }
         }
@@ -477,15 +479,15 @@ impl engine::framework::State for State {
             }
         }
         if surface_ready {
+            let owned_fallback = frame_only
+                || !reserve_read
+                || (!at_max && !acquired && !scripted && self.prepared.is_some());
             let map_start = ctx.gfx.profile_timer();
             self.prepare_map(ctx);
             ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
             if let Some(frame) = captured {
                 self.present_captured(ctx, frame);
-            } else if frame_only
-                || !reserve_read
-                || (!at_max && !acquired && !scripted && self.prepared.is_some())
-            {
+            } else if can_present_owned(owned_fallback, live_widgets) {
                 self.present_captured(
                     ctx,
                     CapturedFrame {
@@ -511,6 +513,12 @@ impl engine::framework::State for State {
     }
 }
 
+fn can_present_owned(available: bool, live_widgets: bool) -> bool {
+    // Yakui receives events against the last tree. Rebuilding a reduced tree
+    // here would drop latched clicks and focus from live widgets.
+    available && !live_widgets
+}
+
 impl State {
     fn view_request(&self) -> ViewRequest {
         ViewRequest {
@@ -519,7 +527,14 @@ impl State {
         }
     }
 
-    fn needs_live_world_at_max(&self, ctx: &Context) -> bool {
+    fn needs_live_presentation(&self) -> bool {
+        *self.uiw.read::<gui::overlays::OverlayMode>() != gui::overlays::OverlayMode::Off
+            || self.uiw.read::<DebugObjs>().has_unselected_overlay()
+            || self.uiw.read::<VehicleHover>().has_hit()
+            || gui::needs_live_world(&self.uiw)
+    }
+
+    fn needs_live_input_at_max(&self, ctx: &Context) -> bool {
         let pointer = ctx.input.pointer_frame(ctx.egui.last_mouse_captured);
         !self.deferred_input.is_empty()
             || pointer.interrupted
@@ -530,10 +545,7 @@ impl State {
             || !self.uiw.read::<InputMap>().just_act.is_empty()
             || land_tiles::shortcut_pending(&self.uiw)
             || self.uiw.read::<FollowEntity>().0.is_some()
-            || self.uiw.read::<VehicleHover>().has_hit()
-            || *self.uiw.read::<gui::overlays::OverlayMode>() != gui::overlays::OverlayMode::Off
-            || self.uiw.read::<DebugObjs>().has_unselected_overlay()
-            || gui::needs_live_world(&self.uiw)
+            || gui::chat::pending(&self.uiw)
     }
 
     fn accept_render_update(&mut self, update: WorldUpdate) {
@@ -560,6 +572,8 @@ impl State {
             crate::inputmap::reset_deck_picker_cache();
             gui::overlays::reset_world_cache();
             gui::selectable::VehiclePicker::reset(&self.uiw, generation);
+            *self.uiw.write::<VehicleHover>() = VehicleHover::default();
+            self.deferred_input.clear();
             self.all_audio.reset_world();
         }
         let epoch = if let Some(view) = driver_view {
@@ -621,20 +635,20 @@ impl State {
             && !self.uiw.read::<SessionState>().interaction_blocked)
             .then(|| self.all_audio.capture(sim, &self.uiw));
         gui::observe_hud(&self.uiw, sim);
-        let hover = self.update_vehicle_hover(sim);
-        let gui = (hover || self.driver.is_none() || gui::needs_world_widgets(&self.uiw, sim))
-            .then(|| {
-                let view = self.views.latest().unwrap().clone();
-                let width = Self::yakui_width(ctx);
-                ctx.prepare_gui(
-                    self,
-                    |state, ui, gfx| {
-                        state.render_world_gui(ui, sim);
-                        state.draw_profile_panel(ui, gfx);
-                    },
-                    |state| state.render_world_yakui(Some(sim), Some(&view.hud), world_draw, width),
-                )
-            });
+        let hover = self.update_vehicle_hover(ctx, sim, generation);
+        let gui = (hover || self.driver.is_none() || gui::needs_live_world(&self.uiw)).then(|| {
+            let view = self.views.latest().unwrap().clone();
+            let width = Self::yakui_width(ctx);
+            ctx.prepare_gui(
+                self,
+                |state, ui, gfx| {
+                    state.render_world_gui(ui, sim);
+                    state.draw_profile_panel(ui, gfx);
+                },
+                |state| state.render_world_yakui(Some(sim), Some(&view.hud), world_draw, width),
+            )
+        });
+        gui::chat::submit_pending(&self.uiw, *sim.read::<GameTime>());
         if commands_observed {
             *self.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
         }
@@ -646,29 +660,19 @@ impl State {
         })
     }
 
-    fn update_vehicle_hover(&self, sim: &Simulation) -> bool {
-        let input = self.uiw.read::<InputMap>();
+    fn update_vehicle_hover(&self, ctx: &Context, sim: &Simulation, generation: u64) -> bool {
+        let screen = ctx.input.mouse.screen;
         let mut hover = self.uiw.write::<VehicleHover>();
         if matches!(*self.uiw.read::<Tool>(), Tool::Hand | Tool::RoadEditor)
             && session::world_interaction(&self.uiw)
             && !self.uiw.read::<GuiState>().hidden
             && self.uiw.can_author()
-            && !goryak::pointer_over_ui(input.screen.x, input.screen.y)
+            && !ctx.egui.last_mouse_captured
+            && !goryak::pointer_over_ui(screen.x, screen.y)
         {
-            let mut picker = self.uiw.write::<gui::selectable::VehiclePicker>();
-            hover.update(&mut picker, sim, &input, Instant::now(), |picker| {
-                if let Some(picker) = picker {
-                    if !picker.start_snapshot(sim) {
-                        return;
-                    }
-                    for (id, vehicle) in &sim.world().vehicles {
-                        picker.index_road(id, vehicle);
-                    }
-                    for (id, wagon) in &sim.world().wagons {
-                        picker.index_wagon(id, wagon);
-                    }
-                }
-            });
+            let picker = self.uiw.read::<gui::selectable::VehiclePicker>();
+            let ray = picker.displayed_ray(screen, generation);
+            hover.update_displayed(&picker, sim, ray, generation, Instant::now());
             hover.has_hit()
         } else {
             *hover = VehicleHover::default();
@@ -687,6 +691,7 @@ impl State {
     }
 
     fn reset_render_source(&mut self) {
+        *self.uiw.write::<gui::chat::GUIChatState>() = Default::default();
         self.local_snapshot = SnapshotSource::default();
         self.pending_map = None;
         self.staged_map = None;
@@ -731,8 +736,7 @@ impl State {
                         .map(|(chunk, _)| (chunk.convert_up(), UpdateType::all()))
                         .collect();
                     for &object in input.source.spatial_map().objects() {
-                        let chunk =
-                            SubscriberChunkID::new(object.canonical_position(&input.source));
+                        let chunk = SubscriberChunkID::new(input.source.canonical_position(object));
                         input.affected_chunks.insert(chunk, UpdateType::all());
                     }
                 }
@@ -799,9 +803,10 @@ impl State {
     fn present_captured(&mut self, ctx: &mut Context, frame: CapturedFrame) {
         let renderers = self.prepared.as_ref().zip(self.map_renderer.as_mut());
         if let Some((prepared, renderer)) = renderers {
-            renderer.set_overlay_preview(&mut ctx.gfx, None);
             if let Some(ground) = frame.ground {
                 ground.apply(renderer, &mut ctx.gfx);
+            } else {
+                renderer.set_overlay_preview(&mut ctx.gfx, None);
             }
             ctx.gfx.set_time(prepared.view.hud.time.timestamp as f32);
             if self.startup.is_none() && !self.uiw.read::<SessionState>().interaction_blocked {
@@ -888,6 +893,7 @@ impl State {
                 .read::<InputMap>()
                 .just_act
                 .contains(&InputAction::HideInterface);
+            gui::chat::open_from_input(&self.uiw);
         }
 
         view_input
@@ -1000,12 +1006,22 @@ impl State {
     fn sample_world_input(&self, ctx: &mut Context) -> WorldInputSample {
         let pointer = engine::pointer_frame();
         let camera = self.uiw.camera().camera;
+        let tool = *self.uiw.read::<Tool>();
+        let generation = self.uiw.read::<SessionState>().generation;
+        let input = self.uiw.read::<InputMap>();
+        let picker = self.uiw.read::<gui::selectable::VehiclePicker>();
         let ray = if pointer.blocked || ctx.egui.last_mouse_captured {
             None
+        } else if tool == Tool::Hand {
+            picker.displayed_ray(ctx.input.mouse.screen, generation)
         } else {
             camera.unproj_ray(ctx.input.mouse.screen)
         };
-        let tool = *self.uiw.read::<Tool>();
+        let vehicle_hit = if tool == Tool::Hand && input.just_act.contains(&InputAction::Select) {
+            ray.and_then(|ray| picker.pick_displayed(ray, generation))
+        } else {
+            None
+        };
         let press_events = if tool == Tool::Bulldozer {
             ctx.egui
                 .platform
@@ -1020,10 +1036,11 @@ impl State {
             Vec::new()
         };
         WorldInputSample {
-            generation: self.uiw.read::<SessionState>().generation,
-            input: self.uiw.read::<InputMap>().world_input(),
+            generation,
+            input: input.world_input(),
             pointer,
             ray,
+            vehicle_hit,
             press_events,
             tool,
             company: self.placement_company(tool),
@@ -1063,7 +1080,11 @@ impl State {
                 .write::<gui::bulldozer::BulldozerState>()
                 .record_press_order(&sample.press_events);
         }
+        if tool == Tool::Hand {
+            self.uiw.write::<gui::selectable::VehiclePicker>().hand_hit = Some(sample.vehicle_hit);
+        }
         gui::run_ui_systems(sim, &self.uiw);
+        self.uiw.write::<gui::selectable::VehiclePicker>().hand_hit = None;
     }
 
     fn draw_prepared(&mut self, ctx: &mut FrameContext<'_>, world_draw: bool) {
@@ -1104,8 +1125,16 @@ impl State {
             selected: self.uiw.read::<gui::InspectedEntity>().e,
             followed: self.uiw.read::<FollowEntity>().0,
         };
-        self.instanced_renderer
-            .render(view, self.views.previous_for(view), selection, ctx);
+        let mut picker = self.uiw.write::<gui::selectable::VehiclePicker>();
+        let displayed = picker.record_displayed(view.stamp, camera, prepared.map.clone());
+        self.instanced_renderer.render(
+            view,
+            self.views.previous_for(view),
+            selection,
+            displayed,
+            ctx,
+        );
+        drop(picker);
         ctx.gfx
             .profile_elapsed(CpuPhase::Instances, instances_start);
         {
@@ -2686,12 +2715,62 @@ mod p4_fix_esc_tests {
     }
 
     #[test]
+    fn client_max_missed_lease_preserves_confirm_button_release() {
+        use yakui::event::Event;
+        use yakui::input::MouseButton;
+        use yakui::{Rect, Vec2, Yakui};
+
+        let mut yak = Yakui::new();
+        let viewport = Vec2::new(400.0, 200.0);
+        yak.set_surface_size(viewport);
+        yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+        let render = |yak: &mut Yakui, live: bool| {
+            yak.start();
+            let button = live.then(|| goryak::button_primary("Confirm Purchase").show());
+            yak.finish();
+            button
+        };
+        let button = render(&mut yak, true).unwrap();
+        let bounds = yak.layout_dom().get(button.id).unwrap().rect;
+        yak.handle_event(Event::CursorMoved(Some(bounds.pos() + bounds.size() * 0.5)));
+        render(&mut yak, true);
+        yak.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down: true,
+        });
+        yak.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down: false,
+        });
+
+        let uiw = playing_ui();
+        *uiw.write::<SessionScreen>() = SessionScreen::Playing;
+        land_tiles::toggle(&uiw);
+        let sim = Simulation::new_with_options(scenarios::builtin::smoke::OPTIONS);
+        let driver = SimThread::start(sim, Simulation::schedule(), 1, None);
+        let view = driver.view();
+        let writer = view.world.write().unwrap();
+        let acquired = view.try_read_for_frame(true).is_some();
+        assert!(!acquired);
+        if can_present_owned(!acquired, gui::needs_live_world(&uiw)) {
+            render(&mut yak, false);
+        }
+        drop(writer);
+        let _reader = view
+            .try_read_for_frame(true)
+            .expect("writer released the world");
+        assert!(render(&mut yak, true).unwrap().clicked);
+        assert!(!render(&mut yak, true).unwrap().clicked);
+    }
+
+    #[test]
     fn scale_t1_fix_deferred_placement_is_bound_to_the_selected_company() {
         let sample = |company| WorldInputSample {
             generation: 4,
             input: InputMap::default().world_input(),
             pointer: Default::default(),
             ray: None,
+            vehicle_hit: None,
             press_events: Vec::new(),
             tool: Tool::SpecialBuilding,
             company,
@@ -2714,6 +2793,7 @@ mod p4_fix_esc_tests {
             input: InputMap::default().world_input(),
             pointer: Default::default(),
             ray: None,
+            vehicle_hit: None,
             press_events: Vec::new(),
             tool: Tool::Bulldozer,
             company: None,

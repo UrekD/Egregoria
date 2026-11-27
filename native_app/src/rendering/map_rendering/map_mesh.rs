@@ -22,8 +22,9 @@ use prototypes::{
 use simulation::map::{
     Building, BuildingKind, CanonicalPosition, Density, EligiblePaintCells, Environment,
     Intersection, LaneKind, Lanes, LotID, LotKind, Map, MapSubscriber, MapSubscribers,
-    ProjectFilter, ProjectKind, PylonPosition, Road, Roads, SubscriberChunkID, Turn, TurnKind,
-    UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
+    ProjectFilter, ProjectKind, PylonPosition, RenderMap, Road, Roads, SubscriberChunkID, Turn,
+    TurnKind, UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
+    ZONE_CELL_SIZE,
 };
 use simulation::souls::growth::{check_growable_lot, GrowableLotError};
 use std::cell::RefCell;
@@ -356,7 +357,7 @@ struct ZoningMeshes {
 }
 
 impl ZoningMeshes {
-    fn draw(&mut self, map: &Map, ctx: &mut FrameContext<'_>) {
+    fn draw(&mut self, map: &RenderMap, ctx: &mut FrameContext<'_>) {
         let Some(frame) = ZONING_FRAME.take() else {
             return;
         };
@@ -417,7 +418,7 @@ impl ZoningMeshes {
         self.draw_preview(map, frame.preview, ctx);
     }
 
-    fn draw_chunks(&mut self, map: &Map, frame: &ZoningFrame, ctx: &mut FrameContext<'_>) {
+    fn draw_chunks(&mut self, map: &RenderMap, frame: &ZoningFrame, ctx: &mut FrameContext<'_>) {
         if frame.grid.cells().is_empty() {
             return;
         }
@@ -468,7 +469,12 @@ impl ZoningMeshes {
         }
     }
 
-    fn draw_preview(&mut self, map: &Map, preview: ZoningPreviewMesh, ctx: &mut FrameContext<'_>) {
+    fn draw_preview(
+        &mut self,
+        map: &RenderMap,
+        preview: ZoningPreviewMesh,
+        ctx: &mut FrameContext<'_>,
+    ) {
         if self.preview_key.as_ref() != Some(&preview) {
             self.builder.clear();
             if let Some(fill) = &preview.fill {
@@ -502,7 +508,7 @@ impl ZoningMeshes {
 }
 
 fn update_zone_chunks(
-    map: &Map,
+    map: &RenderMap,
     chunks: &mut FastMap<ZoningChunk, ZoningChunkState>,
     previous: Option<&ZoneGrid>,
     grid: &ZoneGrid,
@@ -562,7 +568,7 @@ fn zone_cell_center(x: i32, y: i32) -> Vec2 {
 
 fn build_zoning_chunk(
     builder: &mut MeshBuilder<false>,
-    map: &Map,
+    map: &RenderMap,
     frame: &ZoningFrame,
     chunk: ZoningChunk,
     revision: ZoningChunkRevision,
@@ -591,7 +597,7 @@ fn build_zoning_chunk(
             let zoned = frame
                 .grid
                 .lot_zone(&lot.shape)
-                .map(|zone| (zone, check_growable_lot(map, lot, zone).map(|_| ())));
+                .map(|zone| (zone, map.check_growable_lot(lot, zone)));
             if let Some((width, color)) = lot_outline(zoned, false) {
                 let start = tess.indices.len() as u32;
                 draw_lot_outline(
@@ -925,7 +931,7 @@ fn preview_tiles(stamp: &EligiblePaintCells, mode: ZoningMode) -> Vec<AABB> {
 }
 
 fn build_painted_cells(
-    map: &Map,
+    map: &RenderMap,
     grid: &ZoneGrid,
     chunk: ZoningChunk,
     mode: ZoningMode,
@@ -962,7 +968,7 @@ fn painted_tile(grid: &ZoneGrid, mode: ZoningMode, x: i32, y: i32, zone: ZoneCel
 }
 
 fn add_zoning_tile(
-    map: &Map,
+    map: &RenderMap,
     tile: AABB,
     color: [f32; 4],
     lift: f32,
@@ -1157,21 +1163,21 @@ mod zoning_tests {
         grid.paint_on_map(&map, &right, Some(ZoneKind::Office), Density::Low)
             .unwrap();
         let mut chunks = FastMap::default();
-        update_zone_chunks(&map, &mut chunks, None, &grid);
+        update_zone_chunks(&map.render_snapshot(), &mut chunks, None, &grid);
 
         let previous = grid.clone();
         grid.paint_on_map(&map, &left, Some(ZoneKind::Office), Density::High)
             .unwrap();
         grid.paint_on_map(&map, &right, Some(ZoneKind::Office), Density::Low)
             .unwrap();
-        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        update_zone_chunks(&map.render_snapshot(), &mut chunks, Some(&previous), &grid);
         assert_eq!(chunks[&left_chunk].grid_revision, grid.generation());
         assert_eq!(chunks[&left_chunk].cells, 1);
         assert_eq!(chunks[&right_chunk].grid_revision, 0);
 
         let previous = grid.clone();
         grid.paint_on_map(&map, &left, None, Density::Low).unwrap();
-        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        update_zone_chunks(&map.render_snapshot(), &mut chunks, Some(&previous), &grid);
         assert_eq!(chunks[&left_chunk].grid_revision, grid.generation());
         assert_eq!(chunks[&left_chunk].cells, 0);
         assert_eq!(chunks[&right_chunk].grid_revision, 0);
@@ -1223,10 +1229,10 @@ mod zoning_tests {
         assert_eq!(preview.outlines[0].width, 0.3);
 
         let mut chunks = FastMap::default();
-        update_zone_chunks(&map, &mut chunks, None, &grid);
+        update_zone_chunks(&map.render_snapshot(), &mut chunks, None, &grid);
         let previous = grid.clone();
         grid.paint_on_map(&map, &area, None, Density::Low).unwrap();
-        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        update_zone_chunks(&map.render_snapshot(), &mut chunks, Some(&previous), &grid);
         assert_eq!(chunks[&painted].grid_revision, grid.generation());
         assert_eq!(chunks[&owner].lot_revision, grid.generation());
         assert_eq!(chunks[&owner].grid_revision, 0);
@@ -1578,7 +1584,7 @@ impl MapMeshHandler {
 
     pub(super) fn stage_chunk(
         &mut self,
-        map: &Map,
+        map: &RenderMap,
         chunk: SubscriberChunkID,
         kinds: UpdateType,
         gfx: &mut GfxContext,
@@ -1662,7 +1668,7 @@ impl MapMeshHandler {
         }
     }
 
-    pub fn draw(&mut self, map: &Map, options: MapRenderOptions, ctx: &mut FrameContext<'_>) {
+    pub fn draw(&mut self, map: &RenderMap, options: MapRenderOptions, ctx: &mut FrameContext<'_>) {
         profiling::scope!("prepare map mesh");
         for v in self.cache.values() {
             ctx.draw(v.build.clone());
@@ -1774,7 +1780,7 @@ impl MapBuilders {
         }
     }
 
-    fn buildings_mesh(&mut self, map: &Map, chunk: SubscriberChunkID) {
+    fn buildings_mesh(&mut self, map: &RenderMap, chunk: SubscriberChunkID) {
         self.power_markers.clear();
         for v in self.buildsprites.values_mut() {
             v.clear();
@@ -2057,7 +2063,7 @@ impl MapBuilders {
         //}
     }
 
-    fn map_mesh(&mut self, map: &Map, chunk: SubscriberChunkID) {
+    fn map_mesh(&mut self, map: &RenderMap, chunk: SubscriberChunkID) {
         self.arrow_builder.clear();
         self.crosswalk_builder.clear();
         self.mesh_map.clear();
@@ -2081,7 +2087,7 @@ impl MapBuilders {
         let mut chunk_inters = Vec::new();
 
         for obj in objs {
-            if SubscriberChunkID::new(obj.canonical_position(map)) != chunk {
+            if SubscriberChunkID::new(map.canonical_position(obj)) != chunk {
                 continue;
             }
             match obj {

@@ -157,8 +157,8 @@ fn client_max_worker_publishes_owned_views_without_waiting_for_redraw() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(first.view.stamp.completed_step, first_step);
-    assert_eq!(view.wait_totals().read_lease_ns, 0);
-    assert_eq!(view.wait_totals().redraw_turn_ns, 0);
+    assert_eq!(view.work_totals().read_lease_ns, 0);
+    assert_eq!(view.work_totals().redraw_turn_ns, 0);
 }
 
 #[test]

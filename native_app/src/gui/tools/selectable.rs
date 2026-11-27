@@ -2,25 +2,28 @@ use crate::gui::follow::FollowEntity;
 use crate::gui::{InspectedBuilding, InspectedEntity, InspectedRoad, Tool};
 use crate::inputmap::{InputAction, InputMap, SurfaceHits};
 use crate::rendering::immediate::ImmediateDraw;
+use crate::rendering::world_snapshot::{ActorKind, ViewStamp};
 use crate::uiworld::UiWorld;
 use common::{FastMap, FastSet};
 use engine::{GfxContext, Tesselator};
 use flat_spatial::Grid;
 use geom::{
-    vec3, Intersect, LinearColor, Ray3, Segment, Shape, Transform, Vec2, Vec3, AABB, AABB3,
+    vec3, Camera, Intersect, LinearColor, Ray3, Segment, Shape, Transform, Vec2, Vec3, AABB, AABB3,
 };
 use prototypes::{
     try_prototype, FreightStationPrototype, GoodsCompanyPrototype, GrowableCompanyID,
     GrowableCompanyPrototype, RenderAsset, RollingStockID, RollingStockPrototype, ServiceID,
 };
 use simulation::map::{
-    Building, BuildingID, BuildingKind, Map, ProjectFilter, ProjectKind, Road, RoadID,
+    Building, BuildingID, BuildingKind, Buildings, Map, ProjectFilter, ProjectKind, RenderMap,
+    Road, RoadID, SpatialMap,
 };
 use simulation::transportation::VehicleKind;
 use simulation::{AnyEntity, Simulation, VehicleEnt, VehicleID, WagonEnt, WagonID};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::Arc;
 
 pub fn select_radius(id: AnyEntity) -> f32 {
     match id {
@@ -45,10 +48,14 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
 
     if clicked && !inspected.dontclear {
         inspected.dist2 = f32::INFINITY;
-        inspected.e = uiworld
-            .write::<VehiclePicker>()
-            .pick(sim, &inp)
+        let mut picker = uiworld.write::<VehiclePicker>();
+        inspected.e = picker
+            .hand_hit
+            .take()
+            .unwrap_or_else(|| picker.pick(sim, &inp))
+            .filter(|hit| hit.valid_in(sim))
             .map(|hit| hit.entity);
+        drop(picker);
         if let Some(unproj) = inp.unprojected.filter(|_| inspected.e.is_none()) {
             for (id, human) in &sim.world().humans {
                 let dist2 = human.trans.pos.xy().distance2(unproj.xy());
@@ -151,7 +158,31 @@ pub(crate) struct VehicleHit {
     part: AnyEntity,
 }
 
+impl VehicleHit {
+    pub(crate) fn valid_in(self, sim: &Simulation) -> bool {
+        match self.part {
+            AnyEntity::VehicleID(id) => sim.get(id).is_some(),
+            AnyEntity::WagonID(id) => sim.get(id).is_some_and(|wagon| {
+                let leader = wagon.itfollower.leader;
+                AnyEntity::from(leader) == self.entity && sim.get(leader).is_some()
+            }),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DisplayedVehicle {
+    pub part: AnyEntity,
+    pub entity: AnyEntity,
+    pub kind: ActorKind,
+    pub transform: Transform,
+}
+
 pub(crate) struct VehiclePicker {
+    presented: Option<(ViewStamp, Camera, Arc<RenderMap>)>,
+    displayed: Vec<DisplayedVehicle>,
+    pub(crate) hand_hit: Option<Option<VehicleHit>>,
     snapshot: Option<(u64, usize, usize)>,
     grid: Grid<AnyEntity, Vec2>,
     radius: f32,
@@ -164,6 +195,9 @@ pub(crate) struct VehiclePicker {
 impl Default for VehiclePicker {
     fn default() -> Self {
         Self {
+            presented: None,
+            displayed: Vec::new(),
+            hand_hit: None,
             snapshot: None,
             grid: Grid::new(64),
             radius: 0.0,
@@ -178,9 +212,76 @@ impl Default for VehiclePicker {
 impl VehiclePicker {
     pub(crate) fn reset(uiworld: &UiWorld, _generation: u64) {
         let mut picker = uiworld.write::<Self>();
+        picker.presented = None;
+        picker.displayed.clear();
+        picker.hand_hit = None;
         picker.snapshot = None;
         drop(picker.grid.clear());
         picker.radius = 0.0;
+    }
+
+    pub(crate) fn record_displayed(
+        &mut self,
+        stamp: ViewStamp,
+        camera: Camera,
+        map: Arc<RenderMap>,
+    ) -> &mut Vec<DisplayedVehicle> {
+        self.presented = Some((stamp, camera, map));
+        self.displayed.clear();
+        &mut self.displayed
+    }
+
+    pub(crate) fn displayed_ray(&self, screen: Vec2, generation: u64) -> Option<Ray3> {
+        let (stamp, camera, _) = self.presented.as_ref()?;
+        if stamp.generation != generation {
+            return None;
+        }
+        camera.unproj_ray(screen)
+    }
+
+    pub(crate) fn pick_displayed(&self, ray: Ray3, generation: u64) -> Option<VehicleHit> {
+        let (stamp, _, map) = self.presented.as_ref()?;
+        if stamp.generation != generation {
+            return None;
+        }
+        self.pick_displayed_in(map, ray)
+    }
+
+    fn pick_displayed_in(&self, map: &RenderMap, ray: Ray3) -> Option<VehicleHit> {
+        let ray = normalize_pick_ray(ray)?;
+        let env = map.environment();
+        let (start, end) = visible_pick_depth(env.bounds(), ray, SurfaceHits::cast(env, ray))?;
+        let query = ray_segment(ray, start, end).bbox();
+        let (hit, depth) = self
+            .displayed
+            .iter()
+            .filter_map(|part| {
+                let bounds = match part.kind {
+                    ActorKind::Car => self.road_bounds(VehicleKind::Car),
+                    ActorKind::Truck => self.road_bounds(VehicleKind::Truck),
+                    ActorKind::Bus => self.road_bounds(VehicleKind::Bus),
+                    ActorKind::RollingStock(stock) => *self.rail_bounds.get(&stock)?,
+                    ActorKind::Pedestrian => return None,
+                };
+                if !query
+                    .expand(pick_radius(bounds, part.transform))
+                    .contains(part.transform.pos.xy())
+                {
+                    return None;
+                }
+                let depth = instance_depth(ray, part.transform, bounds)?;
+                (depth <= end).then_some((
+                    VehicleHit {
+                        entity: part.entity,
+                        part: part.part,
+                    },
+                    depth,
+                ))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        self.building_before_in(map.spatial_map(), map.buildings(), ray, start, depth)
+            .is_none()
+            .then_some(hit)
     }
 
     pub(crate) fn load_models(&mut self, gfx: &mut GfxContext) {
@@ -276,9 +377,13 @@ impl VehiclePicker {
     }
 
     pub(crate) fn pick(&mut self, sim: &Simulation, input: &InputMap) -> Option<VehicleHit> {
+        if let Some((_, _, map)) = &self.presented {
+            return self
+                .pick_displayed_in(map, input.ray?)
+                .filter(|hit| hit.valid_in(sim));
+        }
         let map = sim.map();
         let ray = PickRay::from_input(&map, input)?;
-        // Hand clicks are handled before rendering and may need the current snapshot.
         if self.start_snapshot(sim) {
             #[cfg(test)]
             VEHICLE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
@@ -316,6 +421,7 @@ impl VehiclePicker {
             .then_some(hit)
     }
 
+    #[cfg(test)]
     pub(crate) fn still_visible(
         &self,
         sim: &Simulation,
@@ -362,6 +468,17 @@ impl VehiclePicker {
         start: f32,
         end: f32,
     ) -> Option<(f32, BuildingID)> {
+        self.building_before_in(map.spatial_map(), map.buildings(), ray, start, end)
+    }
+
+    fn building_before_in(
+        &self,
+        spatial: &SpatialMap,
+        buildings: &Buildings,
+        ray: Ray3,
+        start: f32,
+        end: f32,
+    ) -> Option<(f32, BuildingID)> {
         if end < start {
             return None;
         }
@@ -369,12 +486,12 @@ impl VehiclePicker {
         // A prefab can reach beyond the footprint indexed by the map. Expand
         // by the largest model radius, then test each prefab in model space.
         let candidates: BTreeSet<_> = pick_query_bounds(segment, self.prefab_radius)
-            .flat_map(|bounds| map.spatial_map().building_candidates(bounds))
+            .flat_map(|bounds| spatial.building_candidates(bounds))
             .collect();
         candidates
             .into_iter()
             .filter_map(|id| {
-                let building = map.get(id)?;
+                let building = buildings.get(id)?;
                 let model = self
                     .building_meshes
                     .get(&building.kind)
@@ -979,6 +1096,87 @@ pub(crate) mod tests {
 
     fn test_assets() -> &'static Path {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets"))
+    }
+
+    #[test]
+    fn client_max_crossing_vehicles_and_train_picking_use_displayed_poses() {
+        let stock = ["locomotive", "freight-wagon"].map(RollingStockID::new);
+        let mut sim = rail_pick_fixture(&stock);
+        let (part, wagon) = sim
+            .world()
+            .wagons
+            .iter()
+            .find(|(_, wagon)| wagon.wagon.rolling_stock == stock[1])
+            .unwrap();
+        let train = wagon.itfollower.leader;
+        let rail_pose = wagon.trans;
+        let visible_road = vec3(80.0, 80.0, 100.0);
+        let other_road = vec3(110.0, 80.0, 100.0);
+        let car =
+            spawn_driving_vehicle(&mut sim, VehicleKind::Car, Transform::new(other_road)).unwrap();
+        let crossing =
+            spawn_driving_vehicle(&mut sim, VehicleKind::Car, Transform::new(visible_road))
+                .unwrap();
+        sim.world_mut_unchecked().wagons[part].trans.pos.y += 60.0;
+        let mut picker = VehiclePicker::default();
+        picker.load_pick_meshes(test_assets());
+        let stamp = ViewStamp {
+            generation: 4,
+            view_seq: 7,
+            completed_step: 100,
+            sample_time: std::time::Instant::now(),
+            map_epoch: 2,
+        };
+        let map = Arc::new(sim.map().render_snapshot());
+        let mut camera = Camera::new(visible_road, 800.0, 600.0);
+        camera.update();
+        picker.record_displayed(stamp, camera, map).extend([
+            DisplayedVehicle {
+                part: car.into(),
+                entity: car.into(),
+                kind: crate::rendering::world_snapshot::ActorKind::Car,
+                transform: Transform::new(visible_road),
+            },
+            DisplayedVehicle {
+                part: crossing.into(),
+                entity: crossing.into(),
+                kind: crate::rendering::world_snapshot::ActorKind::Car,
+                transform: Transform::new(other_road),
+            },
+            DisplayedVehicle {
+                part: part.into(),
+                entity: train.into(),
+                kind: crate::rendering::world_snapshot::ActorKind::RollingStock(stock[1]),
+                transform: rail_pose,
+            },
+        ]);
+        let (screen, _) = camera.project(visible_road);
+        let ray = picker.displayed_ray(screen, stamp.generation).unwrap();
+        assert!(picker.displayed_ray(screen, stamp.generation + 1).is_none());
+        assert_eq!(
+            picker
+                .pick_displayed(ray, stamp.generation)
+                .map(|hit| hit.entity),
+            Some(car.into())
+        );
+        let mut input = InputMap::default();
+        input.ray = Some(Ray3::new(visible_road.up(24.0), -Vec3::Z));
+        let car_hit = picker.pick(&sim, &input).map(|hit| hit.entity);
+        input.ray = Some(Ray3::new(rail_pose.pos.up(24.0), -Vec3::Z));
+        let train_hit = picker.pick(&sim, &input).map(|hit| hit.entity);
+        assert_eq!((car_hit, train_hit), (Some(car.into()), Some(train.into())));
+        let mut hover = crate::debug_gui::VehicleHover::default();
+        let now = std::time::Instant::now();
+        hover.update_displayed(&picker, &sim, Some(ray), stamp.generation, now);
+        assert!(hover.has_hit());
+        sim.world_mut_unchecked().vehicles.remove(car);
+        hover.update_displayed(&picker, &sim, Some(ray), stamp.generation, now);
+        assert!(!hover.has_hit());
+        assert!(picker.pick_displayed(ray, stamp.generation).is_some());
+        assert!(!picker
+            .pick_displayed(ray, stamp.generation)
+            .unwrap()
+            .valid_in(&sim));
     }
 
     #[test]

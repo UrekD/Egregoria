@@ -9,8 +9,8 @@ use geom::{vec2, LinearColor, AABB};
 use geom::{Camera, Circle, InfiniteFrustrum, Intersect3};
 use map_mesh::MapMeshHandler;
 use simulation::map::{
-    Lane, LaneID, LaneKind, Map, MapSubscribers, ProjectFilter, ProjectKind, SubscriberChunkID,
-    TrafficBehavior, UpdateType,
+    Lane, LaneID, LaneKind, MapSubscribers, ProjectFilter, ProjectKind, RenderMap,
+    SubscriberChunkID, TrafficBehavior, UpdateType,
 };
 use terrain::TerrainRender;
 
@@ -29,6 +29,38 @@ pub(crate) use map_mesh::intersection_mesh;
 use water::WaterRender;
 pub(crate) use water::{water_color, WATER_OVERVIEW_POOL, WATER_TILE_PITCH};
 
+fn active_overlay_preview(
+    preview: Option<GroundOverlayDisc>,
+    debug_preview: Option<&GroundOverlayDisc>,
+) -> Option<GroundOverlayDisc> {
+    preview.or_else(|| {
+        debug_preview.map(|disc| GroundOverlayDisc {
+            center: disc.center,
+            radius: disc.radius,
+            color: disc.color,
+        })
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn client_max_ground_preview_restores_debug_disc() {
+    let disc = |radius| GroundOverlayDisc {
+        center: geom::Vec2::ZERO,
+        radius,
+        color: geom::LinearColor::WHITE,
+    };
+    assert_eq!(
+        active_overlay_preview(None, Some(&disc(4.0))).map(|x| x.radius),
+        Some(4.0)
+    );
+    assert_eq!(
+        active_overlay_preview(Some(disc(2.0)), Some(&disc(4.0))).map(|x| x.radius),
+        Some(2.0)
+    );
+    assert!(active_overlay_preview(None, None).is_none());
+}
+
 /// Render the entire map including the terrain, trees, water etc
 pub struct MapRenderer {
     pub meshb: MapMeshHandler,
@@ -37,6 +69,7 @@ pub struct MapRenderer {
     water: WaterRender,
     pub lamps: LampsRender,
     changes: MapSubscribers,
+    debug_preview: Option<GroundOverlayDisc>,
 }
 
 pub struct MapRenderOptions {
@@ -45,7 +78,7 @@ pub struct MapRenderOptions {
 }
 
 impl MapRenderer {
-    pub fn new(gfx: &mut GfxContext, map: &Map) -> Self {
+    pub fn new(gfx: &mut GfxContext, map: &RenderMap) -> Self {
         defer!(log::info!("finished init of road render"));
         let changes = MapSubscribers::default();
         let renderer = MapRenderer {
@@ -55,6 +88,7 @@ impl MapRenderer {
             water: WaterRender::new(&changes),
             lamps: LampsRender::new(),
             changes,
+            debug_preview: None,
         };
         #[cfg(feature = "debug-ground-overlay")]
         if std::env::var("EGR_DEBUG_GROUND_OVERLAY").as_deref() == Ok("1") {
@@ -67,7 +101,7 @@ impl MapRenderer {
 
     pub(crate) fn stage(
         &mut self,
-        map: &Map,
+        map: &RenderMap,
         remaining: &mut BTreeMap<SubscriberChunkID, UpdateType>,
         gfx: &mut GfxContext,
         full_refresh: bool,
@@ -94,7 +128,7 @@ impl MapRenderer {
 
     pub(crate) fn promote(
         &mut self,
-        map: &Map,
+        map: &RenderMap,
         chunks: &BTreeMap<SubscriberChunkID, UpdateType>,
         ctx: &mut Context,
         full_refresh: bool,
@@ -140,7 +174,10 @@ impl MapRenderer {
         gfx: &mut GfxContext,
         preview: Option<GroundOverlayDisc>,
     ) {
-        self.terrain.set_overlay_preview(gfx, preview);
+        self.terrain.set_overlay_preview(
+            gfx,
+            active_overlay_preview(preview, self.debug_preview.as_ref()),
+        );
     }
 
     #[cfg(feature = "debug-ground-overlay")]
@@ -182,19 +219,17 @@ impl MapRenderer {
             }),
             true,
         );
-        self.set_overlay_preview(
-            gfx,
-            Some(GroundOverlayDisc {
-                center: center + vec2(0.28, -0.10) * radius,
-                radius: radius * 0.35,
-                color: LinearColor::new(0.02, 0.60, 1.0, 0.75),
-            }),
-        );
+        self.debug_preview = Some(GroundOverlayDisc {
+            center: center + vec2(0.28, -0.10) * radius,
+            radius: radius * 0.35,
+            color: LinearColor::new(0.02, 0.60, 1.0, 0.75),
+        });
+        self.set_overlay_preview(gfx, None);
     }
 
     pub fn render(
         &mut self,
-        map: &Map,
+        map: &RenderMap,
         time: u32,
         cam: &Camera,
         options: MapRenderOptions,
@@ -249,7 +284,7 @@ impl MapRenderer {
     }
 
     fn render_lanes(
-        map: &Map,
+        map: &RenderMap,
         lanes: impl Iterator<Item = (LaneID, LaneKind)>,
         draw: &mut ImmediateDraw,
         time: u32,
@@ -271,7 +306,7 @@ impl MapRenderer {
     }
 
     fn signals_render(
-        map: &Map,
+        map: &RenderMap,
         time: u32,
         cam: &Camera,
         frustrum: &InfiniteFrustrum,

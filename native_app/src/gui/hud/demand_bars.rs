@@ -9,6 +9,7 @@ use simulation::{PopulationScale, Simulation};
 use yakui::paint::PaintRect;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot, Rect, Vec2};
 
+#[derive(Clone, Copy)]
 pub(crate) struct DemandSnapshot {
     values: [Option<f32>; ZoneKind::ALL.len()],
     population: u64,

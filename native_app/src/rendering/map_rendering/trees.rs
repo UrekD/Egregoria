@@ -6,7 +6,7 @@ use engine::{
     Drawable, FrameContext, GfxContext, InstancedMesh, InstancedMeshBuilder, MeshInstance,
 };
 use geom::{vec3, vec4, Camera, HeightmapChunk, Intersect3, LinearColor, Matrix4, Vec3, AABB3};
-use simulation::map::{Map, SubscriberChunkID};
+use simulation::map::{RenderMap, SubscriberChunkID};
 
 pub struct TreesRender {
     tree_builder: InstancedMeshBuilder<false>,
@@ -25,7 +25,12 @@ impl TreesRender {
         }
     }
 
-    pub(super) fn stage_chunk(&mut self, map: &Map, chunkid: SubscriberChunkID, gfx: &GfxContext) {
+    pub(super) fn stage_chunk(
+        &mut self,
+        map: &RenderMap,
+        chunkid: SubscriberChunkID,
+        gfx: &GfxContext,
+    ) {
         self.tree_builder.instances.clear();
 
         let aabb = chunkid.bbox();
@@ -55,7 +60,7 @@ impl TreesRender {
         }
     }
 
-    pub fn draw(&mut self, map: &Map, cam: &Camera, ctx: &mut FrameContext<'_>) {
+    pub fn draw(&mut self, map: &RenderMap, cam: &Camera, ctx: &mut FrameContext<'_>) {
         profiling::scope!("draw trees");
 
         let camcenter = cam.pos.xy();

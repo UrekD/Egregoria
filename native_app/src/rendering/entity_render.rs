@@ -1,11 +1,12 @@
 use common::FastMap;
 use engine::meshload::load_scaled_mesh;
 use engine::{FrameContext, GfxContext, InstancedMeshBuilder, SpriteBatchBuilder};
-use geom::{LinearColor, Vec3, V3};
+use geom::{LinearColor, Transform, Vec3, V3};
 use prototypes::{RenderAsset, RollingStockID, RollingStockPrototype};
 use std::time::Instant;
 
 use super::world_snapshot::{ActorKind, SelectionView, WorldView};
+use crate::gui::selectable::DisplayedVehicle;
 
 pub struct InstancedRender {
     pub path_not_found: SpriteBatchBuilder<true>,
@@ -70,6 +71,7 @@ impl InstancedRender {
         view: &WorldView,
         previous: Option<&WorldView>,
         selection: SelectionView,
+        displayed: &mut Vec<DisplayedVehicle>,
         fctx: &mut FrameContext<'_>,
     ) {
         profiling::scope!("entity_render::render");
@@ -106,26 +108,34 @@ impl InstancedRender {
         });
 
         for actor in &view.entities.actors {
-            let instance = if selection.contains(actor.id) {
-                actor.pose
-            } else {
-                previous_actors
-                    .get(&actor.id)
-                    .map_or(actor.pose, |previous| {
-                        actor.pose_from(previous, elapsed_steps, fraction)
-                    })
-            };
-            match actor.kind {
-                ActorKind::Car => self.cars.instances.push(instance),
-                ActorKind::Truck => self.trucks.instances.push(instance),
-                ActorKind::Bus => self.buses.instances.push(instance),
-                ActorKind::Pedestrian => self.pedestrians.instances.push(instance),
-                ActorKind::RollingStock(id) => {
-                    if let Some(builder) = self.rolling_stock.get_mut(&id) {
-                        builder.instances.push(instance);
-                    }
+            let instance = previous_actors
+                .get(&actor.id)
+                .filter(|_| !selection.contains(actor))
+                .map_or(actor.pose, |previous| {
+                    actor.pose_from(previous, elapsed_steps, fraction)
+                });
+            let builder = match actor.kind {
+                ActorKind::Car => &mut self.cars,
+                ActorKind::Truck => &mut self.trucks,
+                ActorKind::Bus => &mut self.buses,
+                ActorKind::Pedestrian => {
+                    self.pedestrians.instances.push(instance);
+                    continue;
                 }
-            }
+                ActorKind::RollingStock(id) => {
+                    let Some(builder) = self.rolling_stock.get_mut(&id) else {
+                        continue;
+                    };
+                    builder
+                }
+            };
+            builder.instances.push(instance);
+            displayed.push(DisplayedVehicle {
+                part: actor.id.entity(),
+                entity: actor.entity(),
+                kind: actor.kind,
+                transform: Transform::new_dir(instance.pos, instance.dir),
+            });
         }
 
         self.path_not_found.clear();

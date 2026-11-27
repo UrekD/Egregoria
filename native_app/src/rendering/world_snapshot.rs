@@ -5,12 +5,14 @@ use std::time::{Duration, Instant};
 use engine::MeshInstance;
 use geom::Camera;
 use geom::{LinearColor, Vec3};
-use prototypes::{GameTime, Money, RollingStockID};
+use prototypes::{GameDuration, GameTime, Money, RollingStockID};
 use simulation::economy::Government;
 use simulation::map::{Map, MapSubscriber, RenderMap, SubscriberChunkID, UpdateType};
-use simulation::map_dynamic::Transit;
+use simulation::map_dynamic::{Itinerary, Transit};
+use simulation::multiplayer::chat::Message;
+use simulation::multiplayer::MultiplayerState;
 use simulation::transportation::{Location, VehicleKind};
-use simulation::{AnyEntity, HumanID, Simulation, VehicleID, WagonID};
+use simulation::{AnyEntity, HumanID, Simulation, TrainID, VehicleID, WagonID};
 
 use crate::gui::{capture_problem_markers, DemandSnapshot, ProblemMarker, ToolboxSnapshot};
 use crate::sim_thread::{BatchId, Boundary};
@@ -18,6 +20,7 @@ use crate::sim_thread::{BatchId, Boundary};
 const VIEW_INTERVAL: Duration = Duration::from_millis(16);
 const HUD_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DIRTY_CHUNKS: usize = 256;
+const ACTOR_POOL_SIZE: usize = 4;
 
 pub(crate) struct MapPrepInput {
     pub generation: u64,
@@ -138,17 +141,19 @@ pub(crate) struct HudSnapshot {
     pub demand: DemandSnapshot,
     pub markers: Arc<[ProblemMarker]>,
     pub toolbox: ToolboxSnapshot,
+    pub chat: Arc<[Message]>,
 }
 
 pub(crate) struct WorldView {
     pub stamp: ViewStamp,
     pub hud: HudSnapshot,
-    pub entities: EntitySamples,
+    pub entities: Arc<EntitySamples>,
     pub applied_batch: Option<BatchId>,
     pub command_sequence: u64,
     pub paused: bool,
     pub transit_stops: Arc<[Vec3]>,
     pub transit_revision: u64,
+    tick: u64,
 }
 
 #[derive(Default)]
@@ -167,7 +172,12 @@ impl LatestViews {
     }
 
     pub fn publish(&mut self, view: Arc<WorldView>) {
-        self.previous = self.latest.replace(view);
+        if let Some(latest) = self.latest.take() {
+            if !Arc::ptr_eq(&latest.entities, &view.entities) {
+                self.previous = Some(latest);
+            }
+        }
+        self.latest = Some(view);
     }
 
     pub fn previous_for(&self, view: &WorldView) -> Option<&WorldView> {
@@ -195,7 +205,23 @@ pub(crate) struct SnapshotSource {
     pending_map: Option<MapPrepInput>,
     latest: Option<Arc<WorldView>>,
     pending: bool,
-    last_markers: Option<Instant>,
+    last_markers: Option<(Instant, Camera)>,
+    last_hud: Option<Instant>,
+    last_view: Option<Instant>,
+    actor_pool: Vec<Arc<EntitySamples>>,
+}
+
+#[derive(Default)]
+pub(crate) struct CaptureWork {
+    pub actor_scan: bool,
+    pub buffer_grows: u64,
+    pub actor_pool_bytes: usize,
+}
+
+fn same_camera(a: &Camera, b: &Camera) -> bool {
+    a.proj_cache.as_ref() == b.proj_cache.as_ref()
+        && a.viewport_w == b.viewport_w
+        && a.viewport_h == b.viewport_h
 }
 
 impl SnapshotSource {
@@ -230,7 +256,7 @@ impl SnapshotSource {
         request: ViewRequest,
         paused: bool,
         force: bool,
-    ) {
+    ) -> CaptureWork {
         let epoch = self.map.as_ref().unwrap().epoch();
         let now = Instant::now();
         let latest = self.latest.as_deref();
@@ -238,62 +264,138 @@ impl SnapshotSource {
             .read::<simulation::world_command::CommandOutcomes>()
             .sequence;
         let same_map = latest.is_some_and(|view| view.stamp.map_epoch == epoch);
-        if !force
-            && same_map
+        let same_commands = latest.is_some_and(|view| {
+            view.command_sequence == command_sequence && view.applied_batch == boundary.last_batch
+        });
+        let same_boundary = same_map
+            && same_commands
             && latest.is_some_and(|view| {
-                view.command_sequence == command_sequence
-                    && view.applied_batch == boundary.last_batch
-                    && view.paused == paused
-                    && now.duration_since(view.stamp.sample_time) < VIEW_INTERVAL
-            })
-        {
-            return;
-        }
-        let markers = match request.camera {
-            None => {
-                self.last_markers = None;
-                Arc::default()
-            }
-            Some(camera)
-                if force
-                    || !same_map
-                    || self.last_markers.is_none_or(|at| now - at >= HUD_INTERVAL) =>
-            {
-                self.last_markers = Some(now);
-                capture_problem_markers(sim, &camera, boundary.generation, epoch).into()
-            }
-            Some(_) => latest.unwrap().hud.markers.clone(),
+                view.stamp.completed_step == boundary.completed_step && view.tick == boundary.tick
+            });
+
+        let camera_changed = match (request.camera.as_ref(), self.last_markers.as_ref()) {
+            (Some(camera), Some((_, old))) => !same_camera(camera, old),
+            (None, None) => false,
+            _ => true,
         };
+        let markers_due = if request.camera.is_some() {
+            !same_map
+                || self.last_markers.is_none_or(|(at, _)| {
+                    (camera_changed || !same_boundary) && (force || now - at >= HUD_INTERVAL)
+                })
+        } else {
+            self.last_markers.is_some()
+        };
+        let hud_due = force
+            || !same_map
+            || !same_commands
+            || (!same_boundary && self.last_hud.is_none_or(|at| now - at >= HUD_INTERVAL));
+        if !force && same_map && same_commands && latest.is_some_and(|view| view.paused == paused) {
+            let recent = self.last_view.is_some_and(|at| now - at < VIEW_INTERVAL);
+            if recent || (same_boundary && !markers_due && !hud_due) {
+                return CaptureWork::default();
+            }
+        }
+        let mut work = CaptureWork::default();
         let transit = sim.read::<Transit>();
+        let same_actors =
+            same_boundary && latest.is_some_and(|view| view.transit_revision == transit.revision);
+        let entities = if same_actors {
+            latest.unwrap().entities.clone()
+        } else {
+            let (entities, buffer_grows) =
+                Self::capture_actors(&mut self.actor_pool, sim, &transit);
+            work.actor_scan = true;
+            work.buffer_grows = buffer_grows;
+            work.actor_pool_bytes = self
+                .actor_pool
+                .iter()
+                .map(|slot| slot.capacity_bytes())
+                .sum();
+            entities
+        };
         let transit_stops = latest
             .filter(|view| same_map && view.transit_revision == transit.revision)
             .map_or_else(
                 || transit.stops.values().map(|stop| stop.walk_pos).collect(),
                 |view| view.transit_stops.clone(),
             );
+
+        let markers = if markers_due {
+            self.last_markers = request.camera.map(|camera| (now, camera));
+            request.camera.map_or_else(Arc::default, |camera| {
+                capture_problem_markers(sim, &camera, boundary.generation, epoch).into()
+            })
+        } else {
+            latest.map_or_else(Arc::default, |view| view.hud.markers.clone())
+        };
+        let time = *sim.read::<GameTime>();
+        let (treasury, demand, toolbox, chat) = if hud_due {
+            self.last_hud = Some(now);
+            let since = time.instant() - GameDuration::from_minutes(5);
+            let chat = sim.read::<MultiplayerState>();
+            (
+                sim.read::<Government>().money,
+                DemandSnapshot::capture(sim),
+                ToolboxSnapshot::capture(sim),
+                chat.chat.messages_since(since).take(30).cloned().collect(),
+            )
+        } else {
+            let hud = &latest.unwrap().hud;
+            (hud.treasury, hud.demand, hud.toolbox, hud.chat.clone())
+        };
+
         self.latest = Some(Arc::new(WorldView {
             stamp: ViewStamp {
                 generation: boundary.generation,
                 view_seq: latest.map_or(1, |previous| previous.stamp.view_seq + 1),
                 completed_step: boundary.completed_step,
-                sample_time: now,
+                sample_time: if same_actors {
+                    latest.unwrap().stamp.sample_time
+                } else {
+                    now
+                },
                 map_epoch: epoch,
             },
             hud: HudSnapshot {
-                time: *sim.read::<GameTime>(),
-                treasury: sim.read::<Government>().money,
-                demand: DemandSnapshot::capture(sim),
+                time,
+                treasury,
+                demand,
                 markers,
-                toolbox: ToolboxSnapshot::capture(sim),
+                toolbox,
+                chat,
             },
-            entities: EntitySamples::capture(sim),
+            entities,
             applied_batch: boundary.last_batch,
             command_sequence,
             paused,
             transit_stops,
             transit_revision: transit.revision,
+            tick: boundary.tick,
         }));
+        self.last_view = Some(now);
         self.pending = true;
+        work
+    }
+
+    fn capture_actors(
+        pool: &mut Vec<Arc<EntitySamples>>,
+        sim: &Simulation,
+        transit: &Transit,
+    ) -> (Arc<EntitySamples>, u64) {
+        for slot in pool.iter_mut() {
+            if let Some(samples) = Arc::get_mut(slot) {
+                let grows = samples.capture(sim, transit);
+                return (slot.clone(), grows);
+            }
+        }
+        let mut samples = EntitySamples::default();
+        let grows = samples.capture(sim, transit);
+        let samples = Arc::new(samples);
+        if pool.len() < ACTOR_POOL_SIZE {
+            pool.push(samples.clone());
+        }
+        (samples, grows)
     }
 
     pub(crate) fn take(&mut self) -> Option<WorldUpdate> {
@@ -317,7 +419,7 @@ pub(crate) enum ActorId {
 }
 
 impl ActorId {
-    fn entity(self) -> AnyEntity {
+    pub(crate) fn entity(self) -> AnyEntity {
         match self {
             Self::Human(id) => id.into(),
             Self::Vehicle(id) => id.into(),
@@ -333,9 +435,13 @@ pub(crate) struct SelectionView {
 }
 
 impl SelectionView {
-    pub fn contains(self, actor: ActorId) -> bool {
+    pub fn contains(self, actor: &ActorSample) -> bool {
+        let part = Some(actor.id.entity());
         let entity = Some(actor.entity());
-        self.selected == entity || self.followed == entity
+        self.selected == part
+            || self.followed == part
+            || self.selected == entity
+            || self.followed == entity
     }
 }
 
@@ -352,10 +458,16 @@ pub(crate) struct ActorSample {
     pub id: ActorId,
     pub kind: ActorKind,
     pub pose: MeshInstance,
+    pub leader: Option<TrainID>,
     parked: bool,
 }
 
 impl ActorSample {
+    pub(crate) fn entity(&self) -> AnyEntity {
+        self.leader
+            .map_or_else(|| self.id.entity(), AnyEntity::from)
+    }
+
     pub(crate) fn pose_from(&self, previous: &Self, steps: u64, fraction: f32) -> MeshInstance {
         let max_step = if self.kind == ActorKind::Pedestrian {
             1.0
@@ -363,36 +475,88 @@ impl ActorSample {
             5.0
         };
         let max_distance = 1.0 + max_step * steps.min(12) as f32;
+        let delta = self.pose.pos - previous.pose.pos;
+        // A chord can cut the corner of a lane or rail. Require both headings
+        // to align with it within 5 degrees, or 1 degree for wider sample gaps.
+        let straight_dot = if steps > 8 { 0.999_847_7 } else { 0.996_194_7 };
         if self.id != previous.id
             || self.kind != previous.kind
             || self.parked != previous.parked
-            || self.pose.pos.distance(previous.pose.pos) > max_distance
-            || self.pose.dir.dot(previous.pose.dir) <= 0.0
+            || self.leader != previous.leader
+            || delta.mag2() > max_distance * max_distance
+        {
+            return self.pose;
+        }
+        let delta = if self.kind == ActorKind::Pedestrian {
+            delta.xy().z0()
+        } else {
+            delta
+        };
+        let (Some(travel), Some(old_heading), Some(new_heading)) = (
+            delta.try_normalize(),
+            previous.pose.dir.try_normalize(),
+            self.pose.dir.try_normalize(),
+        ) else {
+            return self.pose;
+        };
+        if old_heading.dot(new_heading) < straight_dot
+            || travel.dot(old_heading) < straight_dot
+            || travel.dot(new_heading) < straight_dot
         {
             return self.pose;
         }
         MeshInstance {
             pos: previous.pose.pos.lerp(self.pose.pos, fraction),
-            dir: previous.pose.dir.lerp(self.pose.dir, fraction).normalize(),
+            dir: previous.pose.dir.lerp(self.pose.dir, fraction),
             tint: self.pose.tint,
         }
     }
 }
 
+#[derive(Default)]
 pub(crate) struct EntitySamples {
     pub actors: Vec<ActorSample>,
     pub reroutes: Vec<(AnyEntity, Vec3, u16)>,
 }
 
 impl EntitySamples {
-    fn capture(sim: &Simulation) -> Self {
+    fn capacity_bytes(&self) -> usize {
+        self.actors.capacity() * std::mem::size_of::<ActorSample>()
+            + self.reroutes.capacity() * std::mem::size_of::<(AnyEntity, Vec3, u16)>()
+    }
+
+    fn record_reroute(&mut self, entity: AnyEntity, pos: Vec3, itinerary: &Itinerary) {
+        if let Some(wait) = itinerary.is_wait_for_reroute().filter(|&wait| wait != 0) {
+            self.reroutes.push((entity, pos, wait));
+        }
+    }
+
+    fn capture(&mut self, sim: &Simulation, transit: &Transit) -> u64 {
         let world = sim.world();
-        let transit = sim.read::<Transit>();
-        let mut samples = Self {
-            actors: Vec::with_capacity(world.vehicles.len() + world.wagons.len()),
-            reroutes: Vec::new(),
-        };
+        let actor_capacity = self.actors.capacity();
+        let reroute_capacity = self.reroutes.capacity();
+        self.actors.clear();
+        self.reroutes.clear();
+        self.actors
+            .reserve(world.vehicles.len() + world.wagons.len());
+        for (id, p) in world.humans.iter() {
+            self.record_reroute(id.into(), p.trans.pos, &p.it);
+            if matches!(p.location, Location::Outside) {
+                self.actors.push(ActorSample {
+                    id: ActorId::Human(id),
+                    kind: ActorKind::Pedestrian,
+                    pose: MeshInstance {
+                        pos: p.trans.pos.up(0.5 + 0.4 * p.pedestrian.walk_anim.cos()),
+                        dir: p.trans.dir.xy().z0(),
+                        tint: LinearColor::WHITE,
+                    },
+                    leader: None,
+                    parked: false,
+                });
+            }
+        }
         for (id, v) in world.vehicles.iter() {
+            self.record_reroute(id.into(), v.trans.pos, &v.it);
             let (kind, tint) = match v.vehicle.kind {
                 VehicleKind::Car => (ActorKind::Car, v.vehicle.tint.into()),
                 VehicleKind::Truck => (ActorKind::Truck, v.vehicle.tint.into()),
@@ -405,7 +569,7 @@ impl EntitySamples {
                         .map_or_else(|| v.vehicle.tint.into(), |line| line.color.into()),
                 ),
             };
-            samples.actors.push(ActorSample {
+            self.actors.push(ActorSample {
                 id: ActorId::Vehicle(id),
                 kind,
                 pose: MeshInstance {
@@ -413,11 +577,12 @@ impl EntitySamples {
                     dir: v.trans.dir,
                     tint,
                 },
+                leader: None,
                 parked: v.vehicle.state.is_parked(),
             });
         }
         for (id, wagon) in world.wagons.iter() {
-            samples.actors.push(ActorSample {
+            self.actors.push(ActorSample {
                 id: ActorId::Wagon(id),
                 kind: ActorKind::RollingStock(wagon.wagon.rolling_stock),
                 pose: MeshInstance {
@@ -425,34 +590,15 @@ impl EntitySamples {
                     dir: wagon.trans.dir,
                     tint: LinearColor::WHITE,
                 },
+                leader: Some(wagon.itfollower.leader),
                 parked: false,
             });
         }
-        for (id, p) in world
-            .humans
-            .iter()
-            .filter(|(_, p)| matches!(p.location, Location::Outside))
-        {
-            samples.actors.push(ActorSample {
-                id: ActorId::Human(id),
-                kind: ActorKind::Pedestrian,
-                pose: MeshInstance {
-                    pos: p.trans.pos.up(0.5 + 0.4 * p.pedestrian.walk_anim.cos()),
-                    dir: p.trans.dir.xy().z0(),
-                    tint: LinearColor::WHITE,
-                },
-                parked: false,
-            });
+        for (id, train) in world.trains.iter() {
+            self.record_reroute(id.into(), train.trans.pos, &train.it);
         }
-        samples.reroutes.extend(
-            world
-                .query_trans_itin()
-                .filter_map(|(id, (trans, itinerary))| {
-                    let wait = itinerary.is_wait_for_reroute().filter(|&wait| wait != 0)?;
-                    Some((id, trans.pos, wait))
-                }),
-        );
-        samples
+        u64::from(self.actors.capacity() > actor_capacity)
+            + u64::from(self.reroutes.capacity() > reroute_capacity)
     }
 }
 
@@ -555,6 +701,85 @@ mod tests {
     }
 
     #[test]
+    fn client_max_turn_with_skipped_ticks_snaps_to_the_lane() {
+        let direction = geom::vec3(0.5, 0.8660254, 0.0);
+        let sample = |pos, dir| ActorSample {
+            id: ActorId::Vehicle(VehicleID::default()),
+            kind: ActorKind::Car,
+            pose: MeshInstance {
+                pos,
+                dir,
+                tint: LinearColor::WHITE,
+            },
+            leader: None,
+            parked: false,
+        };
+        let previous = sample(-Vec3::X * 20.0, Vec3::X);
+        let latest = sample(direction * 20.0, direction);
+        assert_eq!(latest.pose_from(&previous, 12, 0.5).pos, latest.pose.pos);
+        let straight = sample(Vec3::X * 20.0, Vec3::X);
+        assert_eq!(straight.pose_from(&previous, 12, 0.5).pos, Vec3::ZERO);
+    }
+
+    #[test]
+    fn client_max_paused_redraw_reuses_actors_even_when_forced() {
+        use geom::Transform;
+        use scenarios::ScenarioCtx;
+        use simulation::transportation::spawn_driving_vehicle;
+        use simulation::SimulationOptions;
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let mut scenario = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let car = spawn_driving_vehicle(
+            &mut scenario.sim,
+            VehicleKind::Car,
+            Transform::new(Vec3::X * 80.0),
+        )
+        .unwrap();
+        let mut source = SnapshotSource::default();
+        let boundary = Boundary {
+            generation: 1,
+            completed_step: 10,
+            last_batch: None,
+            tick: scenario.sim.get_tick(),
+        };
+        source.capture_map(&scenario.sim, boundary.generation, false);
+        let mut request = ViewRequest { camera: None };
+        source.capture_view(&scenario.sim, boundary, request, true, true);
+        let first = source.take().unwrap().view;
+        assert_eq!(first.entities.actors.len(), 1);
+
+        request.camera = Some(Camera::new(Vec3::ZERO, 800.0, 600.0));
+        source.capture_view(&scenario.sim, boundary, request, true, true);
+        let second = source.take().unwrap().view;
+        assert_eq!(
+            first.entities.actors.as_ptr(),
+            second.entities.actors.as_ptr()
+        );
+
+        scenario.sim.world_mut_unchecked().vehicles[car].trans.pos += Vec3::X;
+        source.capture_view(
+            &scenario.sim,
+            Boundary {
+                completed_step: boundary.completed_step + 1,
+                ..boundary
+            },
+            request,
+            true,
+            true,
+        );
+        let advanced = source.take().unwrap().view;
+        assert_ne!(
+            second.entities.actors[0].pose.pos,
+            advanced.entities.actors[0].pose.pos
+        );
+    }
+
+    #[test]
     fn scale_t2_actor_uses_full_id_and_snaps_on_jump() {
         use slotmapd::SlotMap;
 
@@ -570,6 +795,7 @@ mod tests {
                 dir: Vec3::X,
                 tint: LinearColor::WHITE,
             },
+            leader: None,
             parked: false,
         };
         let previous = sample(old_id, 1.0);
@@ -585,6 +811,32 @@ mod tests {
             sample(old_id, 50.0).pose_from(&previous, 1, 0.5).pos,
             Vec3::X * 50.0
         );
+    }
+
+    #[test]
+    fn scale_t2_selected_train_covers_wagons() {
+        let leader = TrainID::default();
+        let wagon = ActorSample {
+            id: ActorId::Wagon(WagonID::default()),
+            kind: ActorKind::RollingStock(RollingStockID::new("freight-wagon")),
+            pose: MeshInstance {
+                pos: Vec3::ZERO,
+                dir: Vec3::X,
+                tint: LinearColor::WHITE,
+            },
+            leader: Some(leader),
+            parked: false,
+        };
+        assert!(SelectionView {
+            selected: Some(leader.into()),
+            followed: None
+        }
+        .contains(&wagon));
+        assert!(SelectionView {
+            selected: None,
+            followed: Some(leader.into())
+        }
+        .contains(&wagon));
     }
 
     #[test]

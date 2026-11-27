@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage, HeightmapRender};
 use engine::{FrameContext, GfxContext};
 use geom::Camera;
-use simulation::map::{Map, SubscriberChunkID};
+use simulation::map::{RenderMap, SubscriberChunkID};
 
 const CSIZE: u32 = simulation::map::Heightmap::SIZE;
 const CRESO: usize = simulation::map::Heightmap::RESOLUTION;
@@ -56,7 +56,7 @@ pub struct TerrainRender {
 }
 
 impl TerrainRender {
-    pub fn new(gfx: &mut GfxContext, map: &Map) -> Self {
+    pub fn new(gfx: &mut GfxContext, map: &RenderMap) -> Self {
         let (w, h) = map.environment().size();
 
         let terrain = HeightmapRender::new(gfx, w as u32, h as u32);
@@ -101,7 +101,7 @@ impl TerrainRender {
     pub(super) fn upload_bucket(
         &mut self,
         gfx: &mut GfxContext,
-        map: &Map,
+        map: &RenderMap,
         bucket: SubscriberChunkID,
     ) {
         for id in bucket.convert() {

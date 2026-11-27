@@ -36,6 +36,14 @@ enum BadgeKind {
 }
 
 impl BadgeKind {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Fire => 0,
+            Self::Blackout => 1,
+            _ => 2,
+        }
+    }
+
     fn appearance(self) -> (&'static str, &'static str, Color) {
         match self {
             Self::Fire => ("Fire", "F", Color::rgb(255, 153, 96)),
@@ -107,11 +115,22 @@ const MAX_PROBLEM_MARKERS: usize = 4096;
 
 pub(crate) struct ProblemMarker {
     pos: Vec3,
+    depth: f32,
     kind: BadgeKind,
     building: BuildingID,
 }
 
-const MAX_PROBLEM_CANDIDATES: usize = 16_384;
+impl ProblemMarker {
+    fn rank(&self) -> (u8, OrderedFloat<f32>, BuildingID) {
+        (
+            self.kind.priority(),
+            OrderedFloat(self.depth),
+            self.building,
+        )
+    }
+}
+
+const MAX_CACHED_CANDIDATES: usize = 16_384;
 
 #[derive(PartialEq)]
 struct CandidateKey {
@@ -121,7 +140,7 @@ struct CandidateKey {
     viewport: Vec2,
 }
 
-type Candidates = Vec<(BuildingID, Vec3)>;
+type Candidates = Vec<(BuildingID, Vec3, f32)>;
 
 thread_local! {
     static CANDIDATES: RefCell<Option<(CandidateKey, Candidates)>> = const { RefCell::new(None) };
@@ -135,7 +154,7 @@ fn candidates(map: &Map, camera: &Camera, viewport: Vec2) -> Candidates {
     let buildings = map.buildings();
     // For a wide view of a compact city, walk building storage directly.
     // The broad spatial query also traverses roads, intersections and lots.
-    let candidates = if bounds.area() >= 1_000_000.0 && buildings.len() <= MAX_PROBLEM_CANDIDATES {
+    let candidates = if bounds.area() >= 1_000_000.0 && buildings.len() <= MAX_CACHED_CANDIDATES {
         Either::Left(buildings.values().filter(|building| {
             building.zone.as_ref().map_or_else(
                 || bounds.intersects(&building.obb),
@@ -154,9 +173,8 @@ fn candidates(map: &Map, camera: &Camera, viewport: Vec2) -> Candidates {
             let pos = building.obb.center().z(building.height + 27.0);
             let (point, depth) = camera.project(pos);
             (depth.is_finite() && depth > 0.0 && point.is_finite() && screen.contains(point))
-                .then_some((building.id, pos))
+                .then_some((building.id, pos, depth))
         })
-        .take(MAX_PROBLEM_CANDIDATES)
         .collect()
 }
 
@@ -174,35 +192,35 @@ pub(super) fn capture(
         viewport: vec2(camera.viewport_w, camera.viewport_h),
     };
     CANDIDATES.with_borrow_mut(|cache| {
-        if cache.as_ref().is_none_or(|(previous, _)| *previous != key) {
-            let candidates = candidates(&map, camera, key.viewport);
-            *cache = Some((key, candidates));
+        if let Some((previous, candidates)) = cache.as_ref() {
+            if *previous == key {
+                return capture_status(sim, &map, candidates);
+            }
         }
-        capture_status(sim, &map, &cache.as_ref().unwrap().1)
+        let candidates = candidates(&map, camera, key.viewport);
+        let markers = capture_status(sim, &map, &candidates);
+        *cache = (candidates.len() <= MAX_CACHED_CANDIDATES).then_some((key, candidates));
+        markers
     })
 }
 
 fn capture_status(
     sim: &Simulation,
     map: &Map,
-    candidates: &[(BuildingID, Vec3)],
+    candidates: &[(BuildingID, Vec3, f32)],
 ) -> Vec<ProblemMarker> {
     let mut utilities = SiteUtilityReader::for_display(sim);
     let fires = sim.read::<Fires>();
     let power = sim.read::<ElectricityFlow>();
     let mut markers = Vec::new();
-    for &(id, pos) in candidates {
-        if markers.len() == MAX_PROBLEM_MARKERS {
-            break;
-        }
+    for &(id, pos, depth) in candidates {
         let mut push = |kind| {
-            if markers.len() < MAX_PROBLEM_MARKERS {
-                markers.push(ProblemMarker {
-                    pos,
-                    kind,
-                    building: id,
-                });
-            }
+            markers.push(ProblemMarker {
+                pos,
+                depth,
+                kind,
+                building: id,
+            })
         };
 
         if fires.by_building.contains_key(&id) {
@@ -227,6 +245,15 @@ fn capture_status(
         };
         push(kind);
     }
+    limit_markers(markers)
+}
+
+fn limit_markers(mut markers: Vec<ProblemMarker>) -> Vec<ProblemMarker> {
+    if markers.len() > MAX_PROBLEM_MARKERS {
+        markers.select_nth_unstable_by_key(MAX_PROBLEM_MARKERS, ProblemMarker::rank);
+        markers.truncate(MAX_PROBLEM_MARKERS);
+    }
+    markers.sort_unstable_by_key(ProblemMarker::rank);
     markers
 }
 
@@ -386,7 +413,13 @@ impl Widget for BadgeHitWidget {
 }
 
 fn place_badges(mut visible: Vec<Badge>, screen: AABB) -> Vec<PlacedBadge> {
-    visible.sort_by_key(|badge| (badge.kind != BadgeKind::Fire, OrderedFloat(badge.depth)));
+    visible.sort_unstable_by_key(|badge| {
+        (
+            badge.kind.priority(),
+            OrderedFloat(badge.depth),
+            badge.building,
+        )
+    });
 
     let count_digits = visible.len().max(1).ilog10() as usize + 1;
     let mut placed: Vec<PlacedBadge> = Vec::new();
@@ -603,6 +636,29 @@ mod tests {
                 "{kind:?} clickable={clickable} swallowed a right click"
             );
         }
+    }
+
+    #[test]
+    fn client_max_saturated_problem_markers_keep_incidents_and_nearby_badges() {
+        let marker = |kind, distance| ProblemMarker {
+            pos: Vec3::X * distance,
+            depth: distance,
+            kind,
+            building: BuildingID::default(),
+        };
+        let mut markers: Vec<_> = (0..MAX_PROBLEM_MARKERS * 5)
+            .map(|_| marker(BadgeKind::NoWater, 100.0))
+            .collect();
+        markers.extend([
+            marker(BadgeKind::NoWater, 2.0),
+            marker(BadgeKind::Blackout, 10.0),
+            marker(BadgeKind::Fire, 20.0),
+        ]);
+        let bounded = limit_markers(markers);
+        assert_eq!(bounded.len(), MAX_PROBLEM_MARKERS);
+        assert_eq!(bounded[0].kind, BadgeKind::Fire);
+        assert_eq!(bounded[1].kind, BadgeKind::Blackout);
+        assert_eq!(bounded[2].pos, Vec3::X * 2.0);
     }
 
     #[test]

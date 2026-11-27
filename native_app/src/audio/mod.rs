@@ -4,7 +4,7 @@ use crate::audio::music::Music;
 use crate::uiworld::UiWorld;
 use engine::AudioContext;
 use geom::Camera;
-use simulation::map::Map;
+use simulation::map::RenderMap;
 use simulation::Simulation;
 
 mod ambient;
@@ -51,7 +51,7 @@ impl GameAudio {
     pub(crate) fn update(
         &mut self,
         input: Option<AudioInputs>,
-        map: &Map,
+        map: &RenderMap,
         uiworld: &UiWorld,
         ctx: &mut AudioContext,
     ) {

@@ -8,6 +8,7 @@ use simulation::Simulation;
 use crate::debug_gui::debug_inspect::debug_inspector;
 use crate::debug_gui::debug_window::debug_window;
 use crate::gui::{inspect, selectable, ErrorTooltip, GuiState, PotentialCommands, Tool};
+#[cfg(test)]
 use crate::inputmap::InputMap;
 use crate::uiworld::UiWorld;
 
@@ -25,7 +26,8 @@ impl VehicleHover {
         self.hit.is_some()
     }
 
-    pub(crate) fn update(
+    #[cfg(test)]
+    fn update_live(
         &mut self,
         picker: &mut selectable::VehiclePicker,
         sim: &Simulation,
@@ -58,6 +60,31 @@ impl VehicleHover {
             self.last_pick = Some(now);
             self.hit = picker.pick_indexed(sim, &map, ray);
         }
+    }
+
+    pub(crate) fn update_displayed(
+        &mut self,
+        picker: &selectable::VehiclePicker,
+        sim: &Simulation,
+        ray: Option<geom::Ray3>,
+        generation: u64,
+        now: Instant,
+    ) {
+        let Some(ray) = ray else {
+            *self = Self::default();
+            return;
+        };
+        if self.hit.is_none()
+            && self
+                .last_pick
+                .is_some_and(|at| now.duration_since(at) < HOVER_REFRESH)
+        {
+            return;
+        }
+        self.last_pick = Some(now);
+        self.hit = picker
+            .pick_displayed(ray, generation)
+            .filter(|hit| hit.valid_in(sim));
     }
 
     fn text_at(&mut self, uiworld: &UiWorld, sim: &Simulation, now: Instant) -> Option<&str> {
@@ -209,7 +236,7 @@ mod tests {
         now: Instant,
     ) -> Option<&'a str> {
         let mut picker = ui.write::<selectable::VehiclePicker>();
-        hover.update(&mut picker, sim, input, now, |picker| {
+        hover.update_live(&mut picker, sim, input, now, |picker| {
             if let Some(picker) =
                 picker.and_then(|picker| picker.start_snapshot(sim).then_some(picker))
             {
