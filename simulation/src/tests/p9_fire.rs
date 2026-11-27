@@ -651,3 +651,27 @@ fn p9_scenario_fire_rules_are_local_and_survive_reload() {
     assert_eq!(*restored.read::<FireScenarioRules>(), rules);
     assert_eq!(*ordinary.g.read::<FireScenarioRules>(), FireScenarioRules::default());
 }
+
+#[test]
+fn p9_snapshot_rejects_an_ordinary_vehicle_on_a_claimed_service_curb() {
+    use crate::souls::service_access::preview_fire_apron;
+    use crate::transportation::{spawn_driving_vehicle, VehicleKind, VehicleState};
+    use geom::{Transform, Vec3};
+
+    let (mut test, station) = fire_station_on_parking_loop();
+    let apron = preview_fire_apron(&test.g, station).unwrap();
+    let spot = *apron.parking_displacements.first().expect("fixture displaces a curb space");
+    let reservation = Bincode::decode(&Bincode::encode(&spot).unwrap()).unwrap();
+    let car = spawn_driving_vehicle(
+        &mut test.g,
+        VehicleKind::Car,
+        Transform::new_dir(apron.bay.pos + Vec3::X * 20.0, Vec3::X),
+    ).unwrap();
+    test.g.world.vehicles[car].vehicle.state = VehicleState::ReturningToDepot {
+        spot: reservation,
+        stopped_ticks: 0,
+    };
+    let snapshot = Bincode::encode(&test.g).unwrap();
+    let error = Bincode::decode::<Simulation>(&snapshot).err().expect("ambiguous curb ownership");
+    assert!(error.to_string().contains("service curb conflicts with ordinary parking"));
+}
