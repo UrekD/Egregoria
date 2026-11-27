@@ -436,7 +436,7 @@ fn pathpark_property_departure_finds_reachable_curb_for_opposite_sidewalk() {
         person.router.go_to(Destination::Outside(destination));
     });
     assert!(
-        (0..7_000).any(|_| {
+        (0..16_000).any(|_| {
             ctx.g.world.edit_human(human, |person| person.decision.wait = u8::MAX);
             ctx.tick_fast();
             let person = &ctx.g.world.humans[human];
@@ -547,7 +547,8 @@ fn pathpark_property_departure_uses_distant_street_bays_when_nearby_supply_is_cl
                 parking.mask(spot);
             }
         }
-        assert!(!parking.property_curb_candidates(&map, door).1.is_empty());
+        let mut work = 1_024;
+        assert!(!parking.property_curb_candidates(&map, door, &mut work).1.is_empty());
     }
     ctx.g.world.edit_human(human, |h| {
         h.router.go_to(Destination::Outside(door));

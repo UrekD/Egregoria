@@ -1925,7 +1925,8 @@ impl Router {
         if selected.is_none() && budget.deferred.is_none() && allow_shared {
             // Check reachability before taking the curb reservation, using the lane
             // alongside the bay so a parallel road cannot supply the approach.
-            let (curb, other_streets) = parking.property_curb_candidates(map, destination);
+            let (curb, other_streets) =
+                parking.property_curb_candidates(map, destination, &mut budget.work);
             street = other_streets;
             selected = curb
                 .into_iter()

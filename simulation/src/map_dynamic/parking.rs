@@ -104,40 +104,60 @@ impl ParkingManagement {
         &self,
         map: &Map,
         near: Vec3,
+        remaining: &mut usize,
     ) -> (Vec<ParkingSpotID>, Vec<ParkingSpotID>) {
         use ordered_float::OrderedFloat;
+        if *remaining == 0 {
+            return (Vec::new(), Vec::new());
+        }
         let radius = 400.0_f32;
         let mut lanes = Vec::new();
         let mut inspections = 48;
+        let projection_limit = (*remaining).min(192);
+        let mut projection_work = projection_limit;
         for hit in map
             .spatial_map()
             .parking_roads(near.xy(), radius)
             .take(16)
         {
+            let Some(left) = projection_work.checked_sub(1) else {
+                break;
+            };
+            projection_work = left;
             inspections -= 1;
             let Some(road) = map.get(hit) else { continue };
             for (lane, kind) in road.lanes_iter() {
+                let Some(left) = projection_work.checked_sub(1) else {
+                    break;
+                };
+                projection_work = left;
                 if kind != LaneKind::Parking {
                     continue;
                 }
-                if let Some(spots) = map.parking.closest_spots(lane, near) {
+                if let Some(spots) = map.parking.curb_spots_near(
+                    &map.lanes()[lane],
+                    near,
+                    &mut projection_work,
+                ) {
                     lanes.push(spots);
                 }
             }
         }
+        *remaining -= projection_limit - projection_work;
         // Interleave lanes so a full stretch of curb cannot consume the whole
         // inspection allowance before a different street is even considered.
         let mut curb = Vec::new();
         let mut street = Vec::new();
-        while inspections > 0 && !lanes.is_empty() {
+        while inspections > 0 && *remaining > 0 && !lanes.is_empty() {
             lanes.retain_mut(|spots| {
-                if inspections == 0 {
+                if inspections == 0 || *remaining == 0 {
                     return false;
                 }
                 let Some(spot) = spots.next() else {
                     return false;
                 };
                 inspections -= 1;
+                *remaining -= 1;
                 let bay = map.parking.get(spot).unwrap();
                 let distance = bay.trans.pos.distance2(near);
                 if distance <= radius.powi(2)
