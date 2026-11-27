@@ -516,7 +516,8 @@ impl ReplayJson {
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
                 let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
                 if discarded || legacy.registry.is_some() {
-                    crate::check_prototype_registry(legacy.registry).map_err(replay_decode_error)?;
+                    crate::check_snapshot_registry(legacy.registry, &version)
+                        .map_err(replay_decode_error)?;
                 }
                 Ok(Replay {
                     obsolete_recording_discarded: discarded,
