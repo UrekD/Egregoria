@@ -8,7 +8,6 @@ use simulation::Simulation;
 use crate::debug_gui::debug_inspect::debug_inspector;
 use crate::debug_gui::debug_window::debug_window;
 use crate::gui::{inspect, selectable, ErrorTooltip, GuiState, PotentialCommands, Tool};
-#[cfg(test)]
 use crate::inputmap::InputMap;
 use crate::uiworld::UiWorld;
 
