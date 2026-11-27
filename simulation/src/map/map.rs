@@ -62,7 +62,7 @@ pub struct LotOrigin {
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionEndpoint {
     pub pos: Vec3,
-    kind: ProjectKind,
+    pub(crate) kind: ProjectKind,
     split_point: Option<(Vec3, usize)>,
 }
 

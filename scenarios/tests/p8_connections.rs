@@ -9,6 +9,7 @@ use scenarios::ScenarioCtx;
 use serde::Serialize;
 use simulation::economy::cargo::CargoBook;
 use simulation::map::{BuildingID, LaneKind};
+use simulation::map_dynamic::transit::{JourneyStats, RailSchedule, RailTransit};
 use simulation::map_dynamic::{Destination, LineID, Router, RoutingStep, StopID, Transit};
 use simulation::souls::human::{spawn_human, HumanDecisionKind};
 use simulation::transportation::Location;
@@ -118,7 +119,7 @@ struct BusOfferTrace {
     arrived_tick: Option<u64>,
 }
 
-fn bus_offer(cross_line: bool, with_service: bool) -> BusOfferTrace {
+fn bus_offer(cross_line: bool, with_service: bool, opposite_sidewalks: bool) -> BusOfferTrace {
     let mut ctx = ScenarioCtx::new(SimulationOptions {
         save_replay: false,
         terrain_size: 0,
@@ -133,8 +134,12 @@ fn bus_offer(cross_line: bool, with_service: bool) -> BusOfferTrace {
     );
     let east = line(
         &mut ctx,
-        &[([2, 0], [2, 1]), ([3, 0], [4, 0]), ([4, 1], [3, 1])],
-        10.0,
+        &[
+            if opposite_sidewalks { ([2, 1], [2, 0]) } else { ([2, 0], [2, 1]) },
+            ([3, 0], [4, 0]),
+            ([4, 1], [3, 1]),
+        ],
+        if opposite_sidewalks { 0.0 } else { 10.0 },
     );
     if !with_service {
         apply(
@@ -224,9 +229,9 @@ fn bus_offer(cross_line: bool, with_service: bool) -> BusOfferTrace {
 
 #[test]
 fn p8_bus_stock_reduction_controls() {
-    let walking = bus_offer(true, false);
+    let walking = bus_offer(true, false, false);
     assert!(walking.arrived_tick.is_some() && walking.boardings.is_empty());
-    let single = bus_offer(false, true);
+    let single = bus_offer(false, true, false);
     assert_eq!(
         single.boardings.len(),
         1,
@@ -238,7 +243,7 @@ fn p8_bus_stock_reduction_controls() {
 
 #[test]
 fn p8_bus_stock_reduction() {
-    let trace = bus_offer(true, true);
+    let trace = bus_offer(true, true, false);
     assert!(
         trace.boardings.len() >= 2,
         "the offer completed fewer than two boardings"
@@ -250,6 +255,13 @@ fn p8_bus_stock_reduction() {
     };
     assert!(trace.boardings[0].0 < first && first < trace.boardings[1].0);
     assert!(trace.boardings[1].0 < second && second < trace.arrived_tick.unwrap());
+}
+
+#[test]
+fn p8_bus_pinned_opposite_sidewalks_respect_crossing_detour() {
+    let trace = bus_offer(true, true, true);
+    assert!(trace.arrived_tick.is_some());
+    assert_eq!(trace.boardings.len(), 1);
 }
 
 #[test]
@@ -352,15 +364,18 @@ fn p8_rail_passenger_station_can_be_built_through_commands() {
         .any(|building| building.kind == BuildingKind::TrainStation));
 }
 
-#[test]
-fn p8_rail_out_and_back_with_deterministic_resume() {
+fn rail_fixture(schedule: RailSchedule) -> (ScenarioCtx, LineID) {
+    passenger_rail_fixture(schedule, false).unwrap()
+}
+
+fn passenger_rail_fixture(
+    schedule: RailSchedule,
+    across_road: bool,
+) -> Result<(ScenarioCtx, LineID), simulation::world_command::Rejection> {
     use geom::OBB;
-    use prototypes::{BuildingGen, Money, RollingStockID};
-    use simulation::economy::{Budget, BudgetCategory};
+    use prototypes::{BuildingGen, RollingStockID};
     use simulation::map::{BuildingKind, LanePatternBuilder, ProjectFilter};
-    use simulation::map_dynamic::transit::{
-        JourneyStats, RailPlatformSpec, RailSchedule, RailTransit,
-    };
+    use simulation::map_dynamic::transit::RailPlatformSpec;
     use simulation::world_command::Rejection;
 
     let mut ctx = ScenarioCtx::new(SimulationOptions::LEGACY);
@@ -395,9 +410,22 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
     for (&from, &to) in corners.iter().zip(corners.iter().cycle().skip(1)) {
         connect(from, to, true);
     }
+    // The rail right of way leaves residential lots on the far sidewalk.
+    // Add junction crosswalks before placing the stations and issuing offers.
+    for (x, y, end_y) in [(800.0, south, 520.0), (900.0, north, 1080.0)] {
+        let from = ctx.sim.map().project(vec2(x, y).z0(), 5.0, ProjectFilter::ROAD);
+        let to = ctx.sim.map().project(vec2(x, end_y).z0(), 1.0, ProjectFilter::INTER);
+        apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
+            from,
+            to,
+            inter: None,
+            pat: road_pattern.clone(),
+        }]);
+    }
 
     let mut platforms = Vec::new();
-    for (road_y, track_y, side) in [(south, south + 30.0, -1.0), (north, north - 30.0, 1.0)] {
+    for (road_y, track_y, side) in [(south, south + 30.0, 1.0), (north, north - 30.0, -1.0)] {
+        let side = if across_road { -side } else { side };
         let x = 850.0;
         let road = ctx
             .sim
@@ -448,10 +476,11 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
             .unwrap_err(),
             Rejection::InvalidConnection,
         );
-        apply(
-            &mut ctx.sim,
-            &[WorldCommand::TransitAddRailPlatform { platform: spec }],
-        );
+        let add = WorldCommand::TransitAddRailPlatform { platform: spec };
+        if across_road {
+            add.preview(&ctx.sim)?;
+        }
+        apply(&mut ctx.sim, &[add]);
         platforms.push(
             *ctx.sim
                 .read::<RailTransit>()
@@ -462,10 +491,6 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         );
     }
 
-    let schedule = RailSchedule {
-        headway_ticks: 1_000,
-        ..RailSchedule::default()
-    };
     let consist = vec![RollingStockID::new("passenger-emu-front")];
     apply(
         &mut ctx.sim,
@@ -476,6 +501,131 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         }],
     );
     let line = *ctx.sim.read::<RailTransit>().lines.keys().next().unwrap();
+    Ok((ctx, line))
+}
+
+#[test]
+fn p8_rail_rejects_unmarked_cross_road_connector() {
+    assert!(matches!(
+        passenger_rail_fixture(RailSchedule::default(), true),
+        Err(simulation::world_command::Rejection::InvalidConnection),
+    ));
+}
+
+#[test]
+fn p8_rail_recurring_zero_lateness_departures() {
+    let schedule = RailSchedule {
+        max_late_ticks: 0,
+        ..RailSchedule::default()
+    };
+    let (mut ctx, _) = rail_fixture(schedule);
+    let mut was_en_route = false;
+    let mut departures = Vec::new();
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        let en_route = ctx.sim.read::<RailTransit>().runs.values().any(|run| {
+            run.next_platform_index() == 1 && run.dwell_until().is_none()
+        });
+        if en_route && !was_en_route {
+            departures.push(simulation::map_dynamic::transit::simulation_elapsed_ticks(&ctx.sim).0);
+        }
+        if departures.len() == 2 {
+            break;
+        }
+        was_en_route = en_route;
+    }
+    assert_eq!(departures.len(), 2);
+    for departure in departures {
+        assert_eq!(departure % schedule.headway_ticks, 0, "departure {departure}");
+    }
+}
+
+#[test]
+fn p8_rail_bus_connections_in_both_directions() {
+    use simulation::map::{LanePatternBuilder, ProjectFilter};
+
+    let (mut ctx, _) = rail_fixture(RailSchedule::default());
+    let from = ctx.sim.map().project(vec2(800.0, 520.0).z0(), 1.0, ProjectFilter::INTER);
+    let to = ctx.sim.map().project(vec2(800.0, 120.0).z0(), 1.0, ProjectFilter::INTER);
+    apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
+        from,
+        to,
+        inter: None,
+        pat: LanePatternBuilder::new().build(),
+    }]);
+    let mut stops = Vec::new();
+    for (point, direction) in [(vec2(800.0, 230.0), Vec2::Y), (vec2(865.0, 600.0), -Vec2::X)] {
+        let add = {
+            let map = ctx.sim.map();
+            let lane = map.lanes().values()
+                .filter(|lane| lane.kind == LaneKind::Driving)
+                .filter(|lane| lane.points.first_dir().is_some_and(|dir| dir.xy().dot(direction) > 0.9))
+                .min_by(|a, b| a.points.project_dist(point.z0()).total_cmp(&b.points.project_dist(point.z0())))
+                .unwrap();
+            WorldCommand::TransitAddStop {
+                pos: lane.points.project(point.z0()),
+                dir: direction,
+            }
+        };
+        apply(&mut ctx.sim, &[add]);
+        stops.push(ctx.sim.read::<Transit>().stops.keys().last().unwrap());
+    }
+    apply(&mut ctx.sim, &[WorldCommand::TransitCreateLine { stops }]);
+    let bus = ctx.sim.read::<Transit>().lines.keys().last().unwrap();
+    apply(&mut ctx.sim, &[WorldCommand::TransitSetVehicles { line: bus, n: 3 }]);
+
+    let destination = house(&mut ctx.sim, vec2(900.0, 1020.0));
+    let mut cohort = Vec::new();
+    for _ in 0..20 {
+        let home = house(&mut ctx.sim, vec2(780.0, 260.0));
+        cohort.push((spawn_human(&mut ctx.sim, home).unwrap(), home));
+    }
+    ctx.run_ticks(950);
+    for outward in [true, false] {
+        let mut trips = Vec::new();
+        for &(id, home) in &cohort {
+            let building = if outward { destination } else { home };
+            let dest = Destination::Building(building);
+            let h = ctx.sim.world_mut_unchecked().humans.get_mut(id).unwrap();
+            h.pedestrian.walking_speed = 1.25;
+            h.router = Router::new(None);
+            h.router.go_to(dest);
+            h.decision.kind = HumanDecisionKind::GoTo(dest);
+            trips.push((id, building, Vec::new(), 0, false));
+        }
+        for _ in 0..CUTOFF {
+            ctx.run_ticks(1);
+            for (id, dest, modes, previous, arrived) in trips.iter_mut().filter(|trip| !trip.4) {
+                let h = ctx.sim.get(*id).unwrap();
+                let mode = match h.location {
+                    Location::Transit(_) => 1,
+                    Location::RailTransit(_) => 2,
+                    _ => 0,
+                };
+                if mode != 0 && *previous != mode {
+                    modes.push(mode);
+                }
+                *previous = mode;
+                *arrived = h.location == Location::Building(*dest);
+            }
+            if trips.iter().all(|trip| trip.4) {
+                break;
+            }
+        }
+        let expected = if outward { [1, 2] } else { [2, 1] };
+        let arrived = trips.iter().filter(|trip| trip.4).count();
+        let transferred = trips.iter().filter(|trip| trip.4 && trip.2.as_slice() == expected).count();
+        println!("rail cohort outward={outward} offered={} arrived={arrived} transferred={transferred}", trips.len());
+        assert!(arrived >= 16 && transferred >= 5, "{trips:?}");
+    }
+}
+
+#[test]
+fn p8_rail_out_and_back_with_deterministic_resume() {
+    use prototypes::Money;
+    use simulation::economy::{Budget, BudgetCategory};
+
+    let (mut ctx, line) = rail_fixture(RailSchedule::default());
     apply(
         &mut ctx.sim,
         &[WorldCommand::TransitSetFare {
@@ -483,8 +633,8 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
             fare: Money::new_bucks(2),
         }],
     );
-    let from = house(&mut ctx.sim, vec2(800.0, south + 20.0));
-    let to = house(&mut ctx.sim, vec2(900.0, north - 20.0));
+    let from = house(&mut ctx.sim, vec2(800.0, 620.0));
+    let to = house(&mut ctx.sim, vec2(900.0, 980.0));
     let human = spawn_human(&mut ctx.sim, from).unwrap();
     let offer = |sim: &mut Simulation, to| {
         let h = sim.world_mut_unchecked().humans.get_mut(human).unwrap();
@@ -519,6 +669,31 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         rider.router.cur_step()
     );
     assert!(rider.collider.is_none());
+    for _ in 0..1_500 {
+        if ctx.sim.read::<RailTransit>().runs.values().any(|run| {
+            run.next_platform_index() == 1 && run.dwell_until().is_none()
+        }) {
+            break;
+        }
+        ctx.run_ticks(1);
+    }
+    assert!(ctx.sim.read::<RailTransit>().runs.values().any(|run| {
+        run.next_platform_index() == 1 && run.dwell_until().is_none()
+    }));
+    let destination_stop = ctx.sim.read::<Transit>().lines[line].stops[1];
+    let platform = ctx.sim.read::<RailTransit>().platforms[&destination_stop];
+    let road = ctx.sim.map().get(platform.lane).unwrap().parent;
+    let before = ctx.sim.hashes();
+    assert_eq!(
+        WorldCommand::MapRemoveRoad(road).preview(&ctx.sim).unwrap_err(),
+        simulation::world_command::Rejection::OccupiedTrack,
+    );
+    assert_eq!(before, ctx.sim.hashes());
+    ctx.sim.apply_commands([&WorldCommand::MapRemoveRoad(road)]);
+    assert_eq!(ctx.sim.read::<CommandOutcomes>().last.as_slice(), &[
+        ("MapRemoveRoad", simulation::world_command::Rejection::OccupiedTrack),
+    ]);
+    assert_eq!(before, ctx.sim.hashes());
     let bytes = ctx
         .sim
         .encode_slot(simulation::SnapshotRevision::new(1))

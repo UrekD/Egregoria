@@ -216,20 +216,20 @@ impl HumanWork {
         mask |= u8::from(human.router.needs_route_change(&human.location))
             << Self::RouteChanged as usize;
         mask |= u8::from(human.router.has_route_step()) << Self::RouteStep as usize;
-        mask |= u8::from(matches!(
-            human.location,
-            Location::Outside | Location::Transit(_)
-        )) << Self::Outside as usize;
-        let transit_work = matches!(
-            human.location,
-            Location::Transit(_) | Location::RailTransit(_)
-        ) || (human.location == Location::Outside
-            && matches!(
-                human.router.cur_step(),
-                Some(crate::map_dynamic::RoutingStep::WaitAtStop { .. })
-            ));
-        mask |= u8::from(transit_work) << Self::Transit as usize;
-        mask
+        const OUTSIDE: u8 = 1 << HumanWork::Outside as usize;
+        const TRANSIT: u8 = 1 << HumanWork::Transit as usize;
+        mask | match human.location {
+            Location::Outside => {
+                let waiting = matches!(
+                    human.router.cur_step(),
+                    Some(crate::map_dynamic::RoutingStep::WaitAtStop { .. })
+                );
+                OUTSIDE | u8::from(waiting) * TRANSIT
+            }
+            Location::Transit(_) => OUTSIDE | TRANSIT,
+            Location::RailTransit(_) => TRANSIT,
+            _ => 0,
+        }
     }
 }
 

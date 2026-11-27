@@ -2022,7 +2022,9 @@ impl SimulationDeser {
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
                 let Some(data) = self.res.get(l.name) else {
-                    if l.optional {
+                    let required_passenger_state = self._header.version == VERSION
+                        && matches!(l.name, "passenger_journey_stats" | "passenger_rail");
+                    if l.optional && !required_passenger_state {
                         continue;
                     }
                     return Err(corrupt(format!("Missing resource {}", l.name)));
@@ -2088,6 +2090,7 @@ impl SimulationDeser {
         sim.map_mut().migrated_roundabout_paths.clear();
         sim.write::<transit::Transit>().rebuild_berth_index();
         transit::validate_rail_snapshot(&sim).map_err(|reason| corrupt(reason.into()))?;
+        transit::validate_journey_snapshot(&sim).map_err(|reason| corrupt(reason.into()))?;
         if sim
             .map()
             .lane_scoring_pilot()
@@ -2194,6 +2197,22 @@ const START_COMMANDS: &str = r#"
 #[cfg(test)]
 mod p4_fix_ac_tests {
     use super::*;
+
+    #[test]
+    fn p8_w2_current_snapshot_requires_passenger_resources() {
+        let ctx = crate::tests::TestCtx::new_fast();
+        for name in ["passenger_journey_stats", "passenger_rail"] {
+            let mut res = ctx.g.snapshot_resources(true, usize::MAX).unwrap();
+            assert!(res.remove(name).is_some());
+            let bytes = Bincode::encode(&SimulationSer {
+                header: SaveHeader::current(),
+                world: ctx.g.world(),
+                res,
+            }).unwrap();
+            let error = Bincode::decode::<Simulation>(&bytes).err().expect("missing resource accepted");
+            assert!(error.to_string().contains(name), "{error}");
+        }
+    }
 
     fn save_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

@@ -24,7 +24,8 @@ use std::collections::BTreeSet;
 
 #[path = "transit_path.rs"]
 mod transit_path;
-use transit_path::{TransitPaths, ValidatedWalk};
+pub(super) use transit_path::PendingSearch;
+use transit_path::{SearchSlice, TransitPaths, ValidatedWalk};
 
 const PERSONAL_CAR_ACCESS_RADIUS: f32 = 4.0 * NEAR_PARKING_RADIUS;
 
@@ -128,13 +129,22 @@ fn routing_changed(
     let cbuf_human = resources.read::<ParCommandBuffer<HumanEnt>>();
     let cbuf_vehicle = resources.read::<ParCommandBuffer<VehicleEnt>>();
     let transit = resources.read::<Transit>();
-    let rail = resources.read::<crate::map_dynamic::transit::RailTransit>();
+    let rail = (!transit.lines.is_empty())
+        .then(|| resources.read::<crate::map_dynamic::transit::RailTransit>());
+    let active_service = !transit.runs.is_empty()
+        || rail.as_ref().is_some_and(|rail| !rail.runs.is_empty());
     let mut transit_paths = None;
+    let mut pending_walks = 128;
+    let mut new_requests = 24;
+    let mut resumed_requests = 40;
 
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let h: &mut HumanEnt = h;
         let router = &mut h.router;
-        if h.location.is_transit() || h.it.is_pedestrian_egress() {
+        if h.location.is_transit()
+            || h.it.is_pedestrian_egress()
+            || (router.replan_at_alight && h.it.is_simple() && !h.it.has_ended(0.0))
+        {
             return;
         }
         if std::mem::take(&mut router.replan_at_alight) {
@@ -168,11 +178,6 @@ fn routing_changed(
         }
         let dest = unwrap_ret!(router.target_dest);
 
-        let replacing_wait = matches!(router.cur_step, Some(RoutingStep::WaitAtStop { .. }));
-        router.clear_steps(parking);
-        if replacing_wait && h.location == Location::Outside && h.collider.is_none() {
-            Router::restore_walking(h, h.trans.pos, resources);
-        }
         let router = &mut h.router;
         let (pos, building) = match dest {
             Destination::Outside(pos) => (pos, None),
@@ -209,7 +214,7 @@ fn routing_changed(
         let router = &mut h.router;
 
         let mut transit_steps = None;
-        if (!transit.runs.is_empty() || !rail.runs.is_empty())
+        if active_service
             && router.allows_transit(&h.household)
             && !matches!(h.location, Location::Vehicle(_))
             && (router.vehicle.is_none() || router.vehicle == router.personal_car)
@@ -227,7 +232,7 @@ fn routing_changed(
             {
                 let now = elapsed_ticks(resources);
                 let paths = transit_paths.get_or_insert_with(|| {
-                    TransitPaths::with_rail(&transit, Some(&rail), now, &headway)
+                    TransitPaths::with_rail(&transit, rail.as_deref(), now, &headway)
                 });
                 if paths.has_service() {
                     let origin = match h.location {
@@ -238,7 +243,10 @@ fn routing_changed(
                         car_pos.distance2(origin) <= PERSONAL_CAR_ACCESS_RADIUS.powi(2)
                     });
                     let walk_speed = f64::from(h.pedestrian.walking_speed);
-                    transit_steps = paths.winning_steps(
+                    let credit = resources
+                        .read::<crate::map_dynamic::transit::JourneyStats>()
+                        .credit(id, now);
+                    let plan = |search| paths.winning_steps(
                         origin,
                         pos,
                         &h.location,
@@ -246,20 +254,52 @@ fn routing_changed(
                         now,
                         nearby_car,
                         walk_speed,
-                        resources
-                            .read::<crate::map_dynamic::transit::JourneyStats>()
-                            .credit(id, now),
+                        credit,
+                        search,
                         |line| transit.allows_line_for_trip(id, router, line),
                     );
+                    if paths.has_interchanges() {
+                        let mut stats = resources.write::<crate::map_dynamic::transit::JourneyStats>();
+                        let (mut pending, resuming) = stats.take_search(id, now, transit.revision, origin, pos);
+                        let requests = if resuming { &mut resumed_requests } else { &mut new_requests };
+                        if now.0.saturating_sub(pending.born.0) < 2_000 {
+                            if *requests == 0 || pending_walks == 0 {
+                                if stats.defer_search(id, pending) {
+                                    return;
+                                }
+                            } else {
+                                *requests -= 1;
+                                let mut slice = SearchSlice::new(&mut pending, &mut pending_walks);
+                                transit_steps = plan(Some(&mut slice));
+                                if slice.deferred && stats.defer_search(id, pending) {
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        transit_steps = plan(None);
+                    }
                 }
             }
         }
 
-        let mut route = if let Some((steps, paths)) = transit_steps {
+        let replacing_wait = matches!(router.cur_step, Some(RoutingStep::WaitAtStop { .. }));
+        router.clear_steps(parking);
+        if replacing_wait && h.location == Location::Outside && h.collider.is_none() {
+            Router::restore_walking(h, h.trans.pos, resources);
+        }
+        let router = &mut h.router;
+        let mut route = if let Some((steps, paths, ordinals)) = transit_steps {
+            resources.write::<crate::map_dynamic::transit::JourneyStats>().install_plan(
+                id, router.trip_start.unwrap_or_else(|| elapsed_ticks(resources)), &steps, &transit, ordinals,
+            );
             let mut paths = paths.into_iter();
             router.transit_walks = Some(Box::new(std::array::from_fn(|_| paths.next())));
             Ok(steps)
         } else {
+            if !transit.lines.is_empty() {
+                resources.write::<crate::map_dynamic::transit::JourneyStats>().forget_search(id);
+            }
             router.steps_to(pos, parking, map, &h.location, &world.vehicles)
         };
         if matches!(route, Err(RouterError::ReservingParkingSpot(_))) {
@@ -1068,6 +1108,11 @@ impl Router {
         }
         human.router.cur_step = None;
         Self::restore_walking(human, stop_pos, resources);
+    }
+
+    pub(super) fn walk_from_platform(human: &mut HumanEnt, door: Vec3, sidewalk: Vec3) {
+        human.router.cur_step = Some(RoutingStep::WalkTo(sidewalk));
+        human.it = Itinerary::simple(vec![door, sidewalk]);
     }
 
     /// Leave transit at a walkable position and plan again from there.

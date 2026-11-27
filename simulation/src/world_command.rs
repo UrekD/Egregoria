@@ -1957,6 +1957,23 @@ impl WorldCommand {
             }
         }
         self.validate_progression(sim)?;
+        let affected = match self {
+            MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => [ProjectKind::Road(*road), ProjectKind::Ground],
+            MapRemoveIntersection(inter)
+            | MapUpdateIntersectionPolicy { inter, .. }
+            | MapSetJunctionRules { junction: inter, .. } => [ProjectKind::Intersection(*inter), ProjectKind::Ground],
+            MapMakeConnection { from, to, .. } => [from.kind, to.kind],
+            _ => [ProjectKind::Ground; 2],
+        };
+        if affected.iter().any(|kind| !kind.is_ground()) {
+            sim.read::<crate::map_dynamic::transit::RailTransit>().check_occupied_egress(
+                &sim.read::<crate::map_dynamic::Transit>(),
+                sim.world(),
+                &sim.map(),
+                &affected,
+                budget,
+            )?;
+        }
         match self {
             Init(_) => return Err(Rejection::UnexpectedInit),
             MapUpgradeRoad {
@@ -2235,6 +2252,18 @@ impl WorldCommand {
                 };
             if !Map::can_connect(fromproj, toproj, interpoint, pat) {
                 record_link(index, Err(Rejection::InvalidConnection));
+                continue;
+            }
+            if let Err(reason) = sim.read::<crate::map_dynamic::transit::RailTransit>()
+                .check_occupied_egress(
+                    &sim.read::<crate::map_dynamic::Transit>(),
+                    sim.world(),
+                    &map,
+                    &[fromproj.kind, toproj.kind],
+                    batch,
+                )
+            {
+                record_link(index, Err(reason));
                 continue;
             }
             let (profile_samples, prepared) = if let Some(work) = &mut water_work {

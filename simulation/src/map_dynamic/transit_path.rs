@@ -5,6 +5,7 @@ use flat_spatial::Grid;
 use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{Money, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND};
+use serde::{Deserialize, Serialize};
 
 use super::{LineID, RoutingStep, StopID, Transit};
 use crate::map::{Map, PathKind, Pathfinder, TraverseDirection};
@@ -18,7 +19,8 @@ const NEAREST_STOPS: usize = 3;
 const TRANSFER_STOPS: usize = 8;
 const TRANSFER_RADIUS: f32 = 250.0;
 const MAX_TRANSFER_LABELS: usize = 256;
-const MAX_TRANSFER_WALKS: usize = 16;
+const ROUTE_WALKS_PER_SLICE: usize = 32;
+const MAX_PENDING_WALKS: usize = 1024;
 const MAX_CACHED_TRANSFERS: usize = 1_024;
 const STOP_ACCESS_RADIUS: f32 = 600.0;
 const CAR_SPEED: f64 = 10.0;
@@ -33,7 +35,95 @@ const COST_EPSILON: f64 = 0.01;
 
 type TransferWalks = BTreeMap<(StopID, StopID), Option<(f32, ValidatedWalk)>>;
 
+type RouteKey = ([u32; 3], [u32; 3]);
+
+type RideOrdinals = [Option<(u8, u8)>; 2];
+
 type StopWalks<'a> = Vec<(f64, &'a TransitStop, ValidatedWalk)>;
+
+#[derive(Serialize, Deserialize)]
+pub(in crate::map_dynamic) struct PendingSearch {
+    pub born: Tick,
+    pub revision: (u64, u64),
+    pub origin: Vec3,
+    pub destination: Vec3,
+    #[serde(deserialize_with = "crate::map_dynamic::transit::decode_passenger_map::<_, _, _, MAX_PENDING_WALKS>")]
+    completed_walks: BTreeMap<RouteKey, Option<(f32, ValidatedWalk)>>,
+    transfer_graph: u64,
+    scored_labels: usize,
+    best_transfer: Option<StoredTransfer>,
+}
+
+impl PendingSearch {
+    pub fn new(born: Tick, revision: (u64, u64), origin: Vec3, destination: Vec3) -> Self {
+        Self {
+            born, revision, origin, destination, completed_walks: BTreeMap::new(),
+            transfer_graph: 0, scored_labels: 0, best_transfer: None,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.origin.is_finite()
+            && self.destination.is_finite()
+            && self.completed_walks.iter().all(|(key, proof)| {
+                proof.as_ref().is_none_or(|(distance, walk)| {
+                    distance.is_finite() && *distance >= 0.0
+                        && walk.start.is_finite() && walk.end.is_finite()
+                        && *key == (point_bits(walk.start), point_bits(walk.end))
+                })
+            })
+            && self.best_transfer.as_ref().is_none_or(|best| {
+                [best.ticks, best.first.ticks, best.second.ticks]
+                    .into_iter().all(|ticks| ticks.is_finite() && ticks >= 0.0)
+                    && [best.first.board_ordinal, best.first.alight_ordinal,
+                        best.second.board_ordinal, best.second.alight_ordinal]
+                        .into_iter().all(|ordinal| ordinal < 30)
+            })
+    }
+}
+
+pub(super) struct SearchSlice<'a> {
+    pending: &'a mut PendingSearch,
+    shared_walks: &'a mut usize,
+    walks: usize,
+    pub deferred: bool,
+}
+
+impl<'a> SearchSlice<'a> {
+    pub fn new(pending: &'a mut PendingSearch, shared_walks: &'a mut usize) -> Self {
+        Self { pending, shared_walks, walks: ROUTE_WALKS_PER_SLICE, deferred: false }
+    }
+
+    fn walk(
+        &mut self, now: Tick, from: Vec3, to: Vec3, map: &Map, speed: f64,
+    ) -> Option<(f64, ValidatedWalk)> {
+        let key = (point_bits(from), point_bits(to));
+        let proof = if let Some(existing) = self.pending.completed_walks.get(&key) {
+            existing.clone()
+        } else {
+            if self.walks == 0 || *self.shared_walks == 0
+                || self.pending.completed_walks.len() == MAX_PENDING_WALKS
+            {
+                self.deferred = true;
+                return None;
+            }
+            self.walks -= 1;
+            *self.shared_walks -= 1;
+            let proof = ValidatedWalk::route(now, from, to, map, 1.0)
+                .map(|(ticks, walk)| ((ticks / TICKS_PER_REALTIME_SECOND as f64) as f32, walk));
+            self.pending.completed_walks.insert(key, proof.clone());
+            proof
+        };
+        proof.map(|(distance, mut walk)| {
+            walk.topology = map.walking_topology_generation;
+            (travel_ticks(distance, speed), walk)
+        })
+    }
+}
+
+fn point_bits(position: Vec3) -> [u32; 3] {
+    [position.x.to_bits(), position.y.to_bits(), position.z.to_bits()]
+}
 
 #[derive(Clone, Copy, Default)]
 struct FareQuote {
@@ -83,6 +173,7 @@ pub(super) struct TransitPaths<'a> {
     stops: Grid<&'a TransitStop, Vec2>,
     transfer_walks: RefCell<TransferWalks>,
     stops_by_id: BTreeMap<StopID, &'a TransitStop>,
+    platform_walks: BTreeMap<StopID, f32>,
 }
 
 impl<'a> TransitPaths<'a> {
@@ -107,6 +198,7 @@ impl<'a> TransitPaths<'a> {
             stops: Grid::new(STOP_ACCESS_RADIUS as i32),
             transfer_walks: RefCell::new(BTreeMap::new()),
             stops_by_id: BTreeMap::new(),
+            platform_walks: BTreeMap::new(),
         };
         let mut runs = BTreeMap::<_, Vec<_>>::new();
         for (&bus, run) in &transit.runs {
@@ -147,9 +239,9 @@ impl<'a> TransitPaths<'a> {
                     .values()
                     .filter(|run| run.line == id)
                     .take(usize::from(line.target_vehicles))
-                    .map(|run| run.forecast(config))
+                    .map(|run| run.forecast(config, now))
                     .collect();
-                let Some(departures) = Departures::new(
+                let Some(mut departures) = Departures::new(
                     now,
                     &config.leg_ticks,
                     config.schedule.dwell_ticks,
@@ -157,6 +249,8 @@ impl<'a> TransitPaths<'a> {
                 ) else {
                     continue;
                 };
+                let cadence = config.schedule.headway_ticks;
+                departures.loop_ticks = departures.loop_ticks.div_ceil(cadence) * cadence;
                 (
                     config.leg_ticks.iter().map(|&ticks| ticks as f64).collect(),
                     config.schedule.dwell_ticks,
@@ -211,6 +305,9 @@ impl<'a> TransitPaths<'a> {
                 if lines.is_empty() {
                     paths.stops.insert(stop.walk_pos.xy(), stop);
                     paths.stops_by_id.insert(stop.id, stop);
+                    if let Some((rail, _)) = rail_line {
+                        paths.platform_walks.insert(stop.id, rail.platform_walk_metres(stop.id));
+                    }
                 }
                 lines.push((id, index));
             }
@@ -220,6 +317,10 @@ impl<'a> TransitPaths<'a> {
 
     pub(super) fn has_service(&self) -> bool {
         !self.lines.is_empty()
+    }
+
+    pub(super) fn has_interchanges(&self) -> bool {
+        self.lines.len() > 1
     }
 
     pub(super) fn winning_steps(
@@ -232,10 +333,11 @@ impl<'a> TransitPaths<'a> {
         car_pos: Option<Vec3>,
         walk_speed: f64,
         credit: Option<(Tick, Money)>,
+        mut search: Option<&mut SearchSlice<'_>>,
         allows_line: impl Fn(LineID) -> bool,
-    ) -> Option<(Vec<RoutingStep>, Vec<ValidatedWalk>)> {
+    ) -> Option<(Vec<RoutingStep>, Vec<ValidatedWalk>, RideOrdinals)> {
         let credit = FareQuote::from_credit(now, credit);
-        let (access, egress) = if self.lines.len() < 2 {
+        let (mut access, mut egress) = if self.lines.len() < 2 {
             self.route_stop_walks(
                 self.nearest(origin, &allows_line),
                 self.nearest(destination, &allows_line),
@@ -245,30 +347,32 @@ impl<'a> TransitPaths<'a> {
                 &allows_line,
             )?
         } else {
-            let route = |from, to| ValidatedWalk::route(now, from, to, map, walk_speed);
+            let mut route = |from, to| {
+                if let Some(search) = search.as_deref_mut() {
+                    search.walk(now, from, to, map, walk_speed)
+                } else {
+                    ValidatedWalk::route(now, from, to, map, walk_speed)
+                }
+            };
             let serves = |stop: &TransitStop| {
                 self.stop_lines[&stop.id]
                     .iter()
                     .any(|&(line, _)| allows_line(line))
             };
-            let access = self
-                .nearby(origin, STOP_ACCESS_RADIUS, TRANSFER_STOPS, serves)
-                .into_iter()
-                .filter_map(|(_, stop)| {
-                    let (ticks, path) = route(origin, stop.walk_pos)?;
-                    Some((ticks, stop, path))
-                })
-                .collect();
-            let egress = self
-                .nearby(destination, STOP_ACCESS_RADIUS, TRANSFER_STOPS, serves)
-                .into_iter()
-                .filter_map(|(_, stop)| {
-                    let (ticks, path) = route(stop.walk_pos, destination)?;
-                    Some((ticks, stop, path))
-                })
-                .collect();
+            let access = self.reachable_nearby(origin, serves, |stop| {
+                route(origin, stop.walk_pos)
+            });
+            let egress = self.reachable_nearby(destination, serves, |stop| {
+                route(stop.walk_pos, destination)
+            });
             (access, egress)
         };
+        if search.as_ref().is_some_and(|search| search.deferred) {
+            return None;
+        }
+        for (ticks, stop, _) in access.iter_mut().chain(&mut egress) {
+            *ticks += self.platform_walk_ticks(stop.id, walk_speed);
+        }
         let direct = self.best_ride(
             access.iter().map(|&(ticks, stop, _)| (ticks, stop)),
             egress.iter().map(|&(ticks, stop, _)| (ticks, stop)),
@@ -277,7 +381,7 @@ impl<'a> TransitPaths<'a> {
         );
         let transfer = (self.lines.len() > 1)
             .then(|| {
-                self.best_transfer(&access, &egress, map, now, walk_speed, credit, &allows_line)
+                self.best_transfer(&access, &egress, map, now, walk_speed, credit, search.as_deref_mut(), &allows_line)
             })
             .flatten()
             .filter(|trip| {
@@ -285,11 +389,22 @@ impl<'a> TransitPaths<'a> {
                     .as_ref()
                     .is_none_or(|ride| trip.ticks + COST_EPSILON < ride.ticks)
             });
+        if search.as_ref().is_some_and(|search| search.deferred) {
+            return None;
+        }
         let ticks = transfer
             .as_ref()
             .map(|trip| trip.ticks)
             .or_else(|| direct.as_ref().map(|ride| ride.ticks))?;
-        let walk_ticks = walk_cost(now, origin, destination, map, walk_speed);
+        let walk_ticks = ValidatedWalk::route(now, origin, destination, map, walk_speed)
+            .map_or_else(
+                || if self.platform_walks.is_empty() && !self.has_interchanges() {
+                    travel_ticks(origin.distance(destination), walk_speed)
+                } else {
+                    f64::INFINITY
+                },
+                |(ticks, _)| ticks,
+            );
         if ticks >= walk_ticks * (1.0 - MIN_WALK_SAVINGS)
             || car_pos.is_some_and(|car| {
                 let car_access = walk_cost(now, origin, car, map, walk_speed);
@@ -329,13 +444,15 @@ impl<'a> TransitPaths<'a> {
             steps.push(RoutingStep::GetOutBuilding(building));
         }
         first.append_steps(&mut steps);
+        let mut ordinals = [Some(first.ordinals()), None];
         if let Some((second, walk)) = second {
             second.append_steps(&mut steps);
+            ordinals[1] = Some(second.ordinals());
             walks.push(walk);
         }
         steps.push(RoutingStep::WalkTo(destination));
         walks.push(egress_path);
-        Some((steps, walks))
+        Some((steps, walks, ordinals))
     }
 
     fn best_transfer(
@@ -346,11 +463,23 @@ impl<'a> TransitPaths<'a> {
         now: Tick,
         walk_speed: f64,
         credit: FareQuote,
+        mut search: Option<&mut SearchSlice<'_>>,
         allows_line: &impl Fn(LineID) -> bool,
     ) -> Option<Transfer<'a>> {
-        let mut best: Option<Transfer<'_>> = None;
+        let mut best = None;
+        let mut already_scored = 0;
+        if let Some(search) = search.as_deref_mut() {
+            let graph = common::hash_u64(self.lines.keys().copied().collect::<Vec<_>>());
+            if search.pending.transfer_graph != graph {
+                search.pending.transfer_graph = graph;
+                search.pending.scored_labels = 0;
+                search.pending.best_transfer = None;
+            }
+            already_scored = search.pending.scored_labels;
+            best = search.pending.best_transfer.as_ref()
+                .and_then(|saved| saved.resolve(&self.stops_by_id, map));
+        }
         let mut paths = self.transfer_walks.borrow_mut();
-        let mut walked = BTreeSet::new();
         let mut labels = 0;
         let destination_lines: BTreeSet<_> = egress
             .iter()
@@ -366,19 +495,20 @@ impl<'a> TransitPaths<'a> {
                     continue;
                 }
                 let first = &self.lines[&first_id];
-                let Some(wait) = first.wait_ticks(from, access_ticks) else {
-                    continue;
-                };
-                let first_board = (access_ticks + wait - first.dwell_ticks).max(access_ticks);
+                let first_board_ordinal = from;
+                let wait = first.wait_ticks(from, access_ticks);
+                let first_board = (access_ticks + wait.unwrap_or(0.0) - first.dwell_ticks).max(access_ticks);
                 let (first_fare, credit) = credit.charge(first_board, first.fare_ticks);
-                for &alight in first
+                for (alight_offset, &alight) in first
                     .line
                     .stops
                     .iter()
                     .cycle()
                     .skip(from + 1)
                     .take(first.line.stops.len() - 1)
+                    .enumerate()
                 {
+                    let first_alight = (from + 1 + alight_offset) % first.line.stops.len();
                     if alight == board.id {
                         continue;
                     }
@@ -386,21 +516,26 @@ impl<'a> TransitPaths<'a> {
                     let Some(first_ride) = first.ride_ticks(from, alight.id) else {
                         continue;
                     };
-                    let first_arrival = access_ticks + wait + first_ride;
+                    let first_arrival = access_ticks + wait.unwrap_or(0.0) + first_ride;
                     let neighbors =
-                        self.nearby(alight.walk_pos, TRANSFER_RADIUS, TRANSFER_STOPS, |stop| {
+                        self.nearby(alight.walk_pos, TRANSFER_RADIUS, usize::MAX, |stop| {
                             self.stop_lines[&stop.id]
                                 .iter()
                                 .any(|&(id, _)| id != first_id && destination_lines.contains(&id))
                         });
+                    let mut reachable = 0;
                     for (_, interchange) in neighbors {
                         let walk_key = (alight.id, interchange.id);
-                        if walked.len() == MAX_TRANSFER_WALKS && !walked.contains(&walk_key) {
-                            continue;
-                        }
-                        walked.insert(walk_key);
                         let uncached;
-                        let walk = if let Some(walk) = paths.get(&walk_key) {
+                        let walk = if let Some(search) = search.as_deref_mut() {
+                            uncached = search.walk(now, alight.walk_pos, interchange.walk_pos, map, 1.0)
+                                .map(|(ticks, walk)| ((ticks / TICKS_PER_REALTIME_SECOND as f64) as f32, walk))
+                                .filter(|(distance, _)| *distance <= TRANSFER_RADIUS);
+                            if search.deferred {
+                                return None;
+                            }
+                            uncached.as_ref()
+                        } else if let Some(walk) = paths.get(&walk_key) {
                             walk.as_ref()
                         } else {
                             let walk = ValidatedWalk::route(
@@ -424,26 +559,39 @@ impl<'a> TransitPaths<'a> {
                         let Some((distance, walk)) = walk else {
                             continue;
                         };
-                        let ready = first_arrival + travel_ticks(*distance, walk_speed);
+                        reachable += 1;
+                        let ready = first_arrival + travel_ticks(*distance, walk_speed)
+                            + self.platform_walk_ticks(alight.id, walk_speed)
+                            + self.platform_walk_ticks(interchange.id, walk_speed);
                         for &(second_id, from) in &self.stop_lines[&interchange.id] {
                             if first_id == second_id || !destination_lines.contains(&second_id) {
                                 continue;
                             }
                             let second = &self.lines[&second_id];
-                            let Some(second_wait) = second.wait_at(from, ready, *distance > 0.0)
-                            else {
-                                continue;
-                            };
+                            let second_wait = second.wait_at(from, ready, *distance > 0.0);
                             for &(egress_ticks, destination, _) in egress {
                                 if destination.id == interchange.id {
                                     continue;
                                 }
-                                if labels == MAX_TRANSFER_LABELS {
-                                    break 'search;
-                                }
-                                labels += 1;
                                 let Some(second_ride) = second.ride_ticks(from, destination.id)
                                 else {
+                                    continue;
+                                };
+                                labels += 1;
+                                if labels <= already_scored {
+                                    continue;
+                                }
+                                if labels - already_scored > MAX_TRANSFER_LABELS {
+                                    if let Some(search) = search.as_deref_mut() {
+                                        search.deferred = true;
+                                        return None;
+                                    }
+                                    break 'search;
+                                }
+                                if let Some(search) = search.as_deref_mut() {
+                                    search.pending.scored_labels = labels;
+                                }
+                                let (Some(_), Some(second_wait)) = (wait, second_wait) else {
                                     continue;
                                 };
                                 let second_board =
@@ -472,19 +620,29 @@ impl<'a> TransitPaths<'a> {
                                     first: Ride {
                                         line: first_id,
                                         board,
+                                        board_ordinal: first_board_ordinal,
                                         alight,
+                                        alight_ordinal: first_alight,
                                         ticks: first_arrival,
                                     },
                                     second: Ride {
                                         line: second_id,
                                         board: interchange,
+                                        board_ordinal: from,
                                         alight: destination,
+                                        alight_ordinal: second.downstream(from, destination.id).unwrap(),
                                         ticks,
                                     },
                                     ticks,
                                     walk: walk.clone(),
                                 });
+                                if let Some(search) = search.as_deref_mut() {
+                                    search.pending.best_transfer = best.as_ref().map(StoredTransfer::from);
+                                }
                             }
+                        }
+                        if reachable == TRANSFER_STOPS {
+                            break;
                         }
                     }
                 }
@@ -566,7 +724,9 @@ impl<'a> TransitPaths<'a> {
                     let ride = Ride {
                         line: id,
                         board,
+                        board_ordinal: from,
                         alight,
+                        alight_ordinal: line.downstream(from, alight.id).unwrap(),
                         ticks: walk_to_stop + wait + bus_ticks + fare + walk_from_stop,
                     };
                     if best.as_ref().is_none_or(|other| ride.key() < other.key()) {
@@ -576,6 +736,22 @@ impl<'a> TransitPaths<'a> {
             }
         }
         best
+    }
+
+    fn reachable_nearby(
+        &self,
+        pos: Vec3,
+        filter: impl Fn(&TransitStop) -> bool,
+        mut route: impl FnMut(&TransitStop) -> Option<(f64, ValidatedWalk)>,
+    ) -> StopWalks<'a> {
+        self.nearby(pos, STOP_ACCESS_RADIUS, usize::MAX, filter)
+            .into_iter()
+            .filter_map(|(_, stop)| {
+                let (ticks, path) = route(stop)?;
+                Some((ticks, stop, path))
+            })
+            .take(TRANSFER_STOPS)
+            .collect()
     }
 
     fn nearest(
@@ -590,6 +766,10 @@ impl<'a> TransitPaths<'a> {
         })
     }
 
+    fn platform_walk_ticks(&self, stop: StopID, walk_speed: f64) -> f64 {
+        self.platform_walks.get(&stop).map_or(0.0, |&metres| travel_ticks(metres, walk_speed))
+    }
+
     fn nearby(
         &self,
         pos: Vec3,
@@ -597,7 +777,7 @@ impl<'a> TransitPaths<'a> {
         limit: usize,
         filter: impl Fn(&TransitStop) -> bool,
     ) -> Vec<(OrderedFloat<f32>, &'a TransitStop)> {
-        let mut stops = Vec::with_capacity(limit);
+        let mut stops = Vec::with_capacity(limit.min(TRANSFER_STOPS));
         let bound = Vec2::splat(radius);
         for (handle, _) in self.stops.query_aabb(pos.xy() - bound, pos.xy() + bound) {
             let &stop = self.stops.get(handle).unwrap().1;
@@ -629,6 +809,12 @@ struct ServiceLine<'a> {
 }
 
 impl ServiceLine<'_> {
+    fn downstream(&self, from: usize, stop: StopID) -> Option<usize> {
+        let len = self.line.stops.len();
+        (1..len).map(|offset| (from + offset) % len)
+            .find(|&ordinal| self.line.stops[ordinal] == stop)
+    }
+
     fn ride_ticks(&self, from: usize, alight: StopID) -> Option<f64> {
         let len = self.line.stops.len();
         // The wait includes any dwell before departure.
@@ -795,7 +981,9 @@ impl Departures {
 struct Ride<'a> {
     line: LineID,
     board: &'a TransitStop,
+    board_ordinal: usize,
     alight: &'a TransitStop,
+    alight_ordinal: usize,
     ticks: f64,
 }
 
@@ -804,6 +992,74 @@ struct Transfer<'a> {
     second: Ride<'a>,
     ticks: f64,
     walk: ValidatedWalk,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredRide {
+    line: LineID,
+    board: StopID,
+    board_ordinal: usize,
+    alight: StopID,
+    alight_ordinal: usize,
+    ticks: f64,
+}
+
+impl From<&Ride<'_>> for StoredRide {
+    fn from(ride: &Ride<'_>) -> Self {
+        Self {
+            line: ride.line,
+            board: ride.board.id,
+            board_ordinal: ride.board_ordinal,
+            alight: ride.alight.id,
+            alight_ordinal: ride.alight_ordinal,
+            ticks: ride.ticks,
+        }
+    }
+}
+
+impl StoredRide {
+    fn resolve<'a>(&self, stops: &BTreeMap<StopID, &'a TransitStop>) -> Option<Ride<'a>> {
+        Some(Ride {
+            line: self.line,
+            board: stops.get(&self.board)?,
+            board_ordinal: self.board_ordinal,
+            alight: stops.get(&self.alight)?,
+            alight_ordinal: self.alight_ordinal,
+            ticks: self.ticks,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTransfer {
+    first: StoredRide,
+    second: StoredRide,
+    ticks: f64,
+    walk: ValidatedWalk,
+}
+
+impl From<&Transfer<'_>> for StoredTransfer {
+    fn from(transfer: &Transfer<'_>) -> Self {
+        Self {
+            first: StoredRide::from(&transfer.first),
+            second: StoredRide::from(&transfer.second),
+            ticks: transfer.ticks,
+            walk: transfer.walk.clone(),
+        }
+    }
+}
+
+impl StoredTransfer {
+    fn resolve<'a>(&self, stops: &BTreeMap<StopID, &'a TransitStop>, map: &Map) -> Option<Transfer<'a>> {
+        let mut walk = self.walk.clone();
+        walk.topology = map.walking_topology_generation;
+        Some(Transfer {
+            first: self.first.resolve(stops)?,
+            second: self.second.resolve(stops)?,
+            ticks: self.ticks,
+            walk,
+        })
+    }
 }
 
 impl Transfer<'_> {
@@ -831,6 +1087,10 @@ impl Transfer<'_> {
 }
 
 impl Ride<'_> {
+    fn ordinals(&self) -> (u8, u8) {
+        (self.board_ordinal as u8, self.alight_ordinal as u8)
+    }
+
     fn append_steps(&self, steps: &mut Vec<RoutingStep>) {
         steps.extend([
             RoutingStep::WalkTo(self.board.walk_pos),
@@ -863,7 +1123,7 @@ fn walk_cost(now: Tick, start: Vec3, end: Vec3, map: &Map, speed: f64) -> f64 {
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ValidatedWalk {
     start: Vec3,
     end: Vec3,
@@ -942,6 +1202,40 @@ mod tests {
     use crate::map_dynamic::transit::recovery_leg_fixture;
     use crate::tests::TestCtx;
     use geom::{vec3, Color};
+
+    #[test]
+    fn p8_w2_reachable_ninth_stop_survives_disconnected_closer_stops() {
+        let mut transit = Transit::default();
+        let mut stops = Vec::new();
+        for i in 1..=9 {
+            let pos = Vec3::X * i as f32;
+            stops.push(transit.stops.insert_with_key(|id| TransitStop {
+                id,
+                pos,
+                walk_pos: pos,
+                berth: pos,
+                dir: Vec2::X,
+            }));
+        }
+        transit.lines.insert_with_key(|id| TransitLine {
+            id,
+            stops: stops.clone(),
+            target_vehicles: 1,
+            fare: Money::ZERO,
+            color: Color::WHITE,
+            suspended: false,
+        });
+        let index = TransitPaths::new(&transit, Tick(0), |_, _| Some(400));
+        let reachable = index.reachable_nearby(Vec3::ZERO, |_| true, |stop| {
+            (stop.id == stops[8]).then(|| (9.0, ValidatedWalk {
+                start: Vec3::ZERO,
+                end: stop.walk_pos,
+                topology: 0,
+                itinerary: Itinerary::simple(vec![stop.walk_pos]),
+            }))
+        });
+        assert_eq!(reachable.iter().map(|(_, stop, _)| stop.id).collect::<Vec<_>>(), stops[8..]);
+    }
 
     #[test]
     fn p3b_wait_prediction_accounts_for_boarding_stop_and_access_time() {
@@ -1143,6 +1437,7 @@ mod tests {
                 Some(origin + Vec3::Y * 3_000.0),
                 walk_speed,
                 None,
+                None,
                 |_| true
             )
             .is_none());
@@ -1179,7 +1474,7 @@ mod tests {
         let paths = TransitPaths::new(&transit, now, |_, _| Some(400));
         assert!(origin.distance(across_road) < origin.distance(same_side));
 
-        let (steps, _) = paths
+        let (steps, _, _) = paths
             .winning_steps(
                 origin,
                 destination,
@@ -1188,6 +1483,7 @@ mod tests {
                 now,
                 Some(origin),
                 1.0,
+                None,
                 None,
                 |_| true,
             )
