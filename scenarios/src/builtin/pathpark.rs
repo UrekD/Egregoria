@@ -2,7 +2,7 @@ use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2};
 use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKind, GarageKind};
 use simulation::map::{
-    BuildingID, Density, LanePatternBuilder, MapProject, ProjectFilter, ProjectKind, ZoneCell,
+    BuildingID, Density, LanePatternBuilder, MapProject, ProjectFilter, ZoneCell,
     ZoneKind,
 };
 use simulation::map_dynamic::Destination;
@@ -48,23 +48,30 @@ fn setup_at(
     offset: Vec2,
 ) -> Result<Vec<BuildingID>, String> {
     let point = |x, y| (offset + vec2(x, y)).z(0.0);
-    let ground = |x, y| MapProject {
-        pos: point(x, y),
-        kind: ProjectKind::Ground,
+    let corners = {
+        let map = sim.map();
+        let mut corners = [
+            point(75.0, 100.0),
+            point(450.0, 100.0),
+            point(450.0, 280.0),
+            point(75.0, 280.0),
+        ];
+        for corner in &mut corners {
+            corner.z = map
+                .environment()
+                .height(corner.xy())
+                .ok_or("parking district lies outside the terrain")?;
+        }
+        corners
     };
     sim.apply_commands([&WorldCommand::MapMakeConnection {
-        from: ground(75.0, 100.0),
-        to: ground(450.0, 100.0),
+        from: MapProject::ground(corners[0]),
+        to: MapProject::ground(corners[1]),
         inter: None,
         pat: LanePatternBuilder::default().build(),
     }]);
     if round_trip {
-        let path = [
-            point(450.0, 100.0),
-            point(450.0, 280.0),
-            point(75.0, 280.0),
-            point(75.0, 100.0),
-        ];
+        let path = [corners[1], corners[2], corners[3], corners[0]];
         for pair in path.windows(2) {
             let [from, to] = {
                 let map = sim.map();
