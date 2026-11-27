@@ -497,7 +497,10 @@ impl ReplayJson {
                 }
                 JSON::decode(bytes)
             }
-            Err(SaveLoadError::IncompatibleReplay { version }) if crate::compatible_save_version(&version) => {
+            Err(SaveLoadError::IncompatibleReplay { version })
+                if crate::compatible_save_version(&version)
+                    || crate::pre_hotfix_save_version(replay_release(&version)) =>
+            {
                 // The city has its own schema and registry checks. Inspect the
                 // recording envelope without decoding obsolete commands.
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
@@ -1007,6 +1010,55 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
         ReplayJson::decode_sidecar(obsolete, None),
         Err(crate::SaveLoadError::IncompatibleReplay { .. })
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn hotfix_release_rejects_old_replays_and_loads_their_snapshots() {
+    let sim = crate::tests::TestCtx::new().g;
+    let registry = prototypes::prototypes().fingerprint();
+    assert_eq!(replay_version(), "0.13.1+commands.2");
+    for release in ["0.12.0", "0.12.9", "0.13.0"] {
+        let mut prior = Replay {
+            version: format!("{release}+commands.2"),
+            enabled: true,
+            registry: Some(registry),
+            ..Replay::default()
+        };
+        prior.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
+        let revision = SnapshotRevision::new(1);
+        let bytes = ReplayJson::encode_sidecar(&prior, revision).unwrap();
+        assert!(matches!(
+            ReplayJson::decode_sidecar(&bytes, Some(revision)),
+            Err(SaveLoadError::IncompatibleReplay { version }) if version == prior.version
+        ));
+        let embedded = ReplayJson::decode_snapshot(&bytes).unwrap();
+        assert!(embedded.obsolete_recording_discarded());
+        assert_eq!(embedded.command_count(), 0);
+
+        let header = crate::RegistrySlotSnapshotHeader {
+            slot: crate::SlotSnapshotHeader {
+                magic: crate::REGISTRY_SLOT_MAGIC,
+                version: release.to_owned(),
+                revision,
+            },
+            registry,
+        };
+        let mut resources = sim.snapshot_resources(true, usize::MAX).unwrap();
+        resources.insert("replay".to_owned(), bytes);
+        let payload = crate::SimulationSer {
+            header: crate::SaveHeader {
+                version: release.to_owned(),
+            },
+            world: &sim.world,
+            res: resources,
+        };
+        let bytes = common::saveload::CompressedBincode::encode(&(header, payload)).unwrap();
+        let loaded =
+            Simulation::load_compressed_snapshot(&bytes, crate::MAX_SNAPSHOT_BYTES).unwrap();
+        assert_eq!(loaded.get_tick(), sim.get_tick());
+        assert!(loaded.read::<Replay>().obsolete_recording_discarded());
+    }
 }
 
 #[cfg(test)]

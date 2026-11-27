@@ -134,11 +134,19 @@ const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
 
+fn pre_hotfix_save_version(version: &str) -> bool {
+    version == "0.13.0"
+        || version.strip_prefix("0.12.").is_some_and(|patch| {
+            !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 fn compatible_save_version(version: &str) -> bool {
-    matches!(
-        version,
-        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
-    )
+    pre_hotfix_save_version(version)
+        || matches!(
+            version,
+            VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
+        )
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2032,9 +2040,12 @@ impl SimulationDeser {
 
         let options = *sim.read::<SimulationOptions>();
         let origin: MapOrigin = match self.res.get("map_origin") {
-            Some(bytes) => Bincode::decode(bytes)
-                .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
+            Some(bytes) => Bincode::decode(bytes).map_err(|error| {
+                corrupt(format!("Could not decode snapshot map origin: {error}"))
+            })?,
+            None if pre_hotfix_save_version(&self._header.version)
+                || matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) =>
+            {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
