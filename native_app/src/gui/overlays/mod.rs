@@ -434,7 +434,7 @@ fn draw_fire_response(
         if let Some(route) = truck.it.get_route() {
             for traversal in route.reversed_route.iter().rev() {
                 if let Some(points) = traversal.raw_points(map) {
-                    draw.polyline(points.iter().map(|point| point.up(0.5)).collect(), 0.7, false)
+                    draw.polyline(points.iter().map(|point| point.up(0.5)).collect::<Vec<_>>(), 0.7, false)
                         .color(color);
                 }
             }
