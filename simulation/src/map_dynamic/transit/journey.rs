@@ -51,6 +51,7 @@ pub(super) struct ServiceOccurrence {
     pub vehicle: ServiceVehicle,
     pub sequence: u64,
     pub ordinal: u8,
+    pub scheduled_slot: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,7 +126,7 @@ impl JourneyStats {
         self.topology_revision += 1;
     }
 
-    pub(crate) fn take_search(
+    pub(in crate::map_dynamic) fn take_search(
         &mut self, human: HumanID, now: Tick, transit_revision: u64, origin: geom::Vec3,
         destination: geom::Vec3,
     ) -> (PendingSearch, bool) {
@@ -138,12 +139,10 @@ impl JourneyStats {
         (search, resuming)
     }
 
-    pub(crate) fn defer_search(&mut self, human: HumanID, search: PendingSearch) -> bool {
-        if self.pending.len() == MAX_PENDING_PLANS {
-            return false;
+    pub(in crate::map_dynamic) fn defer_search(&mut self, human: HumanID, search: PendingSearch) {
+        if self.pending.len() < MAX_PENDING_PLANS {
+            self.pending.insert(human, search);
         }
-        self.pending.insert(human, search);
-        true
     }
 
     pub(crate) fn forget_search(&mut self, human: HumanID) {
@@ -195,11 +194,19 @@ impl JourneyStats {
             // Supported older snapshots and stock bus test routes have no companion plan.
             return true;
         };
-        plan.boarding.is_none() && plan.ride().is_some_and(|ride| {
-            ride.board.line == line && ride.board.stop == stop
-                && ride.board.pattern == self.patterns.get(&line).copied().unwrap_or_default()
-                && calls.get(usize::from(ride.board.ordinal)) == Some(&stop)
-                && calls.get(usize::from(ride.alight.ordinal)) == Some(&ride.alight.stop)
+        plan.boarding.is_none()
+            && plan.ride().is_some_and(|ride| {
+                ride.board.line == line
+                    && ride.board.stop == stop
+                    && ride.board.pattern == self.patterns.get(&line).copied().unwrap_or_default()
+                    && calls.get(usize::from(ride.board.ordinal)) == Some(&stop)
+                    && calls.get(usize::from(ride.alight.ordinal)) == Some(&ride.alight.stop)
+            })
+    }
+
+    pub(super) fn matches_ride(&self, human: HumanID, alight: StopID, rail: bool) -> bool {
+        self.plans.get(&human).map_or(!rail, |plan| {
+            plan.ride().is_some_and(|ride| ride.alight.stop == alight)
         })
     }
 
@@ -242,9 +249,14 @@ impl JourneyStats {
         }
     }
 
-    pub(super) fn expire(&mut self, now: Tick) {
+    pub(super) fn expire(&mut self, now: Tick, world: &crate::World) {
         self.fares.retain(|_, window| {
             now.0.saturating_sub(window.first_board.0) < Transit::FARE_WINDOW_TICKS
+        });
+        self.pending.retain(|&id, _| {
+            world.humans.get(id).is_some_and(|human| {
+                human.router.target_dest.is_some() && human.router.needs_route_change(&human.location)
+            })
         });
     }
 
@@ -302,7 +314,13 @@ pub(crate) fn validate_journey_snapshot(sim: &crate::Simulation) -> Result<(), &
     let world = sim.world();
     let now = super::elapsed_ticks(&sim.resources);
     let transit = sim.read::<Transit>();
-    if stats.patterns.keys().chain(stats.lines.keys()).any(|line| !transit.lines.contains_key(*line)) {
+    let rail = sim.read::<super::RailTransit>();
+    if stats
+        .patterns
+        .keys()
+        .chain(stats.lines.keys())
+        .any(|line| !transit.lines.contains_key(*line))
+    {
         return Err("Orphaned saved passenger line statistics");
     }
     for (&id, fare) in &stats.fares {
@@ -330,9 +348,42 @@ pub(crate) fn validate_journey_snapshot(sim: &crate::Simulation) -> Result<(), &
                 key.trip != plan.trip || key.leg != plan.leg
                     || Some(key.arrival.ordinal) != plan.ride().map(|ride| ride.board.ordinal)
                     || key.arrival.vehicle.location() != human.location
+                    || !matches!(
+                        (plan.ride(), human.router.cur_step()),
+                        (Some(ride), Some(RoutingStep::RideTransit { line, alight }))
+                            if ride.alight.line == *line && ride.alight.stop == *alight
+                    )
+                    || match key.arrival.vehicle {
+                        ServiceVehicle::Bus(id) => {
+                            key.arrival.scheduled_slot.is_some()
+                                || transit.runs.get(&id).is_none_or(|run| {
+                                    plan.ride().is_none_or(|ride| ride.board.line != run.line)
+                                        || key.arrival.sequence > now.0
+                                })
+                        }
+                        ServiceVehicle::Rail(id) => {
+                            key.arrival
+                                .scheduled_slot
+                                .is_none_or(|slot| slot > now.0.saturating_add(600))
+                                || rail.runs.get(&id).is_none_or(|run| {
+                                    plan.ride().is_none_or(|ride| ride.board.line != run.line)
+                                        || key.arrival.sequence > run.call_sequence
+                                })
+                        }
+                    }
             })
         {
             return Err("Invalid saved passenger journey stage");
+        }
+    }
+    for &train in rail.runs.keys() {
+        if rail.riders(train).any(|id| {
+            stats
+                .plans
+                .get(&id)
+                .is_none_or(|plan| plan.boarding.is_none())
+        }) {
+            return Err("Missing saved passenger rail boarding occurrence");
         }
     }
     for (&id, pending) in &stats.pending {

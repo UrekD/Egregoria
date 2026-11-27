@@ -22,9 +22,8 @@ mod journey;
 mod rail;
 mod service;
 
-pub use journey::{JourneyStats, LineJourneyStats};
 pub(crate) use journey::validate_journey_snapshot;
-pub(super) use rail::bounded_map as decode_passenger_map;
+pub use journey::{JourneyStats, LineJourneyStats};
 pub(crate) use rail::{
     forget_rail_rider, rail_train_dropped, validate_rail_snapshot, MAX_PASSENGER_STOCK,
 };
@@ -743,10 +742,16 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
             );
         }
         (TransitSetRailSchedule { line, schedule, .. }, _) => {
+            let booked = rail
+                .runs
+                .values()
+                .filter(|run| run.line == *line)
+                .filter_map(|run| run.slot)
+                .max();
             rail.lines
                 .get_mut(line)
                 .unwrap()
-                .set_schedule(*schedule, now);
+                .set_schedule(*schedule, now, booked);
         }
         (TransitEditLine { line, stops }, Prepared::RailLine(times, _)) => {
             if transit.lines[*line].stops != *stops {

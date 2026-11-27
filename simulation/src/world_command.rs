@@ -1961,8 +1961,9 @@ impl WorldCommand {
             MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => [ProjectKind::Road(*road), ProjectKind::Ground],
             MapRemoveIntersection(inter)
             | MapUpdateIntersectionPolicy { inter, .. }
-            | MapSetJunctionRules { junction: inter, .. } => [ProjectKind::Intersection(*inter), ProjectKind::Ground],
-            MapMakeConnection { from, to, .. } => [from.kind, to.kind],
+            | MapSetJunctionRules {
+                junction: inter, ..
+            } => [ProjectKind::Intersection(*inter), ProjectKind::Ground],
             _ => [ProjectKind::Ground; 2],
         };
         if affected.iter().any(|kind| !kind.is_ground()) {
@@ -2022,8 +2023,10 @@ impl WorldCommand {
                 pat,
             } => {
                 let map = sim.map();
+                let rail = sim.read::<crate::map_dynamic::transit::RailTransit>();
                 let shared_topology = map.land_ownership().is_tiled()
                     || budget.shared_topology
+                    || rail.has_occupied_runs()
                     || map.checks_rail_sweeps(pat);
                 let mut work = (shared_topology || map.needs_topology_preparation())
                     .then(WaterTopologyWork::new);
@@ -2039,6 +2042,23 @@ impl WorldCommand {
                     }
                 }
                 let (from, to, topology) = prepared.map_err(Rejection::water_connection_error)?;
+                if rail.has_occupied_runs() {
+                    let transit = sim.read::<crate::map_dynamic::Transit>();
+                    rail.check_occupied_egress(
+                        &transit,
+                        sim.world(),
+                        &map,
+                        &[from.kind, to.kind],
+                        budget,
+                    )?;
+                    let topology = topology.as_ref().ok_or(Rejection::OccupiedTrack)?;
+                    rail.check_egress_crossing(
+                        &transit,
+                        &topology.preview.deck,
+                        pat.width(),
+                        budget,
+                    )?;
+                }
                 let cost =
                     Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pat))?;
                 return Ok(PreparedAction::Connection {
@@ -2192,8 +2212,12 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
+        let occupied_rail = sim
+            .read::<crate::map_dynamic::transit::RailTransit>()
+            .has_occupied_runs();
         let shared_topology = tiled
             || batch.shared_topology
+            || occupied_rail
             || links
                 .iter()
                 .any(|(_, _, _, pattern)| map.checks_rail_sweeps(pattern));
@@ -2254,18 +2278,6 @@ impl WorldCommand {
                 record_link(index, Err(Rejection::InvalidConnection));
                 continue;
             }
-            if let Err(reason) = sim.read::<crate::map_dynamic::transit::RailTransit>()
-                .check_occupied_egress(
-                    &sim.read::<crate::map_dynamic::Transit>(),
-                    sim.world(),
-                    &map,
-                    &[fromproj.kind, toproj.kind],
-                    batch,
-                )
-            {
-                record_link(index, Err(reason));
-                continue;
-            }
             let (profile_samples, prepared) = if let Some(work) = &mut water_work {
                 match map.prepare_resolved_connection(fromproj, toproj, interpoint, pat, work) {
                     Ok(prepared) => prepared,
@@ -2281,6 +2293,34 @@ impl WorldCommand {
             } else {
                 (0, None)
             };
+            if occupied_rail {
+                let rail = sim.read::<crate::map_dynamic::transit::RailTransit>();
+                let transit = sim.read::<crate::map_dynamic::Transit>();
+                let work = water_work.as_mut().unwrap();
+                batch.remaining = work.remaining;
+                let result = rail
+                    .check_occupied_egress(
+                        &transit,
+                        sim.world(),
+                        &map,
+                        &[fromproj.kind, toproj.kind],
+                        batch,
+                    )
+                    .and_then(|()| {
+                        let topology = prepared.as_ref().ok_or(Rejection::OccupiedTrack)?;
+                        rail.check_egress_crossing(
+                            &transit,
+                            &topology.preview.deck,
+                            pat.width(),
+                            batch,
+                        )
+                    });
+                work.remaining = batch.remaining;
+                if let Err(reason) = result {
+                    record_link(index, Err(reason));
+                    continue;
+                }
+            }
             let cost = match Self::affordable_cost(
                 sim,
                 Government::connection_cost(fromproj.pos, toproj.pos, pat),

@@ -125,17 +125,20 @@ impl PassengerRailRun {
         let mut close = self.close_at;
         if self.next_call == 0 && self.slot.is_none() {
             let schedule = config.schedule;
-            let ready = close.or_else(|| {
-                let remaining = config.leg_ticks.last()?
-                    .checked_sub(now.0.saturating_sub(self.leg_started.0))?;
-                Some(Tick(now.0.saturating_add(remaining).saturating_add(schedule.dwell_ticks)))
-            });
-            close = ready.and_then(|ready| {
-                let ready = ready.0.max(now.0.saturating_add(1));
-                let slot = config.next_slot.max(
-                    schedule.slot_at_or_after(ready.saturating_sub(schedule.max_late_ticks))
-                );
-                schedule.departure_in_slot(slot, ready)
+            let arrival = if close.is_some() {
+                Some(now.0)
+            } else {
+                config
+                    .leg_ticks
+                    .last()
+                    .and_then(|expected| {
+                        expected.checked_sub(now.0.saturating_sub(self.leg_started.0))
+                    })
+                    .map(|remaining| now.0.saturating_add(remaining))
+            };
+            close = arrival.and_then(|arrival| {
+                let ready = arrival.saturating_add(schedule.dwell_ticks);
+                schedule.departure_in_slot(config.next_service_slot(ready), ready)
             });
         }
         BusRun {
@@ -482,9 +485,18 @@ pub(super) fn new_line(
 }
 
 impl PassengerRailLine {
-    pub(super) fn set_schedule(&mut self, schedule: RailSchedule, now: Tick) {
+    pub(super) fn set_schedule(&mut self, schedule: RailSchedule, now: Tick, booked: Option<u64>) {
         self.schedule = schedule;
-        self.next_slot = schedule.slot_at_or_after(now.0.saturating_add(schedule.dwell_ticks));
+        let ready = now.0.saturating_add(schedule.dwell_ticks);
+        let after_booked = booked.map_or(ready, |slot| ready.max(slot.saturating_add(1)));
+        self.next_slot = schedule.slot_at_or_after(after_booked);
+    }
+
+    fn next_service_slot(&self, ready: u64) -> u64 {
+        self.next_slot.max(
+            self.schedule
+                .slot_at_or_after(ready.saturating_sub(self.schedule.max_late_ticks)),
+        )
     }
 
     pub(super) fn install_loop(&mut self, route: RailLoop) {
@@ -556,7 +568,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
         let mut counts = BTreeMap::<LineID, usize>::new();
         let mut starts = Vec::new();
         let mut suspend = BTreeSet::new();
-        let mut ready = BTreeMap::<LineID, (TrainID, Tick)>::new();
+        let mut ready = BTreeMap::<LineID, TrainID>::new();
 
         // Seen after shared boarding so the closing elapsed tick has its boarding pass.
         for (&id, run) in runs.iter_mut() {
@@ -617,6 +629,9 @@ pub fn rail_service_update(sim: &mut Simulation) {
                 let estimate = &mut config.leg_ticks[previous];
                 *estimate = (7 * u128::from(*estimate) + u128::from(observed)).div_ceil(8) as u64;
                 run.close_at = Some(Tick(now.0.saturating_add(config.schedule.dwell_ticks)));
+                if run.next_call == 0 && !retiring && !line.suspended {
+                    ready.entry(run.line).or_insert(id);
+                }
                 continue;
             }
             let close_at = run.close_at.unwrap();
@@ -624,7 +639,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
                 continue;
             }
             if run.next_call == 0 && run.slot.is_none() && !retiring && !line.suspended {
-                ready.entry(run.line).or_insert((id, close_at));
+                ready.entry(run.line).or_insert(id);
                 continue;
             }
             if now < close_at {
@@ -662,11 +677,13 @@ pub fn rail_service_update(sim: &mut Simulation) {
             run.call_sequence = run.call_sequence.saturating_add(1);
             run.close_at = None;
             run.leg_started = now;
-            run.slot = None;
+            if next_call == 0 {
+                run.slot = None;
+            }
         }
 
-        // One opening per line and no catch-up burst. An occupied first platform retains
-        // the slot until its deadline; a ready train has priority over a purchase.
+        // A ready train has priority over a purchase. Once a full dwell no
+        // longer fits before the deadline, advance to the next available slot.
         for (&id, config) in lines.iter_mut() {
             let Some(line) = transit.lines.get(id) else {
                 continue;
@@ -675,33 +692,23 @@ pub fn rail_service_update(sim: &mut Simulation) {
                 continue;
             }
             let schedule = config.schedule;
-            if now.0 > config.next_slot.saturating_add(schedule.max_late_ticks) {
-                let next = schedule.slot_at_or_after(now.0);
-                config.missed_slots = config
-                    .missed_slots
-                    .saturating_add((next - config.next_slot) / schedule.headway_ticks);
-                config.next_slot = next;
-            }
             let dwell_end = now.0.saturating_add(schedule.dwell_ticks);
-            if dwell_end >= config.next_slot {
-                if let Some(&(train, min_close)) = ready.get(&id) {
-                    let Some(close) = schedule.departure_in_slot(
-                        config.next_slot,
-                        min_close.0.max(now.0.saturating_add(1)),
-                    ) else {
-                        continue;
-                    };
-                    let run = runs.get_mut(&train).unwrap();
-                    run.slot = Some(config.next_slot);
-                    run.close_at = Some(close);
-                    config.next_slot = config.next_slot.saturating_add(schedule.headway_ticks);
-                    continue;
-                }
+            let next = config.next_service_slot(dwell_end);
+            config.missed_slots = config
+                .missed_slots
+                .saturating_add((next - config.next_slot) / schedule.headway_ticks);
+            config.next_slot = next;
+            if dwell_end < config.next_slot {
+                continue;
             }
-            if dwell_end >= config.next_slot
-                && schedule.departure_in_slot(config.next_slot, dwell_end).is_some()
-                && counts.get(&id).copied().unwrap_or(0) < usize::from(line.target_vehicles)
-            {
+            if let Some(&train) = ready.get(&id) {
+                let run = runs.get_mut(&train).unwrap();
+                run.slot = Some(config.next_slot);
+                run.close_at = Some(Tick(dwell_end));
+                config.next_slot = config.next_slot.saturating_add(schedule.headway_ticks);
+                continue;
+            }
+            if counts.get(&id).copied().unwrap_or(0) < usize::from(line.target_vehicles) {
                 let spec = platforms[&line.stops[0]];
                 if poses.contains_key(&line.stops[0]) {
                     starts.push((id, spec, config.consist.clone()));
@@ -739,7 +746,8 @@ pub fn rail_service_update(sim: &mut Simulation) {
                             pose.berth.distance2(hold.position) <= BERTH_TOLERANCE.powi(2)
                         });
                     if let Some(pose) = exit {
-                        Router::force_detach(human, pose.door, resources);
+                        Router::force_detach(human, pose.boarding, resources);
+                        Router::walk_from_platform(human, pose.door, pose.sidewalk);
                     }
                 }
             });
@@ -843,8 +851,7 @@ pub(crate) fn rail_train_dropped(sim: &mut Simulation, id: TrainID, train: &Trai
 
 impl PassengerRailRun {
     pub(super) fn boarding_open(&self, now: Tick) -> bool {
-        self.close_at.is_some_and(|close| now <= close)
-            && (self.next_call != 0 || self.slot.is_some())
+        self.close_at.is_some_and(|close| now <= close) && self.slot.is_some()
     }
 }
 
@@ -961,6 +968,44 @@ fn refresh_one_rail_line(
 }
 
 impl RailTransit {
+    pub(crate) fn has_occupied_runs(&self) -> bool {
+        !self.riders.is_empty()
+    }
+
+    pub(crate) fn check_egress_crossing(
+        &self,
+        transit: &Transit,
+        road: &geom::PolyLine3,
+        width: f32,
+        budget: &mut PrepareBudget,
+    ) -> Result<(), Rejection> {
+        for id in self.riders.keys() {
+            budget.spend_road_work(1)?;
+            let exit = self
+                .runs
+                .get(id)
+                .and_then(|run| transit.lines.get(run.line)?.stops.get(run.next_call))
+                .and_then(|stop| self.poses.get(stop))
+                .ok_or(Rejection::OccupiedTrack)?;
+            for (start, end) in [(exit.sidewalk, exit.door), (exit.door, exit.boarding)] {
+                let connector = Segment::new(start.xy(), end.xy());
+                let min_z = start.z.min(end.z) - PLATFORM_HEIGHT_TOLERANCE;
+                let max_z = start.z.max(end.z) + PLATFORM_HEIGHT_TOLERANCE;
+                for segment in road.segments() {
+                    budget.spend_road_work(1)?;
+                    if segment.src.z.min(segment.dst.z) <= max_z
+                        && segment.src.z.max(segment.dst.z) >= min_z
+                        && connector.distance(&Segment::new(segment.src.xy(), segment.dst.xy()))
+                            <= width * 0.5
+                    {
+                        return Err(Rejection::OccupiedTrack);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn platform_walk_metres(&self, stop: StopID) -> f32 {
         self.poses.get(&stop).map_or(0.0, |pose| {
             pose.sidewalk.distance(pose.door) + pose.door.distance(pose.boarding)
@@ -1089,6 +1134,13 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
     let transit = sim.read::<Transit>();
     let map = sim.map();
     let now = elapsed_ticks(&sim.resources);
+    let day = i128::from(TICKS_PER_BUDGET_DAY);
+    let max_upkeep = i128::from(Money::new_bucks(10_000).inner())
+        * MAX_PASSENGER_STOCK as i128
+        * MAX_RAIL_RUNS as i128;
+    if !(0..=day - 1 + i128::from(TICKS_PER_HOUR) * max_upkeep).contains(&rail.upkeep_pending) {
+        return Err("Invalid saved passenger rail upkeep");
+    }
     if rail.pending_lines.keys().any(|&id| {
         !rail.lines.contains_key(&id) || transit.lines.get(id).is_none_or(|line| !line.suspended)
     }) {
@@ -1161,6 +1213,7 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
         }
     }
     let mut run_counts = BTreeMap::<LineID, usize>::new();
+    let mut assigned_slots = BTreeSet::new();
     for (&id, run) in &rail.runs {
         let (Some(train), Some(config), Some(line), Some(wagons)) = (
             sim.world().trains.get(id), rail.lines.get(&run.line), transit.lines.get(run.line), stock.get_mut(&id),
@@ -1178,8 +1231,19 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
             || *count > 10
             || run.leg_started > now
             || run.braking_at_berth && run.close_at.is_some()
-            || run.slot.is_some_and(|slot| run.next_call != 0 || run.close_at.is_none_or(|close| close.0 < slot))
-            || run.close_at.is_some_and(|close| close.0 > now.0.saturating_add(6_600))
+            || run.call_sequence > now.0
+            || run.slot.is_some_and(|slot| {
+                !assigned_slots.insert((run.line, slot))
+                    || slot > now.0.saturating_add(600)
+                    || (run.next_call == 0
+                        && run.close_at.is_none_or(|close| {
+                            !(slot..=slot.saturating_add(600)).contains(&close.0)
+                        }))
+            })
+            || (run.next_call != 0 && run.slot.is_none())
+            || run
+                .close_at
+                .is_some_and(|close| close.0 > now.0.saturating_add(600))
             || train.locomotive.length != locomotive.length
             || train.locomotive.max_speed != locomotive.max_speed
             || train.locomotive.acc_force != locomotive.acc_force
@@ -1203,9 +1267,25 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
                 let aboard = riders.entry(train).or_default();
                 aboard.insert(id);
                 let line = &transit.lines[run.line];
+                let stop = line.stops[run.next_call];
+                let platform = rail.platforms[&stop];
+                let train = &sim.world().trains[train];
+                let has_exit = poses.get(&stop).is_some_and(|pose| {
+                    if run.close_at.is_some() {
+                        at_platform(train, platform, pose.berth)
+                    } else if run.braking_at_berth {
+                        measured_berth(train, platform, pose.berth)
+                    } else {
+                        train.it.target()
+                            == Some(crate::map_dynamic::ItineraryTarget::DirectedLane(
+                                platform.lane,
+                                platform.offset,
+                            ))
+                    }
+                });
                 if human.collider.is_some()
                     || aboard.len() > rail.lines[&run.line].capacity
-                    || !poses.contains_key(&line.stops[run.next_call])
+                    || !has_exit
                     || !matches!(human.router.cur_step(),
                         Some(crate::map_dynamic::RoutingStep::RideTransit { line: riding, alight })
                         if *riding == run.line && line.stops.contains(alight))
@@ -1237,6 +1317,71 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::saveload::{Bincode, Encoder};
+
+    #[test]
+    fn p8_w2_pre_passenger_snapshot_can_omit_passenger_resources() {
+        let ctx = crate::tests::TestCtx::new_fast();
+        let bytes = Bincode::encode(&ctx.g).unwrap();
+        let mut older: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
+        older.res.remove("passenger_rail").unwrap();
+        older.res.remove("passenger_journey_stats").unwrap();
+        older.res.insert(
+            "prototype_registry".to_owned(),
+            Bincode::encode(&prototypes::prototypes().pre_passenger_fingerprint()).unwrap(),
+        );
+        older._header.version = crate::PRE_PASSENGER_VERSION.into();
+        let migrated = older.into_sim().unwrap();
+        assert!(migrated.read::<RailTransit>().lines.is_empty());
+    }
+
+    #[test]
+    fn p8_w2_forecast_requires_full_boarding_window_on_return() {
+        let _ctx = crate::tests::TestCtx::new_fast();
+        let schedule = RailSchedule {
+            max_late_ticks: 10,
+            ..RailSchedule::default()
+        };
+        let mut line = new_line(
+            schedule,
+            1,
+            vec![RollingStockID::new("passenger-emu-front")],
+            RailLoop {
+                times: vec![200, 200],
+                paths: Vec::new(),
+            },
+            Tick(0),
+        );
+        line.next_slot = 1_000;
+        let run = PassengerRailRun {
+            line: LineID::default(),
+            next_call: 0,
+            close_at: Some(Tick(950)),
+            braking_at_berth: false,
+            leg_started: Tick(650),
+            call_sequence: 2,
+            slot: None,
+        };
+
+        // There are only 20 ticks before the deadline, so the doors must open
+        // for the next slot instead of offering a partial 100-tick dwell.
+        assert_eq!(
+            run.forecast(&line, Tick(990)).dwell_until,
+            Some(Tick(2_000))
+        );
+    }
+
+    #[test]
+    fn p8_w2_rejects_invalid_saved_upkeep_accumulator() {
+        let ctx = crate::tests::TestCtx::new_fast();
+        ctx.g.write::<RailTransit>().upkeep_pending = i128::MAX;
+        let bytes = ctx
+            .g
+            .encode_slot(crate::SnapshotRevision::new(1))
+            .unwrap()
+            .into_snapshot_bytes();
+        assert!(Simulation::load_compressed_snapshot(&bytes, 32 * 1024 * 1024).is_err());
+    }
 
     #[test]
     fn p8_w2_rejects_empty_saved_pattern() {

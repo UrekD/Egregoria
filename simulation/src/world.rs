@@ -528,12 +528,7 @@ impl HumanStorage {
     }
 
     pub(crate) fn has_active(&self, kind: HumanWork) -> bool {
-        self.activity.dirty
-            || !self.activity.sets[kind as usize].nonempty.is_empty()
-                && self.activity.sets[kind as usize]
-                    .nonempty
-                    .iter()
-                    .any(|&word| word != 0)
+        self.activity.dirty || !self.activity.sets[kind as usize].nonempty.is_empty()
     }
 
     pub(crate) fn edit_active(

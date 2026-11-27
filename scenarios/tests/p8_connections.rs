@@ -694,6 +694,49 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         ("MapRemoveRoad", simulation::world_command::Rejection::OccupiedTrack),
     ]);
     assert_eq!(before, ctx.sim.hashes());
+    let crossing = {
+        use simulation::map::{LanePatternBuilder, MapProject, ProjectKind};
+
+        let map = ctx.sim.map();
+        let station = map.get(platform.station).unwrap();
+        let berth = ctx.sim.read::<Transit>().stops[destination_stop].berth;
+        let middle = (station.door_pos + berth) * 0.5;
+        let endpoint = |dx| MapProject {
+            pos: middle + Vec3::X * dx,
+            kind: ProjectKind::Ground,
+        };
+        WorldCommand::MapMakeConnection {
+            from: endpoint(-60.0),
+            to: endpoint(60.0),
+            inter: None,
+            pat: LanePatternBuilder::new().build(),
+        }
+    };
+    assert_eq!(
+        crossing.preview(&ctx.sim).unwrap_err(),
+        simulation::world_command::Rejection::OccupiedTrack,
+    );
+    ctx.sim.apply_commands([&crossing]);
+    assert_eq!(before, ctx.sim.hashes());
+    let WorldCommand::MapMakeConnection {
+        from: road_start,
+        to: road_end,
+        pat,
+        ..
+    } = crossing
+    else {
+        unreachable!()
+    };
+    let far_away = |mut endpoint: simulation::map::MapProject| {
+        endpoint.pos.x += 400.0;
+        endpoint
+    };
+    apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
+        from: far_away(road_start),
+        to: far_away(road_end),
+        inter: None,
+        pat,
+    }]);
     let bytes = ctx
         .sim
         .encode_slot(simulation::SnapshotRevision::new(1))
@@ -729,4 +772,50 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         (2, 2, 0)
     );
     assert!(ctx.sim.read::<Budget>().total(BudgetCategory::TransitFares) > 0);
+}
+
+#[test]
+fn p8_rail_removal_drains_a_rider_at_the_next_platform() {
+    let (mut ctx, line) = rail_fixture(RailSchedule::default());
+    let from = house(&mut ctx.sim, vec2(800.0, 620.0));
+    let to = house(&mut ctx.sim, vec2(900.0, 980.0));
+    let rider = spawn_human(&mut ctx.sim, from).unwrap();
+    ctx.run_ticks(950);
+    let human = ctx.sim.world_mut_unchecked().humans.get_mut(rider).unwrap();
+    human.pedestrian.walking_speed = 1.25;
+    human.router = Router::new(None);
+    let destination = Destination::Building(to);
+    human.router.go_to(destination);
+    human.decision.kind = HumanDecisionKind::GoTo(destination);
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if let Location::RailTransit(train) = ctx.sim.get(rider).unwrap().location {
+            let rail = ctx.sim.read::<RailTransit>();
+            let run = &rail.runs[&train];
+            if run.next_platform_index() == 1 && run.dwell_until().is_none() {
+                break;
+            }
+        }
+    }
+    assert!(matches!(
+        ctx.sim.get(rider).unwrap().location,
+        Location::RailTransit(_)
+    ));
+    apply(&mut ctx.sim, &[WorldCommand::TransitRemoveLine { line }]);
+    assert!(ctx.sim.read::<RailTransit>().lines[&line].is_retiring());
+
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if ctx.sim.get(rider).unwrap().location == Location::Building(to) {
+            break;
+        }
+    }
+    assert_eq!(ctx.sim.get(rider).unwrap().location, Location::Building(to));
+    assert!(!ctx.sim.read::<RailTransit>().lines.contains_key(&line));
+    assert!(ctx
+        .sim
+        .read::<RailTransit>()
+        .runs
+        .values()
+        .all(|run| run.line != line));
 }

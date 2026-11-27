@@ -415,6 +415,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                     vehicle: ServiceVehicle::Bus(bus),
                     ordinal: run.next_stop_idx as u8,
                     sequence: run.leg_started.0,
+                    scheduled_slot: None,
                 },
             },
         );
@@ -460,6 +461,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                     vehicle: ServiceVehicle::Rail(id),
                     ordinal: run.next_call as u8,
                     sequence: run.call_sequence,
+                    scheduled_slot: run.slot,
                 },
             },
         );
@@ -482,7 +484,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         true
     });
     if now.0 % 256 == 0 {
-        resources.write::<super::JourneyStats>().expire(now);
+        resources.write::<super::JourneyStats>().expire(now, world);
     }
     world.humans.edit_active(HumanWork::Transit, |id, human| {
         let human: &mut HumanEnt = human;
@@ -504,6 +506,11 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             return;
         };
         let (stop, line, since) = (*stop, *line, *since);
+        let platform = resources.read::<super::RailTransit>().poses.get(&stop).copied();
+        const PLATFORM_WALK_TOLERANCE: f32 = 0.75;
+        let on_platform_walk = platform.as_ref().is_some_and(|pose| {
+            human.it.is_simple() && human.it.local_path().first() == Some(&pose.boarding)
+        });
         let timed_out = now.0.saturating_sub(since.0) > GIVE_UP_TICKS;
         let serving_line = transit.lines.get(line).is_some_and(|info| {
             !info.suspended && info.target_vehicles > 0 && info.stops.contains(&stop)
@@ -514,7 +521,14 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             .get(stop)
             .filter(|_| serving_line && !timed_out)
         else {
-            let pos = walkable_egress(&map, human.trans.pos);
+            let platform_exit = platform.filter(|pose| {
+                on_platform_walk || human.trans.pos.is_close(pose.boarding, PLATFORM_WALK_TOLERANCE)
+            });
+            let pos = if platform_exit.is_some() {
+                human.trans.pos
+            } else {
+                walkable_egress(&map, human.trans.pos)
+            };
             detach_for_replan(
                 &mut transit,
                 id,
@@ -523,17 +537,22 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 resources,
                 (!timed_out).then_some(line),
             );
+            if let Some(pose) = platform_exit {
+                Router::walk_from_platform(human, pose.door, pose.sidewalk);
+            }
             if timed_out {
                 on_wait_timeout(resources);
             }
             return;
         };
 
-        let platform = resources.read::<super::RailTransit>().poses.get(&stop).copied();
         if let Some(platform) = platform {
-            const PLATFORM_WALK_TOLERANCE: f32 = 0.75;
-            if !human.trans.pos.is_close(platform.boarding, PLATFORM_WALK_TOLERANCE) {
-                if human.it.end_pos() == Some(platform.boarding) && !human.it.has_ended(0.0) {
+            if !human
+                .trans
+                .pos
+                .is_close(platform.boarding, PLATFORM_WALK_TOLERANCE)
+            {
+                if on_platform_walk {
                     return;
                 }
                 if human.trans.pos.is_close(platform.sidewalk, OBJECTIVE_OK_DIST) {
@@ -597,9 +616,24 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             }
             world.edit_human(id, |human| {
                 let line = &transit.lines[at.line];
-                if !human.router.waits_for_ride(at.line, at.stop, &line.stops) {
-                    let walk_pos = transit.stops[at.stop].walk_pos;
+                let valid = human
+                    .router
+                    .waiting_alight(at.line, at.stop, &line.stops)
+                    .is_some_and(|alight| {
+                        resources.read::<super::JourneyStats>().matches_ride(
+                            id,
+                            alight,
+                            at.platform.is_some(),
+                        )
+                    });
+                if !valid {
+                    let walk_pos = at
+                        .platform
+                        .map_or(transit.stops[at.stop].walk_pos, |pose| pose.boarding);
                     detach_for_replan(&mut transit, id, human, walk_pos, resources, Some(at.line));
+                    if let Some(platform) = at.platform {
+                        Router::walk_from_platform(human, platform.door, platform.sidewalk);
+                    }
                     return;
                 }
                 if !Router::board_transit(human, vehicle.location(), resources) {

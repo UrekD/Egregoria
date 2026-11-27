@@ -246,35 +246,51 @@ fn routing_changed(
                     let credit = resources
                         .read::<crate::map_dynamic::transit::JourneyStats>()
                         .credit(id, now);
-                    let plan = |search| paths.winning_steps(
-                        origin,
-                        pos,
-                        &h.location,
-                        map,
-                        now,
-                        nearby_car,
-                        walk_speed,
-                        credit,
-                        search,
-                        |line| transit.allows_line_for_trip(id, router, line),
-                    );
-                    if paths.has_interchanges() {
-                        let mut stats = resources.write::<crate::map_dynamic::transit::JourneyStats>();
-                        let (mut pending, resuming) = stats.take_search(id, now, transit.revision, origin, pos);
-                        let requests = if resuming { &mut resumed_requests } else { &mut new_requests };
-                        if now.0.saturating_sub(pending.born.0) < 2_000 {
-                            if *requests == 0 || pending_walks == 0 {
-                                if stats.defer_search(id, pending) {
-                                    return;
+                    let plan = |search| {
+                        paths.winning_steps(
+                            origin,
+                            pos,
+                            &h.location,
+                            map,
+                            now,
+                            nearby_car,
+                            walk_speed,
+                            credit,
+                            search,
+                            |line| transit.allows_line_for_trip(id, router, line),
+                        )
+                    };
+                    if paths.needs_search_budget() {
+                        let mut stats =
+                            resources.write::<crate::map_dynamic::transit::JourneyStats>();
+                        let (mut pending, resuming) =
+                            stats.take_search(id, now, transit.revision, origin, pos);
+                        let requests = if resuming {
+                            &mut resumed_requests
+                        } else {
+                            &mut new_requests
+                        };
+                        let deferred = if *requests == 0 || pending_walks == 0 {
+                            true
+                        } else {
+                            *requests -= 1;
+                            let mut slice = SearchSlice::new(&mut pending, &mut pending_walks);
+                            transit_steps = plan(Some(&mut slice));
+                            slice.deferred
+                        };
+                        if deferred {
+                            stats.defer_search(id, pending);
+                            stats.discard_plan(id);
+                            router.clear_steps(parking);
+                            if h.location == Location::Outside {
+                                // Keep the start position stable while the saved search advances.
+                                if h.collider.is_none() {
+                                    Router::restore_walking(h, origin, resources);
                                 }
-                            } else {
-                                *requests -= 1;
-                                let mut slice = SearchSlice::new(&mut pending, &mut pending_walks);
-                                transit_steps = plan(Some(&mut slice));
-                                if slice.deferred && stats.defer_search(id, pending) {
-                                    return;
-                                }
+                                h.it = Itinerary::NONE;
+                                h.speed.0 = 0.0;
                             }
+                            return;
                         }
                     } else {
                         transit_steps = plan(None);
@@ -298,7 +314,9 @@ fn routing_changed(
             Ok(steps)
         } else {
             if !transit.lines.is_empty() {
-                resources.write::<crate::map_dynamic::transit::JourneyStats>().forget_search(id);
+                let mut journeys = resources.write::<crate::map_dynamic::transit::JourneyStats>();
+                journeys.forget_search(id);
+                journeys.discard_plan(id);
             }
             router.steps_to(pos, parking, map, &h.location, &world.vehicles)
         };
@@ -1059,11 +1077,33 @@ impl Router {
         matches!(self.trip_mode, TripProgress::RodeTransit)
     }
 
-    pub(super) fn waits_for_ride(&self, line: LineID, stop: StopID, calls: &[StopID]) -> bool {
-        matches!(self.cur_step, Some(RoutingStep::WaitAtStop { line: waiting, stop: boarding, .. })
-            if waiting == line && boarding == stop)
-            && matches!(self.steps.last(), Some(RoutingStep::RideTransit { line: riding, alight })
-                if *riding == line && *alight != stop && calls.contains(alight))
+    pub(super) fn waiting_alight(
+        &self,
+        line: LineID,
+        stop: StopID,
+        calls: &[StopID],
+    ) -> Option<StopID> {
+        match (self.cur_step.as_ref(), self.steps.last()) {
+            (
+                Some(RoutingStep::WaitAtStop {
+                    line: waiting,
+                    stop: boarding,
+                    ..
+                }),
+                Some(RoutingStep::RideTransit {
+                    line: riding,
+                    alight,
+                }),
+            ) if *waiting == line
+                && *boarding == stop
+                && *riding == line
+                && *alight != stop
+                && calls.contains(alight) =>
+            {
+                Some(*alight)
+            }
+            _ => None,
+        }
     }
 
     /// Start the next ride after the boarding system has checked the bus and stop.
