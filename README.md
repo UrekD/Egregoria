@@ -103,9 +103,28 @@ On Linux, `make p5-shots` regenerates the P5 screenshots under Xvfb from freshly
 |---|---|
 | ![Land Tiles panel](docs/screenshots/p6-land-tiles.png) | ![New Game population options](docs/screenshots/p6-population-options.png) |
 
-### Milestone P7 (in progress)
+### Milestone P7 — released in v0.12.0
 
-Inspect directed traffic queues and curb parking, preview and confirm road edits, and compare their effects on trips and freight deliveries. Experimental junction rules apply locally when enabled. P7 opens P6 city saves and uses version `0.12.0` for new saves, replays and multiplayer connections.
+- **Traffic repair tools.** Inspect lane queues and curb parking, compare the effects of repairs on trips and freight, and apply quoted edits live. Change speed limits, upgrade roads, reverse traffic or make roads one-way. Experimental junction rules let you set local stop and turn restrictions. Stuck-traffic fixes help pedestrians clear crossings and cars brake for crossing traffic.
+- **Windows simulation pacing.** Lesce at MAX went from about 1–3× to about 24× on a Core Ultra 9 275HX laptop with an RTX 5070 Ti. Use the frame profiler and headless `bench-slot` command to measure rendering and simulation separately. [Performance reporting guide](docs/perf-report.md)
+- **Ready-to-play cities.** The desktop archives include Starter Town, Showcase City, Lesce OSM and Lesce Town. P7 opens v0.11.1 city saves and uses v0.12.0 for new saves, replays and multiplayer connections. [v0.12.0 release and downloads](https://github.com/UrekD/Egregoria/releases/tag/v0.12.0)
+
+![Lesce Town road inspector showing directed traffic, curb parking and a quoted speed-limit change](docs/screenshots/p7-road-quote.png)
+
+### On master (next release)
+
+Changes since v0.12.0, slated for v0.13.0.
+
+- **Freight and vehicle inspection.** P8 wave 1 adds shipment tracing and controls for freight terminals and depots. Vehicle tooltips show destinations, and the inspector shows routes and freight cargo.
+- **Service staffing.** Map icons identify services, and clickable staff lists open individual citizen inspectors.
+- **Road tools.** Corrected roundabout geometry, a bulldoze preview and finer road snapping while holding Shift.
+- **City fixes.** Freight trains can serve Lesce Town's elevated rail terminal again, and Mixed Use residents favor shopping downstairs.
+
+### In progress
+
+- **PathPark.** Parking on properties and in garages, plus footpaths.
+- **P9 fire service.** Fire engine dispatch, burned-out ruins and timed demolition.
+- **P8 passenger transit.** Transfers between services and passenger rail.
 
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
