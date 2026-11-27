@@ -697,35 +697,20 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
     // Give property users time to drive out before the staffed frontage cut.
-    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
-    let close = {
-        let map = live.sim.map();
-        let frontage = map
-            .buildings()
-            .values()
-            .filter(|building| building.is_mixed_use())
-            .filter_map(|building| building.connected_road);
-        let adjacent = frontage_and_adjacent(&map, frontage);
-        map.buildings()
-            .keys()
-            .filter(|&id| {
-                live.sim.building_parking(id).is_some_and(|parking| {
-                    parking.open && adjacent.contains(&parking.entrance.road)
-                })
-            })
-            .map(|building| WorldCommand::SetBuildingParkingOpen {
-                building,
-                open: false,
-            })
-            .collect::<Vec<_>>()
-    };
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 18 * TICKS_PER_HOUR)?;
+    let close = frontage_closures(&live.sim);
     if !close.is_empty() {
         prepare_draining_parking(live)?;
         run_teardown_batch(live, &close, 1)?;
     }
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
+    let close = frontage_closures(&live.sim);
+    if !close.is_empty() {
+        run_teardown_batch(live, &close, 1)?;
+    }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
     let mut next_stage = elapsed(&live.sim);
-    let staging_deadline = next_stage + 6 * TICKS_PER_HOUR;
+    let staging_deadline = next_stage + TICKS_PER_DAY;
     let mut staged = 0;
     let (roads, affected) = loop {
         let missing = match staffed_teardown_frontage(&live.sim) {
@@ -789,7 +774,8 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
             // replacement house submits its first applications.
             let changed = stage_teardown_hires(live)?;
             staged += usize::from(changed);
-            next_stage = elapsed(&live.sim) + if changed { TICKS_PER_HOUR } else { 32 };
+            next_stage =
+                elapsed(&live.sim) + if changed { TICKS_PER_HOUR } else { TICKS_PER_HOUR / 12 };
             if changed {
                 continue;
             }
@@ -1035,6 +1021,28 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
 }
 
+fn frontage_closures(sim: &Simulation) -> Vec<WorldCommand> {
+    let map = sim.map();
+    let frontage = map
+        .buildings()
+        .values()
+        .filter(|building| building.is_mixed_use())
+        .filter_map(|building| building.connected_road);
+    let adjacent = frontage_and_adjacent(&map, frontage);
+    map.buildings()
+        .keys()
+        .filter(|&id| {
+            sim.building_parking(id).is_some_and(|parking| {
+                parking.open && adjacent.contains(&parking.entrance.road)
+            })
+        })
+        .map(|building| WorldCommand::SetBuildingParkingOpen {
+            building,
+            open: false,
+        })
+        .collect()
+}
+
 fn frontage_and_adjacent(map: &Map, frontage: impl Iterator<Item = RoadID>) -> BTreeSet<RoadID> {
     frontage
         .filter_map(|road| map.get(road))
@@ -1139,8 +1147,9 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
         }
         workers_by_home
             .into_iter()
-            .filter(|(home, _)| {
-                map.lot_origin(*home).is_some()
+            .filter(|(home, (frontage, _, _))| {
+                *frontage != 0
+                    && map.lot_origin(*home).is_some()
                     && WorldCommand::MapRemoveBuilding(*home)
                         .validate_and_price(&ctx.sim)
                         .is_ok()
