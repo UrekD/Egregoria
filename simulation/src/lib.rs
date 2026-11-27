@@ -135,19 +135,23 @@ const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
 const PRE_PROPERTY_PARKING_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.1");
 const PROPERTY_PARKING_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.2");
-const PATHPARK_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.3");
+const SURFACE_LOT_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.3");
+const PATHPARK_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.4");
 
 fn has_property_parking(version: &str) -> bool {
     matches!(
         version,
-        PROPERTY_PARKING_VERSION | PATHPARK_SNAPSHOT_VERSION
+        PROPERTY_PARKING_VERSION | SURFACE_LOT_SNAPSHOT_VERSION | PATHPARK_SNAPSHOT_VERSION
     )
 }
 
 fn pathpark_snapshot(version: &str) -> bool {
     matches!(
         version,
-        PRE_PROPERTY_PARKING_VERSION | PROPERTY_PARKING_VERSION | PATHPARK_SNAPSHOT_VERSION
+        PRE_PROPERTY_PARKING_VERSION
+            | PROPERTY_PARKING_VERSION
+            | SURFACE_LOT_SNAPSHOT_VERSION
+            | PATHPARK_SNAPSHOT_VERSION
     )
 }
 
@@ -155,6 +159,7 @@ fn compatible_save_version(version: &str) -> bool {
     matches!(
         version,
         PATHPARK_SNAPSHOT_VERSION
+            | SURFACE_LOT_SNAPSHOT_VERSION
             | PROPERTY_PARKING_VERSION
             | PRE_PROPERTY_PARKING_VERSION
             | VERSION
@@ -2081,8 +2086,10 @@ impl SimulationDeser {
                     let required = (requires_driveways && l.name == "driveway_traffic")
                         || (has_property_parking(&self._header.version)
                             && l.name == "property_parking")
-                        || (self._header.version == PATHPARK_SNAPSHOT_VERSION
-                            && l.name == "surface_lots");
+                        || (matches!(
+                            self._header.version.as_str(),
+                            PATHPARK_SNAPSHOT_VERSION | SURFACE_LOT_SNAPSHOT_VERSION
+                        ) && l.name == "surface_lots");
                     if l.optional && !required {
                         continue;
                     }
@@ -2128,6 +2135,7 @@ impl SimulationDeser {
             None if matches!(
                 self._header.version.as_str(),
                 PATHPARK_SNAPSHOT_VERSION
+                    | SURFACE_LOT_SNAPSHOT_VERSION
                     | PROPERTY_PARKING_VERSION
                     | PRE_PROPERTY_PARKING_VERSION
                     | VERSION
@@ -2179,9 +2187,10 @@ impl SimulationDeser {
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.map_mut().migrated_roundabout_paths.clear();
         sim.write::<transit::Transit>().rebuild_berth_index();
+        let mut surface_work = 16 * map::MAX_WATER_BATCH_WORK;
         sim.read::<crate::transportation::DrivewayTraffic>()
             .properties
-            .restore_surface_footprints(&mut sim.map_mut())
+            .restore_surface_footprints(&mut sim.map_mut(), &mut surface_work)
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.write::<crate::transportation::DrivewayTraffic>()
             .properties
@@ -2190,11 +2199,12 @@ impl SimulationDeser {
                 sim.world(),
                 &sim.read::<crate::transportation::TransportGrid>(),
                 &mut sim.write::<ParkingManagement>(),
+                &mut surface_work,
             )
             .map_err(|reason| corrupt(reason.into_owned()))?;
         sim.read::<crate::transportation::DrivewayTraffic>()
             .properties
-            .restore_surface_geometry(&mut sim.map_mut())
+            .restore_surface_geometry(&mut sim.map_mut(), &mut surface_work)
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.read::<crate::transportation::DrivewayTraffic>()
             .validate_loaded(

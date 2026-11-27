@@ -184,12 +184,20 @@ impl Map {
         &self,
         id: IntersectionID,
     ) -> Result<Polygon, ConnectionError> {
+        let mut work = crate::map::MAX_WATER_BATCH_WORK;
+        self.land_junction_outline_with_work(id, &mut work)
+    }
+
+    pub(in crate::map) fn land_junction_outline_with_work(
+        &self,
+        id: IntersectionID,
+        remaining: &mut usize,
+    ) -> Result<Polygon, ConnectionError> {
         let junction = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
-        junction_outline(
-            junction,
-            &self.roads,
-            &mut WaterTopologyWork::new().geometry(),
-        )
+        let mut tile_tests = MAX_DECK_TILE_TESTS;
+        let mut samples = 65_536;
+        let mut work = CrossingWork::new(remaining, &mut tile_tests, &mut samples);
+        junction_outline(junction, &self.roads, &mut work)
     }
 
     pub fn preview_connection(
@@ -1815,6 +1823,7 @@ pub(crate) struct RoadReplacementProjection {
     pub(crate) preview: RoadPreview,
     pub(crate) affected_roads: Vec<RoadID>,
     pub(crate) affected_roads_omitted: usize,
+    pub(crate) reclipped_roads: Vec<RoadID>,
     pub(crate) material: u64,
 }
 
@@ -1868,6 +1877,16 @@ pub(crate) fn prepare_road_replacement(
         .collect::<Vec<_>>();
     affected_roads.sort_unstable();
     let affected_roads_omitted = affected_roads.len().saturating_sub(MAX_PREVIEW_ROADS);
+    let reclipped_roads = affected_roads
+        .iter()
+        .copied()
+        .filter(|id| {
+            graph.roads[graph.road_keys[id]]
+                .interfaced_points()
+                .as_slice()
+                != map.roads[*id].interfaced_points().as_slice()
+        })
+        .collect();
     affected_roads.truncate(MAX_PREVIEW_ROADS);
     Ok(RoadReplacementProjection {
         preview: RoadPreview {
@@ -1877,6 +1896,7 @@ pub(crate) fn prepare_road_replacement(
         },
         affected_roads,
         affected_roads_omitted,
+        reclipped_roads,
         material,
     })
 }

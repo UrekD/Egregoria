@@ -491,7 +491,10 @@ impl ReplayJson {
                 JSON::decode(bytes)
             }
             Err(SaveLoadError::IncompatibleReplay { version })
-                if matches!(version.as_str(), "0.12.0+commands.3" | "0.12.0+commands.4") =>
+                if matches!(
+                    version.as_str(),
+                    "0.12.0+commands.3" | "0.12.0+commands.4" | "0.12.0+commands.5"
+                ) =>
             {
                 // This recording used earlier parking and command semantics.
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
@@ -499,10 +502,10 @@ impl ReplayJson {
                 if discarded || legacy.registry.is_some() {
                     crate::check_snapshot_registry(
                         legacy.registry,
-                        if version.ends_with("+commands.4") {
-                            crate::PROPERTY_PARKING_VERSION
-                        } else {
-                            crate::PRE_PROPERTY_PARKING_VERSION
+                        match version.as_str() {
+                            "0.12.0+commands.5" => crate::SURFACE_LOT_SNAPSHOT_VERSION,
+                            "0.12.0+commands.4" => crate::PROPERTY_PARKING_VERSION,
+                            _ => crate::PRE_PROPERTY_PARKING_VERSION,
                         },
                     )
                     .map_err(replay_decode_error)?;

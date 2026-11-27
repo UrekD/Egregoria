@@ -733,6 +733,7 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
             "The road or its quote changed. Preview the edit again."
         }
         (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
+        (_, ParkingLotAccess) => "This edit would alter a surface parking lot's access",
         (_, BusyConflict) => "Traffic or a service route still needs this movement",
         (_, InvalidJunctionRules(JunctionRuleError::Signalized)) => {
             "Approach priorities require an unsignalized junction"

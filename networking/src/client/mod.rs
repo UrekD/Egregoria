@@ -412,6 +412,12 @@ fn pathpark_w3_rejects_commands_4_handshake() {
 }
 
 #[cfg(test)]
+#[test]
+fn pathpark_w3_rejects_commands_5_handshake() {
+    assert_legacy_handshake_rejected("0.12.0+commands.5");
+}
+
+#[cfg(test)]
 fn assert_legacy_handshake_rejected(floor: &str) {
     use crate::{Server, ServerConfiguration, ServerPollResult};
     use std::net::{Ipv4Addr, TcpListener};

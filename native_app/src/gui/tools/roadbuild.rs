@@ -271,16 +271,26 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         _ => true,
     };
 
+    let build_pattern = || {
+        if tool == Tool::LocalOneWay {
+            simulation::map::SmallRoadPreset::LocalOneWay {
+                curb_parking: state.local_curb_parking,
+            }
+            .lane_pattern()
+        } else {
+            builder.build()
+        }
+    };
     let build_args = match state.build_state {
         StartCurved(selected_proj) if !cur_proj.is_ground() => {
-            Some((selected_proj, cur_proj, None, builder.build()))
+            Some((selected_proj, cur_proj, None, build_pattern()))
         }
-        Start(selected_proj) => Some((selected_proj, cur_proj, None, builder.build())),
-        CurvedConnection(src, dst) => Some((src, dst, Some(cur_proj.pos.xy()), builder.build())),
+        Start(selected_proj) => Some((selected_proj, cur_proj, None, build_pattern())),
+        CurvedConnection(src, dst) => Some((src, dst, Some(cur_proj.pos.xy()), build_pattern())),
 
         Curved(interpoint, selected_proj) => {
             let inter = Some(interpoint);
-            Some((selected_proj, cur_proj, inter, builder.build()))
+            Some((selected_proj, cur_proj, inter, build_pattern()))
         }
         _ => None,
     };

@@ -261,7 +261,15 @@ impl ParkingLayout {
             _ => None,
         }
         .into_iter()
-        .flat_map(SurfaceLotDraft::protected_roads)
+        .flat_map(|draft| {
+            draft.protected_roads().chain(
+                draft
+                    .mouths
+                    .into_iter()
+                    .flatten()
+                    .map(|mouth| mouth.at.road),
+            )
+        })
     }
 
     pub(super) fn door(&self) -> Vec3 {
@@ -1401,14 +1409,45 @@ impl BuildingParking {
         });
     }
 
-    pub(crate) fn protects_road(&self, road: RoadID, retire_vacant: bool) -> bool {
+    pub(crate) fn protects_surface_road(&self, road: RoadID) -> bool {
         self.surface_roads.contains_key(&road)
-            || self.mouths.get(&road).is_some_and(|mouths| {
-                !retire_vacant
-                    || mouths
-                        .iter()
-                        .any(|&(_, id)| self.busy(id) || self.sites[&id].layout.kind.is_public())
+    }
+
+    pub(crate) fn protects_non_surface_road(&self, road: RoadID, retire_vacant: bool) -> bool {
+        self.mouths.get(&road).is_some_and(|mouths| {
+            mouths.iter().any(|&(_, id)| {
+                let site = &self.sites[&id];
+                !matches!(site.layout.kind, BuildingParkingKind::SurfaceLot(_))
+                    && (!retire_vacant || site.layout.kind.is_public() || self.busy(id))
             })
+        })
+    }
+
+    pub(crate) fn guard_surface_demolition(
+        &self,
+        map: &Map,
+        edit: crate::map::ProjectKind,
+        remaining: &mut usize,
+    ) -> Result<(), crate::world_command::Rejection> {
+        use crate::world_command::Rejection;
+
+        if self.surface_roads.is_empty() {
+            return Ok(());
+        }
+        let mut work = super::WaterTopologyWork::new();
+        work.remaining = *remaining;
+        let clips = super::demolition_road_clips(map, &[edit], &mut work.geometry());
+        *remaining = work.remaining;
+        for (id, clip) in clips.map_err(Rejection::water_connection_error)? {
+            if self.protects_surface_road(id)
+                && clip.as_ref().is_none_or(|clip| {
+                    clip.as_slice() != map.roads()[id].interfaced_points().as_slice()
+                })
+            {
+                return Err(Rejection::ParkingLotAccess);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn protected_motion_roads(
@@ -1491,15 +1530,18 @@ impl BuildingParking {
         Some(self.sites[site].layout.anchor.road)
     }
 
-    pub(crate) fn restore_surface_footprints(&self, map: &mut Map) -> Result<(), &'static str> {
-        let mut work = 16 * crate::map::MAX_WATER_BATCH_WORK;
+    pub(crate) fn restore_surface_footprints(
+        &self,
+        map: &mut Map,
+        work: &mut usize,
+    ) -> Result<(), &'static str> {
         for (&id, site) in &self.sites {
             if let BuildingParkingKind::SurfaceLot(draft) = site.layout.kind {
                 if let Some(at) = draft.frame.curb() {
                     let road = map
                         .get(at.road)
                         .ok_or("missing surface lot frontage road")?;
-                    crate::map::spend_water_work(&mut work, road.points().len())
+                    crate::map::spend_water_work(work, road.points().len())
                         .map_err(|_| "surface parking load work limit exceeded")?;
                 }
                 let pad = lot_footprint(map, draft.frame, draft.width_blocks)
@@ -1510,12 +1552,21 @@ impl BuildingParking {
         Ok(())
     }
 
-    pub(crate) fn restore_surface_geometry(&self, map: &mut Map) -> Result<(), &'static str> {
+    pub(crate) fn restore_surface_geometry(
+        &self,
+        map: &mut Map,
+        work: &mut usize,
+    ) -> Result<(), &'static str> {
         for (&id, site) in &self.sites {
             if matches!(site.layout.kind, BuildingParkingKind::SurfaceLot(_)) {
                 let pad = map
                     .surface_lot_footprint(id)
                     .expect("surface parking footprint checked during restore");
+                crate::map::spend_water_work(
+                    work,
+                    site.layout.paths.len() * usize::from(MOTION_TICKS + 1) * 4,
+                )
+                .map_err(|_| "surface parking load work limit exceeded")?;
                 let geometry = site.layout.surface_geometry(pad);
                 match map.verify_surface_stalls(id, &geometry.stalls) {
                     Some(true) => (),
@@ -1534,6 +1585,7 @@ impl BuildingParking {
         world: &World,
         grid: &TransportGrid,
         parking: &mut ParkingManagement,
+        surface_work: &mut usize,
     ) -> Result<(), std::borrow::Cow<'static, str>> {
         if self.parked.len() + self.arrivals.len() > MAX_LIVE_CLAIMS {
             return Err("too many live property parking claims".into());
@@ -1556,7 +1608,6 @@ impl BuildingParking {
             }
         }
 
-        let mut surface_work = 16 * crate::map::MAX_WATER_BATCH_WORK;
         for (&id, site) in &mut self.sites {
             let layout = &mut site.layout;
             if let BuildingParkingKind::SurfaceLot(draft) = layout.kind {
@@ -1567,7 +1618,7 @@ impl BuildingParking {
                 if pad.shape.corners != building.obb.corners || building.door_pos != layout.door {
                     return Err("surface parking footprint or door changed".into());
                 }
-                let expected = prepare_surface_layout(map, draft, pad, Some(id), &mut surface_work)
+                let expected = prepare_surface_layout(map, draft, pad, Some(id), surface_work)
                     .map_err(|error| match error {
                         crate::world_command::Rejection::WaterWorkLimit => {
                             "surface parking load work limit exceeded"

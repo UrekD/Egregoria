@@ -414,7 +414,26 @@ pub fn lot_gate_position(
     footprint: LotFootprint,
     endpoint: PathEndpoint,
 ) -> Option<Vec3> {
-    checked_gate_position(map, footprint, endpoint, None)
+    let mut work = crate::map::MAX_WATER_BATCH_WORK;
+    checked_gate_position(map, footprint, endpoint, None, &mut work).ok()
+}
+
+fn spend_geometry_work(work: &mut usize, units: usize) -> Result<(), Rejection> {
+    crate::map::spend_water_work(work, units).map_err(|_| Rejection::WaterWorkLimit)
+}
+
+fn authorize_surface_pad(
+    map: &Map,
+    corners: &[Vec2; 4],
+    work: &mut usize,
+) -> Result<(), Rejection> {
+    use crate::map::LandDenial;
+
+    map.authorize_surface_footprint(corners, work)
+        .map_err(|reason| match reason {
+            LandDenial::WorkLimit => Rejection::WaterWorkLimit,
+            _ => Rejection::InvalidBuilding,
+        })
 }
 
 fn checked_gate_position(
@@ -422,62 +441,71 @@ fn checked_gate_position(
     footprint: LotFootprint,
     endpoint: PathEndpoint,
     own: Option<BuildingID>,
-) -> Option<Vec3> {
+    work: &mut usize,
+) -> Result<Vec3, Rejection> {
     let point = match endpoint {
         PathEndpoint::Sidewalk(anchor) => {
-            let (edge, outward) = curb_edge(map, anchor)?;
+            let (edge, outward) = curb_edge(map, anchor).ok_or(Rejection::InvalidBuilding)?;
             edge - outward.z0() * 1.5
         }
-        PathEndpoint::Ground { .. } => return None,
-        _ => map.path_endpoint_position(endpoint)? + Vec3::z(ROAD_Z_OFFSET),
+        PathEndpoint::Ground { .. } => return Err(Rejection::InvalidBuilding),
+        _ => {
+            map.path_endpoint_position(endpoint)
+                .ok_or(Rejection::InvalidBuilding)?
+                + Vec3::z(ROAD_Z_OFFSET)
+        }
     };
     let at = footprint.local(point);
     if (point.z - footprint.front.z).abs() > 0.5 {
-        return None;
+        return Err(Rejection::InvalidBuilding);
     }
     let nearest = Vec2::new(
         at.x.clamp(-footprint.width * 0.5, footprint.width * 0.5),
         at.y.clamp(0.0, footprint.depth),
     );
     if nearest.distance2(at) > 6.0_f32.powi(2) {
-        return None;
+        return Err(Rejection::InvalidBuilding);
     }
     let corridor = footprint.pedestrian_corridor(point.xy());
-    if corridor.axis()[1].mag() > 6.01
-        || !map.authorize_driveway_pad(&corridor.corners)
-        || map
-            .environment()
-            .intersects_water(&geom::Polygon(corridor.corners.to_vec()))
-    {
-        return None;
+    if corridor.axis()[1].mag() > 6.01 {
+        return Err(Rejection::InvalidBuilding);
     }
+    authorize_surface_pad(map, &corridor.corners, work)?;
     let corridor = Polygon::from(corridor.corners.as_slice());
+    if map.environment().intersects_water(&corridor) {
+        return Err(Rejection::InvalidBuilding);
+    }
+    let bounds = corridor.bbox();
+    map.spatial_map()
+        .reserve_construction_query(bounds, work)
+        .map_err(|_| Rejection::WaterWorkLimit)?;
     let skip = endpoint.road();
-    if map
+    for object in map
         .spatial_map()
-        .construction_candidates(
-            corridor.bbox(),
-            ProjectFilter::ROAD | ProjectFilter::BUILDING,
-        )
-        .any(|object| match object {
-            ProjectKind::Road(id) => {
-                Some(id) != skip
-                    && map
-                        .get(id)
-                        .is_some_and(|road| road.boldline().intersects(&corridor))
+        .construction_candidates(bounds, ProjectFilter::ROAD | ProjectFilter::BUILDING)
+    {
+        let overlaps = match object {
+            ProjectKind::Road(id) if Some(id) != skip => {
+                let road = &map.roads()[id];
+                spend_geometry_work(work, 4 * road.points().len())?;
+                road.boldline().intersects(&corridor)
             }
-            ProjectKind::Building(id) if Some(id) != own => map.get(id).is_some_and(|building| {
-                map.surface_lot_footprint(id).map_or_else(
+            ProjectKind::Building(id) if Some(id) != own => {
+                let building = &map.buildings()[id];
+                let pad = map.surface_lot_footprint(id);
+                spend_geometry_work(work, 4 * pad.map_or(1, |pad| pad.blocks().count()))?;
+                pad.map_or_else(
                     || building.obb.intersects(&corridor),
                     |pad| pad.blocks().any(|block| block.intersects(&corridor)),
                 )
-            }),
+            }
             _ => false,
-        })
-    {
-        return None;
+        };
+        if overlaps {
+            return Err(Rejection::InvalidBuilding);
+        }
     }
-    Some(point)
+    Ok(point)
 }
 
 impl LotFootprint {
@@ -832,20 +860,7 @@ pub(in crate::map) fn prepare_surface_layout(
     // Validate the revision even when the selected sidewalk's point still looks the same.
     map.path_endpoint_position(gate)
         .ok_or(Rejection::StaleRoadEdit)?;
-    let gate_query = pad.shape.bbox().expand(6.5);
-    map.spatial_map()
-        .reserve_construction_query(gate_query, work)
-        .map_err(|_| Rejection::WaterWorkLimit)?;
-    for candidate in map
-        .spatial_map()
-        .construction_candidates(gate_query, ProjectFilter::ROAD)
-    {
-        if let ProjectKind::Road(id) = candidate {
-            crate::map::spend_water_work(work, map.roads()[id].points().len() * 4)
-                .map_err(|_| Rejection::WaterWorkLimit)?;
-        }
-    }
-    let door = checked_gate_position(map, pad, gate, own).ok_or(Rejection::InvalidBuilding)?;
+    let door = checked_gate_position(map, pad, gate, own, work)?;
     let gate_bounds = pad.pedestrian_corridor(door.xy()).bbox();
     let mut paths = Vec::new();
     let mut slots = Vec::new();
@@ -878,12 +893,12 @@ pub(in crate::map) fn prepare_surface_layout(
                     || environment
                         .height(xy)
                         .is_none_or(|z| (z + ROAD_Z_OFFSET - point.z).abs() > 0.6)
-                    || !map.authorize_driveway_pad(&clearance.corners)
                     || (mouth.inward.dot((point - apron_point(pad, mouth)).xy()) > -0.9
                         && !pad.shape.expand(-0.5).contains(xy))
                 {
                     return Err(Rejection::InvalidBuilding);
                 }
+                authorize_surface_pad(map, &clearance.corners, work)?;
             }
             surface_sweep_clear(map, own, mouth, sweep, work)?;
             let envelope = sweep.bounds();

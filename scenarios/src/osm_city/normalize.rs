@@ -603,6 +603,7 @@ fn lane_pattern(element: &Element, class: LinkClass, one_way: bool, reverse: boo
         lanes
     };
     LanePattern {
+        local_one_way: false,
         lanes_forward: side(forward_count),
         lanes_backward: side(backward_count),
     }

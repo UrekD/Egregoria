@@ -408,6 +408,7 @@ pub enum Rejection {
     RoadTopologyUnavailable,
     InvalidJunctionRules(JunctionRuleError),
     BusyConflict,
+    ParkingLotAccess,
 }
 
 impl From<LandDenial> for Rejection {
@@ -439,7 +440,7 @@ impl Rejection {
         }
     }
 
-    fn water_connection_error(error: ConnectionError) -> Self {
+    pub(crate) fn water_connection_error(error: ConnectionError) -> Self {
         match error {
             ConnectionError::WorkLimit => Self::WaterWorkLimit,
             ConnectionError::LandDenied(reason) => Self::LandDenied(reason),
@@ -2056,8 +2057,17 @@ impl WorldCommand {
             .protected_motion_roads(&map, remaining)
             .map_err(|error| Rejection::water_error(&error))?;
         let retire_vacant = matches!(self, MapRemoveRoad(_));
+        // Upgrade and demolition have their own checks for lot frontage.
+        let check_surface_neighbors = !matches!(
+            self,
+            MapUpgradeRoad { .. } | MapRemoveRoad(_) | MapRemoveIntersection(_)
+        );
         let protects = |road| {
-            protected.contains(&road) || traffic.properties.protects_road(road, retire_vacant)
+            protected.contains(&road)
+                || traffic
+                    .properties
+                    .protects_non_surface_road(road, retire_vacant)
+                || (check_surface_neighbors && traffic.properties.protects_surface_road(road))
         };
         let touches_junction = |id| {
             map.get(id).is_some_and(|joint: &crate::map::Intersection| {
@@ -2177,10 +2187,21 @@ impl WorldCommand {
             _ => false,
         };
         if blocked {
-            Err(Rejection::BusyConflict)
-        } else {
-            Ok(())
+            return Err(Rejection::BusyConflict);
         }
+        let demolition = match self {
+            MapRemoveRoad(road) if map.get(*road).is_some() => Some(ProjectKind::Road(*road)),
+            MapRemoveIntersection(joint) if map.get(*joint).is_some() => {
+                Some(ProjectKind::Intersection(*joint))
+            }
+            _ => None,
+        };
+        if let Some(edit) = demolition {
+            traffic
+                .properties
+                .guard_surface_demolition(&map, edit, remaining)?;
+        }
+        Ok(())
     }
 
     fn check_parking_facility(

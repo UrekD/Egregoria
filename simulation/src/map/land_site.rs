@@ -90,7 +90,15 @@ impl Map {
         points: &[Vec2],
         purchased: Option<LandTileId>,
     ) -> Result<(), LandDenial> {
-        self.authorize_land_footprint_with_deck(points, purchased, None)
+        self.authorize_land_footprint_with_deck(points, purchased, None, None)
+    }
+
+    pub(super) fn authorize_surface_footprint(
+        &self,
+        points: &[Vec2],
+        work: &mut usize,
+    ) -> Result<(), LandDenial> {
+        self.authorize_land_footprint_with_deck(points, None, None, Some(work))
     }
 
     pub(super) fn authorize_existing_road_deck(&self, id: RoadID) -> Result<(), LandDenial> {
@@ -113,6 +121,7 @@ impl Map {
             &triangle.map(Vec3::xy),
             None,
             Some((live, triangle)),
+            None,
         )
     }
 
@@ -121,9 +130,27 @@ impl Map {
         points: &[Vec2],
         purchased: Option<LandTileId>,
         deck: Option<(&Road, [Vec3; 3])>,
+        mut work: Option<&mut usize>,
     ) -> Result<(), LandDenial> {
-        self.land_ownership().check_polygon(points, purchased)?;
+        let spend = |work: &mut usize, units| {
+            super::spend_water_work(work, units).map_err(|_| LandDenial::WorkLimit)
+        };
         let bounds = Polygon::from(points).bbox();
+        if let Some(work) = work.as_deref_mut() {
+            let tiles = (bounds.ur - bounds.ll) / super::LAND_TILE_SIZE;
+            spend(
+                work,
+                (tiles.x.ceil() as usize + 2)
+                    .saturating_mul(tiles.y.ceil() as usize + 2)
+                    .saturating_mul(points.len()),
+            )?;
+        }
+        self.land_ownership().check_polygon(points, purchased)?;
+        if let Some(work) = work.as_deref_mut() {
+            self.spatial_map
+                .reserve_construction_query(bounds, work)
+                .map_err(|_| LandDenial::WorkLimit)?;
+        }
         for object in self.spatial_map.construction_candidates(
             bounds,
             ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
@@ -134,6 +161,9 @@ impl Map {
             let overlaps = match object {
                 ProjectKind::Road(id) => {
                     let road = &self.roads[id];
+                    if let Some(work) = work.as_deref_mut() {
+                        spend(work, 32 * road.interfaced_points().len())?;
+                    }
                     let shared = deck.and_then(|(deck_road, _)| {
                         [deck_road.src, deck_road.dst]
                             .into_iter()
@@ -164,13 +194,22 @@ impl Map {
                     if deck.is_some_and(|(road, _)| id == road.src || id == road.dst) {
                         continue;
                     }
-                    let outline = self
-                        .land_junction_outline(id)
-                        .map_err(|_| LandDenial::WorkLimit)?;
+                    let outline = match work.as_deref_mut() {
+                        Some(work) => self.land_junction_outline_with_work(id, work),
+                        None => self.land_junction_outline(id),
+                    }
+                    .map_err(|_| LandDenial::WorkLimit)?;
+                    if let Some(work) = work.as_deref_mut() {
+                        spend(work, outline.len().saturating_add(4).saturating_pow(2))?;
+                    }
                     polygons_overlap(points, outline.as_slice())
                 }
                 ProjectKind::Building(id) => {
                     let building = &self.buildings[id];
+                    if let Some(work) = work.as_deref_mut() {
+                        let vertices = building.zone.as_ref().map_or(0, |zone| zone.poly.len());
+                        spend(work, vertices.saturating_add(8).saturating_pow(2))?;
+                    }
                     polygons_overlap(points, &building.obb.corners)
                         || building
                             .zone
@@ -516,6 +555,27 @@ fn polygons_overlap(a: &[Vec2], b: &[Vec2]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pathpark_wave3_dense_pad_authority_spends_raw_cell_work() {
+        let mut map = Map::empty();
+        let pad = OBB::new(vec2(125.0, 125.0), Vec2::X, 2.5, 2.5);
+        let mut work = 256;
+        assert!(map
+            .authorize_surface_footprint(&pad.corners, &mut work)
+            .is_ok());
+
+        // The query returns no intersections. Their raw memberships still cost work.
+        for i in 0..256 {
+            map.add_intersection(vec2(101.0 + i as f32 / 128.0, 101.0).z0());
+        }
+        let mut work = 256;
+        assert_eq!(
+            map.authorize_surface_footprint(&pad.corners, &mut work),
+            Err(LandDenial::WorkLimit)
+        );
+        assert_eq!(work, 0);
+    }
 
     #[test]
     fn tiles_fix_inscribed_reserve_overlap_and_boundary_contact() {

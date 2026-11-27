@@ -51,26 +51,26 @@ pub struct Road {
 
     pub connected_buildings: Vec<BuildingID>,
 
-    src_interface: SourceInterface,
-    dst_interface: f32,
+    src_interface: TaggedInterface,
+    dst_interface: TaggedInterface,
 
     lanes_forward: Vec<(LaneID, LaneKind)>,
     lanes_backward: Vec<(LaneID, LaneKind)>,
 }
 
-/// Stores the elevated-span flag in the sign bit of the source interface distance.
-/// This keeps the positional Bincode layout of a road. Older saves stored
-/// nonnegative distances, which decode as terrain-following.
+/// The sign bits of the source and destination interface distances record
+/// elevated spans and the local one-way preset, respectively. The positional
+/// Bincode layout is unchanged and older destination distances are untagged.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(transparent)]
-struct SourceInterface(f32);
+struct TaggedInterface(f32);
 
-impl SourceInterface {
-    fn new(distance: f32, elevated_span: bool) -> Self {
-        Self(if elevated_span { -distance } else { distance })
+impl TaggedInterface {
+    fn new(distance: f32, tagged: bool) -> Self {
+        Self(if tagged { -distance } else { distance })
     }
 
-    fn elevated_span(self) -> bool {
+    fn is_tagged(self) -> bool {
         self.0.is_sign_negative()
     }
 
@@ -196,8 +196,8 @@ impl Road {
             id,
             src,
             dst,
-            src_interface: SourceInterface::new(9.0, elevated_span),
-            dst_interface: 9.0,
+            src_interface: TaggedInterface::new(9.0, elevated_span),
+            dst_interface: TaggedInterface::new(9.0, false),
             width,
             lanes_forward: vec![],
             lanes_backward: vec![],
@@ -229,6 +229,10 @@ impl Road {
     }
 
     pub(crate) fn make_lanes(&mut self, pattern: &LanePattern, lanes: &mut Lanes) {
+        self.dst_interface = TaggedInterface::new(
+            self.dst_interface.distance(),
+            pattern.local_one_way && pattern.has_local_one_way_layout(),
+        );
         let mut dist_from_bottom = 0.0;
         for (kind, dir, limit) in pattern.lanes() {
             let id = Lane::make(self, lanes, kind, limit, dir, dist_from_bottom);
@@ -420,8 +424,13 @@ impl Road {
         BoldLine::new(self.points.flatten(), self.width * 0.5)
     }
 
+    pub(in crate::map) fn is_local_one_way(&self) -> bool {
+        self.dst_interface.is_tagged()
+    }
+
     pub fn pattern(&self, lanes: &Lanes) -> LanePattern {
         LanePattern {
+            local_one_way: self.is_local_one_way(),
             lanes_forward: self
                 .lanes_forward
                 .iter()
@@ -484,7 +493,7 @@ impl Road {
     }
 
     pub fn elevated_span(&self) -> bool {
-        self.src_interface.elevated_span()
+        self.src_interface.is_tagged()
     }
 
     pub(crate) fn split_surface_height(&self, point: Vec3, env: &Environment) -> f32 {
@@ -829,9 +838,9 @@ impl Road {
 
     fn interfaces_from(&self, id: IntersectionID) -> (f32, f32) {
         if id == self.src {
-            (self.src_interface.distance(), self.dst_interface)
+            (self.src_interface.distance(), self.dst_interface.distance())
         } else if id == self.dst {
-            (self.dst_interface, self.src_interface.distance())
+            (self.dst_interface.distance(), self.src_interface.distance())
         } else {
             panic!("Asking interface from from an intersection not connected to the road");
         }
@@ -841,7 +850,7 @@ impl Road {
         if id == self.src {
             self.src_interface.set_distance(v);
         } else if id == self.dst {
-            self.dst_interface = v;
+            self.dst_interface.set_distance(v);
         } else {
             panic!("Setting interface from from an intersection not connected to the road");
         }
@@ -852,7 +861,8 @@ impl Road {
             self.src_interface
                 .set_distance(self.src_interface.distance().max(v));
         } else if id == self.dst {
-            self.dst_interface = self.dst_interface.max(v);
+            self.dst_interface
+                .set_distance(self.dst_interface.distance().max(v));
         } else {
             panic!("Setting interface from from an intersection not connected to the road");
         }

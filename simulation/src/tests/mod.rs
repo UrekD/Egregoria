@@ -562,6 +562,7 @@ fn w0_water_rejects_excess_lanes_before_topology_and_c1_keeps_the_inputs() {
     let from = MapProject::ground(vec3(32.0, 96.0, 10.0));
     let to = MapProject::ground(vec3(160.0, 96.0, 10.0));
     let pat = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0); 17],
         lanes_backward: vec![(LaneKind::Driving, 10.0); 16],
     };
@@ -745,6 +746,7 @@ fn w0_water_indexed_links_share_the_topology_budget() {
     .unwrap();
     sim.write::<Replay>().enabled = true;
     let pat = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0); 16],
         lanes_backward: vec![(LaneKind::Driving, 10.0); 15],
     };
@@ -800,6 +802,7 @@ fn w0_water_rejects_alternating_terrain_links_before_profiling() {
         })
         .collect();
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };
@@ -830,6 +833,7 @@ fn w0_water_profile_samples_are_shared_by_indexed_links() {
     })
     .unwrap();
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };
@@ -866,6 +870,7 @@ fn w0_water_profile_samples_include_split_road_rebuilds() {
     let mut map = Map::empty();
     assert!(map.install_environment(terrain));
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };

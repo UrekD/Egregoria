@@ -569,6 +569,10 @@ pub(crate) fn prepare_upgrade(
     if current != expected {
         return Err(Rejection::StaleRoadEdit);
     }
+    let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+    if traffic.properties.protects_surface_road(id) {
+        return Err(Rejection::ParkingLotAccess);
+    }
     if road.is_walking_path() {
         return Err(Rejection::InvalidRoadPattern);
     }
@@ -616,21 +620,7 @@ pub(crate) fn prepare_upgrade(
         return Err(Rejection::StaleRoadEdit);
     }
     let mut direction_edits = None;
-    let local_reversal = matches!(change, RoadUpgrade::ReverseOneWay) && {
-        let curb_parking = pattern
-            .lanes()
-            .any(|(kind, _, _)| kind == LaneKind::Parking);
-        let local = super::SmallRoadPreset::LocalOneWay { curb_parking }.lane_pattern();
-        let same_kinds = |a: &[(LaneKind, f32)], b: &[(LaneKind, f32)]| {
-            a.iter()
-                .map(|(kind, _)| kind)
-                .eq(b.iter().map(|(kind, _)| kind))
-        };
-        (same_kinds(&pattern.lanes_forward, &local.lanes_forward)
-            && same_kinds(&pattern.lanes_backward, &local.lanes_backward))
-            || (same_kinds(&pattern.lanes_forward, &local.lanes_backward)
-                && same_kinds(&pattern.lanes_backward, &local.lanes_forward))
-    };
+    let local_reversal = matches!(change, RoadUpgrade::ReverseOneWay) && road.is_local_one_way();
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
         let edits = forward
@@ -669,6 +659,13 @@ pub(crate) fn prepare_upgrade(
                     ConnectionError::LandDenied(reason) => Rejection::LandDenied(reason),
                     error => Rejection::WaterConnection(error),
                 })?;
+        if projection
+            .reclipped_roads
+            .iter()
+            .any(|&road| traffic.properties.protects_surface_road(road))
+        {
+            return Err(Rejection::ParkingLotAccess);
+        }
         let topology = RoadTopologyPreview {
             junctions: projection.preview.junctions,
             crosses_water: projection.preview.crosses_water,

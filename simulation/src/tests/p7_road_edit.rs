@@ -874,6 +874,7 @@ fn p7_replay_mixed_dry_batch_keeps_link_indices_and_refusals() {
         .unwrap();
     let (edit, _) = upgrade(&sim, road, 13.0);
     let wide = crate::map::LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0); 17],
         lanes_backward: vec![(LaneKind::Driving, 10.0); 17],
     };

@@ -256,6 +256,107 @@ fn run_edits(ctx: &mut ScenarioCtx) -> Result<(), String> {
     run_surface_trip(ctx, true)
 }
 
+fn edit_held_trip_topology(sim: &mut Simulation, resumed: &mut Simulation) -> Result<(), String> {
+    use simulation::map::road_edit::{preview_road_upgrade, road_edit_stamp, RoadUpgrade};
+    use simulation::map::{ProjectKind, SmallRoadPreset};
+    use simulation::world_command::PrepareBudget;
+
+    let apply = |sim: &mut Simulation, resumed: &mut Simulation, command: WorldCommand| {
+        let name = command.kind();
+        for run in [&mut *sim, &mut *resumed] {
+            run.apply_commands([&command]);
+            let outcomes = run.read::<CommandOutcomes>();
+            if outcomes.accepted != [0] {
+                return Err(format!("held-trip {name} failed: {:?}", outcomes.last));
+            }
+        }
+        if sim.hashes() != resumed.hashes() {
+            return Err(format!("held-trip {name} diverged after reload"));
+        }
+        Ok(())
+    };
+    let ground = |sim: &Simulation, xy: Vec2| {
+        sim.map()
+            .environment()
+            .height(xy)
+            .map(|z| MapProject::ground(xy.z(z)))
+            .ok_or("topology edit lies outside the terrain")
+    };
+    let project = |sim: &Simulation, xy: Vec2| {
+        ground(sim, xy).map(|at| {
+            sim.map()
+                .project(at.pos, 0.0, ProjectFilter::ROAD | ProjectFilter::INTER)
+        })
+    };
+    let connect = |from, to, pat| WorldCommand::MapMakeConnection {
+        from,
+        to,
+        inter: None,
+        pat,
+    };
+    let local = SmallRoadPreset::LocalOneWay {
+        curb_parking: false,
+    }
+    .lane_pattern();
+    let start = vec2(80.0, 405.0);
+    let join = vec2(200.0, 405.0);
+    let end = vec2(340.0, 405.0);
+    let center = vec2(240.0, 405.0);
+    let road_count = sim.map().roads().len();
+    let original = connect(ground(sim, start)?, ground(sim, join)?, local.clone());
+    apply(sim, resumed, original)?;
+    let extension = connect(project(sim, join)?, ground(sim, end)?, local);
+    apply(sim, resumed, extension)?;
+    if sim.map().roads().len() != road_count + 1 {
+        return Err("collinear local road extension did not merge".into());
+    }
+    let ProjectKind::Road(road) = project(sim, center)?.kind else {
+        return Err("merged local road is missing".into());
+    };
+    let change = RoadUpgrade::ReverseOneWay;
+    let mut budget = PrepareBudget::for_preview(1_000_000);
+    let expected =
+        road_edit_stamp(sim, road, &mut budget).map_err(|reason| format!("{reason:?}"))?;
+    let quote = preview_road_upgrade(sim, road, expected, &change, &mut budget)
+        .map_err(|reason| format!("held-trip reversal preview: {reason:?}"))?
+        .quote;
+    apply(
+        sim,
+        resumed,
+        WorldCommand::MapUpgradeRoad {
+            road,
+            expected,
+            change,
+            quote,
+        },
+    )?;
+
+    let branch = connect(
+        project(sim, center)?,
+        ground(sim, vec2(240.0, 475.0))?,
+        LanePatternBuilder::default().build(),
+    );
+    apply(sim, resumed, branch)?;
+    if sim.map().get(road).is_some() || sim.map().roads().len() != road_count + 3 {
+        return Err("branch did not split the reversed road".into());
+    }
+    let path = {
+        let map = sim.map();
+        let from = map
+            .pick_path_ground(8_000, 47_500)
+            .ok_or("invalid edit path start")?;
+        let to = map
+            .pick_path_ground(16_000, 47_500)
+            .ok_or("invalid edit path end")?;
+        WorldCommand::MapMakeWalkingPath {
+            from,
+            to,
+            control: None,
+        }
+    };
+    apply(sim, resumed, path)
+}
+
 fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
     let sites = setup_at(&mut ctx.sim, true, Vec2::ZERO, edits, false)?;
     ctx.sim
@@ -332,13 +433,20 @@ fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
                     ));
                 }
             }
-            let restored = ctx.round_tripped()?;
+            let mut restored = ctx.round_tripped()?;
             if ctx.sim.hashes() != restored.hashes()
                 || restored.car_property_parking(car).0 != Some(lot)
             {
                 return Err("public-lot hold diverged on reload".into());
             }
             ctx.sample("public_held");
+            if edits {
+                edit_held_trip_topology(&mut ctx.sim, &mut restored)?;
+                if ctx.sim.car_property_parking(car).0 != Some(lot) {
+                    return Err("topology edits lost the tagged lot hold".into());
+                }
+                ctx.sample("held_after_topology_edits");
+            }
         }
         if arrived(&ctx.sim) {
             break;
