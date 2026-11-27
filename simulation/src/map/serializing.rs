@@ -244,7 +244,7 @@ impl SerializedMap {
                 if self
                     .roads
                     .get(road)
-                    .is_none_or(|r| !r.connected_buildings.contains(&id))
+                    .is_none_or(|r| r.is_walking_path() || !r.connected_buildings.contains(&id))
                 {
                     return Err(format!("building {id:?} has an invalid road {road:?}"));
                 }

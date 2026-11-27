@@ -240,6 +240,11 @@ impl Road {
         }
     }
 
+    pub(crate) fn mark_staged_path(&mut self) {
+        self.lanes_forward
+            .push((LaneID::default(), LaneKind::Walking));
+    }
+
     pub(crate) fn clear_staged_lanes(&mut self) {
         self.lanes_forward.clear();
         self.lanes_backward.clear();
@@ -289,8 +294,32 @@ impl Road {
         [PolyLine3::new(before), PolyLine3::new(after)]
     }
 
+    pub fn is_walking_path(&self) -> bool {
+        matches!(self.lanes_forward.as_slice(), [(_, LaneKind::Walking)])
+            && self.lanes_backward.is_empty()
+    }
+
+    pub fn allows_motor_access(&self) -> bool {
+        self.lanes_iter().any(|(_, kind)| kind.vehicles())
+    }
+
     pub fn is_one_way(&self) -> bool {
-        self.lanes_forward.is_empty() || self.lanes_backward.is_empty()
+        let traffic = |lanes: &[(LaneID, LaneKind)]| {
+            lanes.iter().any(|(_, kind)| kind.vehicles() || kind.is_rail())
+        };
+        traffic(&self.lanes_forward) != traffic(&self.lanes_backward)
+    }
+
+    pub(crate) fn sidewalk_on(&self, side: crate::map::RoadSide) -> Option<LaneID> {
+        if self.is_walking_path() {
+            return None;
+        }
+        let lanes = match side {
+            crate::map::RoadSide::Left => &self.lanes_backward,
+            crate::map::RoadSide::Right => &self.lanes_forward,
+        };
+        let &(id, kind) = lanes.last()?;
+        (kind == LaneKind::Walking).then_some(id)
     }
 
     pub fn n_lanes(&self) -> usize {
@@ -320,6 +349,9 @@ impl Road {
     }
 
     pub fn has_sidewalks(&self) -> bool {
+        if self.is_walking_path() {
+            return false;
+        }
         self.lanes_forward
             .iter()
             .any(|(_, kind)| matches!(kind, LaneKind::Walking))

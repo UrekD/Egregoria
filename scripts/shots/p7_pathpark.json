@@ -1,0 +1,23 @@
+[
+  {"LoadSlot": "pathpark_growables"},
+  {"Camera": {"x": 267, "y": 123, "z": 0, "yaw": 0.2, "pitch": 1.12, "dist": 115}},
+  {"WaitFrames": 8},
+  {"Screenshot": "p7-pathpark-driveways"},
+  {"Camera": {"x": 320, "y": 121, "z": 0, "yaw": 0.22, "pitch": 0.9, "dist": 120}},
+  {"Pointer": {"action": "Click", "world_pos": [330, 122, 3]}},
+  {"WaitFrames": 6},
+  {"Screenshot": "p7-pathpark-garage-inspector"},
+  "ClearBuildingInspector",
+  {"Camera": {"x": 257, "y": 108, "z": 0, "yaw": 1.45, "pitch": 0.9, "dist": 242}},
+  {"WaitFrames": 8},
+  {"Screenshot": "p7-pathpark-public-garages"},
+  {"Camera": {"x": 400, "y": 118, "z": 0, "yaw": 0.16, "pitch": 1.05, "dist": 120}},
+  {"SelectTool": "transport/parking-garages"},
+  {"Pointer": {"action": "Click", "world_pos": [398, 113, 0]}},
+  {"WaitFrames": 6},
+  {"Screenshot": "p7-pathpark-garage-entrance"},
+  {"Pointer": {"action": "Click", "world_pos": [398, 113, 0]}},
+  {"WaitFrames": 8},
+  {"Assert": "NoRejections"},
+  "Exit"
+]

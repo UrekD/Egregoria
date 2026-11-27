@@ -37,6 +37,7 @@ pub fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
 }
 
 pub fn run_10k(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    ctx.sim.use_curb_only_benchmark_parking();
     run_with_options(ctx, PERF_10K_OPTIONS)
 }
 
@@ -66,8 +67,27 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
 
     // perf_10k measures the 08:25–10:05 morning commute ramp in game time (fixed tick
     // counts, so the hourly passes at 09:00 and 10:00 fall inside the measured window).
-    for (label, ticks) in [("setup", 0), ("warmup", 2_000), ("measured", 10_000)] {
-        ctx.run_ticks(ticks);
+    const WARMUP_TICKS: u64 = 2_000;
+    const MEASURED_TICKS: u64 = 10_000;
+    let mut opening = crate::runner::ParkingOpening::capture(&ctx.sim);
+    for (label, ticks) in [
+        ("setup", 0),
+        ("warmup", WARMUP_TICKS),
+        ("measured", MEASURED_TICKS),
+    ] {
+        if label == "measured" {
+            if let Some(opening) = opening.take() {
+                opening.write(&ctx.sim, None, WARMUP_TICKS, MEASURED_TICKS)?;
+            }
+        }
+        let workload = if label == "measured" && options.minimum_employment_percent.is_some() {
+            let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
+            ctx.run_ticks_observed(ticks, |sim| workload.observe(sim));
+            workload.finish(&ctx.sim)
+        } else {
+            ctx.run_ticks(ticks);
+            Default::default()
+        };
         let houses = ctx
             .sim
             .map()
@@ -76,7 +96,7 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
             .filter(|building| building.kind == BuildingKind::House)
             .count();
         let sample = if options.minimum_employment_percent.is_some() {
-            ctx.sample_perf(label, houses)
+            ctx.sample_perf_with_extra(label, houses, workload, false)
         } else {
             ctx.sample(label)
         };
@@ -133,7 +153,11 @@ fn setup_bakeries(ctx: &mut ScenarioCtx) -> Result<usize, String> {
     Ok(companies)
 }
 
-fn setup_employers(ctx: &mut ScenarioCtx, houses: usize, percent: usize) -> Result<usize, String> {
+pub(super) fn setup_employers(
+    ctx: &mut ScenarioCtx,
+    houses: usize,
+    percent: usize,
+) -> Result<usize, String> {
     const EMPLOYER: &str = "clothes-store";
     let proto = try_prototype(GoodsCompanyID::new(EMPLOYER))
         .filter(|proto| proto.n_workers > 0)
@@ -167,7 +191,7 @@ fn setup_employers(ctx: &mut ScenarioCtx, houses: usize, percent: usize) -> Resu
     Err(format!("built {companies} of {company_count} employers"))
 }
 
-fn setup_houses(ctx: &mut ScenarioCtx, house_count: usize) -> Result<(), String> {
+pub(super) fn setup_houses(ctx: &mut ScenarioCtx, house_count: usize) -> Result<(), String> {
     // A house costs $100. Cover the default run and the 10,000-house comparison.
     grant_money(ctx, Money::new_bucks(1_000_000));
     let houses = fill_houses(ctx, house_count);
