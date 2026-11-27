@@ -19,6 +19,7 @@ fn mark_legacy(snapshot: &mut SimulationDeser, schema: crate::SnapshotSchema, ve
     snapshot._header.version = version.to_owned();
     snapshot.res.remove("service_incidents");
     snapshot.res.remove("site_remnants");
+    snapshot.res.remove("fire_fleet");
     snapshot.res.insert(
         "prototype_registry".into(),
         Bincode::encode(&schema.registry().unwrap()).unwrap(),
