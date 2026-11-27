@@ -66,6 +66,31 @@ pub(crate) fn corridor_clear(map: &Map, site: Option<BuildingID>, corridor: OBB)
     })
 }
 
+pub(crate) fn check_truck_envelope(
+    map: &Map,
+    road: RoadID,
+    envelope: OBB,
+    work: &mut AccessBudget,
+) -> Result<(), AccessError> {
+    map.spatial_map()
+        .reserve_apron_query(envelope.bbox(), &mut work.0)
+        .map_err(|_| AccessError::WorkLimit)?;
+    if map
+        .spatial_map()
+        .query(
+            envelope,
+            ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
+        )
+        .any(|object| object != road.into())
+        || map
+            .authorize_land_effects(PreparedEffects::Footprint(&envelope.corners))
+            .is_err()
+    {
+        return Err(AccessError::NoTruckFit);
+    }
+    Ok(())
+}
+
 pub(crate) struct AccessBudget(pub(crate) usize);
 
 impl AccessBudget {
@@ -265,22 +290,7 @@ impl Frontage<'_> {
             2.0 * (transition + radius),
             drive_pos.xy().distance(pocket.xy()) + 2.0 * radius,
         );
-        map.spatial_map()
-            .reserve_apron_query(envelope.bbox(), &mut work.0)
-            .map_err(|_| AccessError::WorkLimit)?;
-        if map
-            .spatial_map()
-            .query(
-                envelope,
-                ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
-            )
-            .any(|object| object != self.road.into())
-            || map
-                .authorize_land_effects(PreparedEffects::Footprint(&envelope.corners))
-                .is_err()
-        {
-            return Err(AccessError::NoTruckFit);
-        }
+        check_truck_envelope(map, self.road, envelope, work)?;
         let environment = map.environment();
         let dry = |point: Vec3| {
             !environment.is_water(point.xy())

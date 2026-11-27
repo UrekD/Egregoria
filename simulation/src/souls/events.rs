@@ -182,6 +182,10 @@ impl Default for ServiceIncidents {
 }
 
 impl ServiceIncidents {
+    pub(crate) fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
     pub fn active(&self) -> impl Iterator<Item = &FireIncidentView> {
         self.active.values()
     }
@@ -272,7 +276,7 @@ pub(crate) fn elapsed_tick(sim: &Simulation) -> Tick {
 
 pub fn events_update(sim: &mut Simulation) {
     let tick = elapsed_tick(sim);
-    let mut losses = Vec::new();
+    let mut loss = None;
     {
         let mut incidents = sim.write::<ServiceIncidents>();
         if incidents.next_risk_minute > tick.0 / TICKS_PER_MINUTE
@@ -323,8 +327,10 @@ pub fn events_update(sim: &mut Simulation) {
             if incident.damage == LOSS_MINUTES as u8 {
                 incidents.active.remove(&id);
                 history.record(tick, id, FireEventKind::Collapsed);
-                losses.push(id);
-                continue;
+                // A site closure includes entity cleanup in the command drain.
+                // Leave the remaining due incidents scheduled for the next tick.
+                loss = Some(id);
+                break;
             }
             incident.position = building.obb.center().z(building.height);
             incident.intensity = (1 + incident.damage / 10).min(9)
@@ -355,7 +361,7 @@ pub fn events_update(sim: &mut Simulation) {
             history.record(tick, offer.site, FireEventKind::Ignited);
         }
     }
-    for id in losses {
+    if let Some(id) = loss {
         super::demolition::ruin_site(sim, id, super::demolition::SiteRemnantCause::Fire)
             .expect("an incident loss retains its occupied site");
     }

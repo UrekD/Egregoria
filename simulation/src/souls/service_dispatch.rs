@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::events::{elapsed_tick, fire_incident, ServiceIncidents};
 use super::service_access::{
-    check_apron, check_scene_apron, corridor_clear, current_anchor, is_fire_station, walking_corridor, AccessBudget, AccessError,
-    DirectedLaneAnchor, DriveSearch, FireApronPreview, APRON_WORK, MAX_FIRE_ROUTE,
+    check_apron, check_scene_apron, check_truck_envelope, corridor_clear, current_anchor,
+    is_fire_station, walking_corridor, AccessBudget, AccessError, DirectedLaneAnchor, DriveSearch,
+    FireApronPreview, APRON_WORK, MAX_FIRE_ROUTE,
 };
 use crate::map::{BuildingID, Map, RoadID, Traversable, TraverseKind};
 use crate::map_dynamic::{
@@ -25,6 +26,7 @@ const STATION_LIMIT: usize = 128;
 const DISPATCH_ROUTE_WORK: usize = 768;
 const RECOVERY_ROUTE_WORK: usize = 768;
 const CANDIDATE_ROUTE_WORK: usize = 192;
+const SWEEP_CHECKS_PER_TICK: usize = 4;
 const WATCHDOG: u64 = 15 * TICKS_PER_MINUTE;
 const HOLD_DEADLINE: u64 = 30 * TICKS_PER_MINUTE;
 const RETRY_TICKS: u64 = TICKS_PER_MINUTE;
@@ -161,16 +163,18 @@ impl SweepClaim {
     }
 
     fn blocks(&self, from: Vec3, to: Vec3, radius: f32) -> bool {
-        if !(self.bounds.expand(radius)).intersects(&Segment::new(from.xy(), to.xy())) {
+        let movement = Segment::new(from.xy(), to.xy());
+        if !self.bounds.expand(radius).intersects(&movement.bbox()) {
             return false;
         }
-        let movement = Segment::new(from.xy(), to.xy());
         let same_deck = |z: f32| (from.z - z).abs().min((to.z - z).abs()) <= SWEEP_DECK;
         let hits = |segment: Segment, clearance: f32| {
-            movement.distance(&segment) < clearance
-                && (segment.project(from.xy()).distance2(from.xy()) >= clearance * clearance
-                    || segment.project(to.xy()).distance2(to.xy())
-                        <= segment.project(from.xy()).distance2(from.xy()))
+            if movement.distance(&segment) >= clearance {
+                return false;
+            }
+            let start_distance = segment.project(from.xy()).distance2(from.xy());
+            start_distance >= clearance * clearance
+                || segment.project(to.xy()).distance2(to.xy()) <= start_distance
         };
         self.path.windows(2).any(|pair| {
             same_deck(pair[0].z) &&
@@ -404,6 +408,14 @@ impl FireFleet {
 
     pub(crate) fn deployed(&self, id: HumanID) -> bool {
         self.deployed.contains(&id)
+    }
+
+    pub(crate) fn has_deployed(&self) -> bool {
+        !self.deployed.is_empty()
+    }
+
+    pub(crate) fn has_outbound(&self) -> bool {
+        !self.outbound.is_empty()
     }
 
     pub(crate) fn owns_truck(&self, truck: VehicleID) -> bool {
@@ -718,15 +730,11 @@ pub(crate) fn commission(sim: &mut Simulation, site: BuildingID, apron: FireApro
 }
 
 pub(crate) fn clearance_blocked(sim: &Simulation, site: BuildingID) -> bool {
-    sim.resources
-        .read::<FireFleet>()
-        .stations
-        .iter()
-        .any(|(&station_site, station)| {
-            station.trip.as_ref().is_some_and(|trip| {
-                station_site == site || (trip.site == site && trip.scene_reserved)
-            })
-        })
+    let fleet = sim.read::<FireFleet>();
+    fleet.active_stations.iter().any(|station| {
+        fleet.stations.get(station).and_then(|station| station.trip.as_ref())
+            .is_some_and(|trip| *station == site || (trip.site == site && trip.scene_reserved))
+    })
 }
 
 pub(crate) fn release_station(sim: &mut Simulation, site: BuildingID) {
@@ -860,18 +868,27 @@ fn access_revision(map: &Map) -> (u64, u64) {
 }
 
 pub(crate) fn dispatch_fire(sim: &mut Simulation) {
-    if sim.resources.read::<FireFleet>().stations.is_empty() {
+    let (now, roster_due, has_alarms) = {
+        let fleet = sim.read::<FireFleet>();
+        if fleet.stations.is_empty() {
+            return;
+        }
+        let now = elapsed_tick(sim);
+        if now < fleet.dispatch_at {
+            return;
+        }
+        (now, fleet.roster_at <= now, !fleet.alarms.is_empty())
+    };
+    if roster_due {
+        update_rosters(sim, now);
+    }
+    let incidents = sim.read::<ServiceIncidents>();
+    if !has_alarms && !incidents.has_active() {
+        sim.write::<FireFleet>().dispatch_at = Tick(now.0 + 10);
         return;
     }
-    let now = elapsed_tick(sim);
-    let now_due = sim.resources.read::<FireFleet>().dispatch_at <= now;
-    if !now_due {
-        return;
-    }
-    update_rosters(sim, now);
     let revision = access_revision(&sim.map());
     let next = {
-        let incidents = sim.resources.read::<ServiceIncidents>();
         let mut fleet = sim.resources.write::<FireFleet>();
         fleet.sync_routes(revision);
         fleet.alarms.retain(|&(_, site, id), _| {
@@ -905,6 +922,7 @@ pub(crate) fn dispatch_fire(sim: &mut Simulation) {
         };
         next
     };
+    drop(incidents);
     let Some(key @ (_, site, incident)) = next else {
         return;
     };
@@ -986,6 +1004,7 @@ fn prepare_trip(sim: &Simulation, key: AlarmKey) -> Result<Assignment, FireRespo
         AccessError::MissingFrontage,
     ))?;
     let pending = sim.write::<FireFleet>().routes.dispatch.remove(&key);
+    let resumed = pending.is_some();
     let mut search = match pending {
         Some(search) => search,
         None => {
@@ -1040,9 +1059,13 @@ fn prepare_trip(sim: &Simulation, key: AlarmKey) -> Result<Assignment, FireRespo
     let crew = dispatch_crew(sim, &fleet, id, station)?;
     let corridor = walking_corridor(search.scene.bay, search.scene.pocket, search.scene.door);
     // Buildings and competing aprons can appear while the route search yields.
-    let mut geometry_work = APRON_WORK;
+    let mut geometry_work = AccessBudget(APRON_WORK);
+    if resumed {
+        check_truck_envelope(&map, search.scene.road, search.scene.envelope, &mut geometry_work)
+            .map_err(FireResponseBlocker::SceneAccess)?;
+    }
     map.spatial_map()
-        .reserve_apron_query(corridor.bbox(), &mut geometry_work)
+        .reserve_apron_query(corridor.bbox(), &mut geometry_work.0)
         .map_err(|_| FireResponseBlocker::SceneAccess(AccessError::WorkLimit))?;
     if !corridor_clear(&map, Some(site), corridor) {
         return Err(FireResponseBlocker::SceneAccess(AccessError::MissingSidewalk));
@@ -1225,10 +1248,12 @@ fn claim_sweep(
     pocket: Option<Vec3>,
     trip: &mut Trip,
     now: Tick,
+    checks_left: &mut usize,
 ) -> bool {
-    if now < trip.retry_at {
+    if now < trip.retry_at || *checks_left == 0 {
         return false;
     }
+    *checks_left -= 1;
     let claim = SweepClaim::new(path, pocket);
     if sweep_clear(sim, truck, &claim, trip.crew) {
         sim.write::<FireFleet>().sweeps.insert(truck, claim);
@@ -1310,16 +1335,17 @@ pub(crate) fn advance_fire_trips(sim: &mut Simulation) {
     };
     let offset = (now.0 % stations.len() as u64) as usize;
     stations.rotate_left(offset);
-    let mut work = AccessBudget(RECOVERY_ROUTE_WORK);
+    let mut recovery_work = RECOVERY_ROUTE_WORK;
+    let mut sweep_checks = SWEEP_CHECKS_PER_TICK;
     for site in stations {
         let mut station = sim.write::<FireFleet>().stations.remove(&site).expect("active station");
         let mut trip = station.trip.take().expect("active response");
         let mut recovery = recoveries.remove(&station.truck);
-        let allowance = work.0.min(CANDIDATE_ROUTE_WORK);
-        let mut slice = AccessBudget(allowance);
+        let allowance = recovery_work.min(CANDIDATE_ROUTE_WORK);
+        let mut work = TripWork { route: AccessBudget(allowance), sweep_checks: &mut sweep_checks };
         let finished = step_trip(sim, site, station.truck, &station.apron, &mut trip, now,
-            &mut recovery, &mut slice);
-        work.0 -= allowance - slice.0;
+            &mut recovery, &mut work);
+        recovery_work -= allowance - work.route.0;
         if !finished {
             if let Some(recovery) = recovery {
                 recoveries.insert(station.truck, recovery);
@@ -1368,6 +1394,11 @@ pub(crate) fn advance_fire_trips(sim: &mut Simulation) {
     sim.write::<FireFleet>().routes.recoveries = recoveries;
 }
 
+struct TripWork<'a> {
+    route: AccessBudget,
+    sweep_checks: &'a mut usize,
+}
+
 fn step_trip(
     sim: &mut Simulation,
     station: BuildingID,
@@ -1376,7 +1407,7 @@ fn step_trip(
     trip: &mut Trip,
     now: Tick,
     recovery: &mut Option<DriveSearch>,
-    work: &mut AccessBudget,
+    work: &mut TripWork<'_>,
 ) -> bool {
     use ServiceTripPhase::*;
 
@@ -1440,7 +1471,7 @@ fn step_trip(
                 .all(|(seat, id)| id.is_some_and(|id| at(sim, id, pocket(apron, seat))))
             {
                 // Leave the current crew on the pocket until a swept merge is clear.
-                if !claim_sweep(sim, truck, apron.departure_sweep, None, trip, now) {
+                if !claim_sweep(sim, truck, apron.departure_sweep, None, trip, now, work.sweep_checks) {
                     return false;
                 }
                 for id in crew.into_iter().flatten() {
@@ -1469,7 +1500,7 @@ fn step_trip(
                 trip.inbound = None;
                 release_scene(sim, trip);
             }
-            if route_from(sim, truck, trip, from, to, outbound, now, recovery, work) {
+            if route_from(sim, truck, trip, from, to, outbound, now, recovery, &mut work.route) {
                 sim.write::<FireFleet>().sweeps.remove(&truck);
                 if !outbound {
                     release_scene(sim, trip);
@@ -1518,7 +1549,7 @@ fn step_trip(
                 if let Some(from) = current {
                     trip.outbound = None;
                     trip.inbound = None;
-                    if route_from(sim, truck, trip, from, to, outbound, now, recovery, work) {
+                    if route_from(sim, truck, trip, from, to, outbound, now, recovery, &mut work.route) {
                         if !outbound {
                             release_scene(sim, trip);
                             transition(trip, now, Returning);
@@ -1539,7 +1570,7 @@ fn step_trip(
                 && vehicle.trans.pos.is_close(target.arrival_sweep[0], 0.35)
             {
                 let sweep = target.arrival_sweep;
-                if !claim_sweep(sim, truck, sweep, Some(target.pocket), trip, now) {
+                if !claim_sweep(sim, truck, sweep, Some(target.pocket), trip, now, work.sweep_checks) {
                     return false;
                 }
                 sim.resources.write::<FireFleet>().outbound.remove(&truck);
@@ -1605,7 +1636,7 @@ fn step_trip(
                 .all(|(seat, id)| id.is_none_or(|id| at(sim, id, pocket(&trip.scene, seat))))
             {
                 let sweep = trip.scene.departure_sweep;
-                if !claim_sweep(sim, truck, sweep, None, trip, now) {
+                if !claim_sweep(sim, truck, sweep, None, trip, now, work.sweep_checks) {
                     return false;
                 }
                 for id in crew.into_iter().flatten() {
@@ -1926,4 +1957,96 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
     map.service_frontages = frontages;
     map.active_service_frontages = active_frontages;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::p9_fire::{fire_station_on_parking_loop, staffed_fire_at_alarm};
+    use crate::transportation::junction_admission::EntryOwner;
+    use crate::transportation::road::{vehicle_decision_system, vehicle_state_update_system};
+    use geom::{vec2, vec3, Vec2, OBB};
+    use prototypes::{BuildingGen, DELTA};
+
+    #[test]
+    fn p9_round2_stock_parking_yields_to_an_active_sweep() {
+        use crate::transportation::{spawn_driving_vehicle, VehicleState, TIME_TO_PARK};
+
+        let (mut test, station) = fire_station_on_parking_loop();
+        let owner = service_station(&test.g, station).unwrap().truck;
+        let (spot, destination) = {
+            let map = test.g.map();
+            let spot = test.g.write::<ParkingManagement>()
+                .reserve_near(vec3(270.0, 104.0, 0.0), &map)
+                .unwrap();
+            let destination = spot.get(&map.parking).unwrap().trans;
+            (spot, destination)
+        };
+        let start = destination.pos - 18.0 * destination.dir;
+        let car = spawn_driving_vehicle(&mut test.g, VehicleKind::Car,
+            Transform::new_dir(start, destination.dir)).unwrap();
+        test.g.world.vehicles[car].begin_parking(destination, spot);
+        let crossing = start + (SWEEP_RADIUS + VehicleKind::Car.width() * 0.5 + 0.01) * destination.dir;
+        let perpendicular = destination.dir.xy().perpendicular().z0();
+        let path = std::array::from_fn(|i| crossing + (i as f32 - 8.0) * perpendicular);
+        let mut fleet = test.g.write::<FireFleet>();
+        fleet.sweeps.insert(owner, SweepClaim::new(path, None));
+        let VehicleState::RoadToPark(spline, _, _) = test.g.get(car).unwrap().vehicle.state else {
+            unreachable!();
+        };
+        let next_progress = DELTA / TIME_TO_PARK;
+        let radius = VehicleKind::Car.width() * 0.5;
+        assert!(fleet.sweep_allows(EntryOwner::Vehicle(car), start, start, radius));
+        assert!(!fleet.sweep_allows(EntryOwner::Vehicle(car), start, spline.get(next_progress), radius));
+        drop(fleet);
+
+        let (world, resources) = test.g.world_res();
+        vehicle_state_update_system(world, resources);
+        assert!(matches!(world.vehicles[car].vehicle.state, VehicleState::RoadToPark(_, 0.0, _)));
+
+        // A claim can also begin after the vehicle has advanced the spline clock.
+        let VehicleState::RoadToPark(_, progress, _) = &mut world.vehicles[car].vehicle.state else {
+            unreachable!();
+        };
+        *progress = next_progress;
+        vehicle_decision_system(world, resources);
+        assert_eq!(world.vehicles[car].trans.pos, start);
+        resources.write::<FireFleet>().sweeps.remove(&owner);
+        vehicle_decision_system(world, resources);
+        assert_eq!(world.vehicles[car].trans.pos, spline.get(next_progress));
+    }
+
+    #[test]
+    fn p9_round2_dispatch_rechecks_the_truck_envelope_after_yielding() {
+        let (mut test, station, target, _) = staffed_fire_at_alarm();
+        crate::souls::events::events_update(&mut test.g);
+        let incident = fire_incident(&test.g, target).unwrap();
+        let key = (incident.alarm_tick, target, incident.id);
+        let now = elapsed_tick(&test.g);
+        update_rosters(&mut test.g, now);
+        let map = test.g.map();
+        let revision = access_revision(&map);
+        let target = map.get(target).unwrap();
+        let scene = check_scene_apron(&test.g, target.connected_road, target.door_pos,
+            &mut AccessBudget(APRON_WORK)).unwrap();
+        let corridor = walking_corridor(scene.bay, scene.pocket, scene.door);
+        let footprint = OBB::new(scene.pocket.xy() + 18.0 * scene.bay.dir.xy(), Vec2::X, 2.0, 2.0);
+        assert!(scene.envelope.intersects(&footprint));
+        assert!(!corridor.intersects(&footprint));
+        let mut search = DispatchSearch { scene, stations: vec![station], best: None, search: None, outgoing: None };
+        let mut fleet = test.g.write::<FireFleet>();
+        fleet.sync_routes(revision);
+        assert_eq!(search.advance(&test.g, &map, &fleet, &mut AccessBudget(1)), Err(AccessError::WorkLimit));
+        fleet.routes.dispatch.insert(key, search);
+        drop(fleet);
+        drop(map);
+
+        test.g.map_mut().build_special_building(&footprint, crate::map::BuildingKind::House,
+            BuildingGen::NoWalkway { door_pos: vec2(0.0, 0.0) }, None, None).unwrap();
+        assert_eq!(access_revision(&test.g.map()), revision);
+        dispatch_fire(&mut test.g);
+        assert_eq!(service_station(&test.g, station).unwrap().phase, None);
+        assert_eq!(fire_response_blocker(&test.g, key.1),
+            Some(FireResponseBlocker::SceneAccess(AccessError::NoTruckFit)));
+    }
 }

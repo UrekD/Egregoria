@@ -581,7 +581,15 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
                 .edit(human_id, |human| clear_human(human_id, human));
         }
     } else {
-        world.humans.edit_each(clear_human);
+        world.humans.edit_each_split(|human_id, human| {
+            if human.location == Location::Vehicle(id)
+                || driver_truck(human) == Some(id)
+                || human.router.references_vehicle(id)
+                || human.decision.kind.references_vehicle(id)
+            {
+                clear_human(human_id, human);
+            }
+        });
     }
 
     let clear_company = |company: &mut CompanyEnt| {
@@ -835,9 +843,11 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
             world.edit_human(buyer, &mut remove_human_trades);
         }
     } else {
-        world
-            .humans
-            .edit_each(|_, human| remove_human_trades(human));
+        world.humans.edit_each_split(|_, human| {
+            if human.bought.0.values().flatten().any(|trade| trade.involves(soul)) {
+                remove_human_trades(human);
+            }
+        });
     }
     if !company_departure {
         for company in world.companies.values_mut() {
@@ -936,18 +946,30 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
     let fleet = resources.read::<super::service_dispatch::FireFleet>();
     let mut returning_trucks = BTreeSet::new();
     let mut idle_drivers = BTreeSet::new();
-    world.humans.edit_each(|human_id, human| {
+    let includes = |id| buildings.contains_key(&id);
+    world.humans.edit_each_split(|human_id, human| {
         let door = match human.location {
             Location::Building(id) => buildings.get(&id).copied().flatten(),
             _ => None,
         };
-        human.food.forget_if(|id| buildings.contains_key(&id));
-
         let seller_removed = human
             .household
             .reservation
             .as_ref()
-            .is_some_and(|basket| buildings.contains_key(&basket.building));
+            .is_some_and(|basket| includes(basket.building));
+        let work_affected = human.work.as_ref().is_some_and(|work| {
+            includes(work.workplace)
+                || matches!(&work.kind, WorkKind::Driver { deliver_order: Some(site), .. } if includes(*site))
+        });
+        let route_affected = human.router.references_any_building(includes)
+            || human.decision.kind.references_any_building(includes);
+        let food_affected = human.food.references_store(includes);
+        if door.is_none() && !seller_removed && !work_affected && !route_affected && !food_affected {
+            return;
+        }
+        if food_affected {
+            human.food.forget_if(includes);
+        }
         if seller_removed {
             human
                 .household
@@ -988,10 +1010,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
         if let Some(door) = door {
             move_outside(human, door, resources);
         }
-        let includes = |id| buildings.contains_key(&id);
-        cancel = cancel
-            || human.router.references_any_building(includes)
-            || human.decision.kind.references_any_building(includes);
+        cancel |= route_affected;
         if cancel && !fleet.deployed(human_id) {
             if let Location::Vehicle(vehicle) = human.location {
                 if let Some(body) = world.vehicles.get_mut(vehicle) {

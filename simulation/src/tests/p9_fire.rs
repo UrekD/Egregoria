@@ -136,6 +136,31 @@ fn p9_checks_truck_apron_on_a_stock_parking_road() {
 }
 
 #[test]
+fn p9_round2_simultaneous_fire_losses_are_spread_across_ticks_and_reload() {
+    use crate::souls::events::{events_update, offer_fixture_fire};
+    use crate::utils::scheduler::drain_commands;
+
+    let (mut test, _) = fire_station_on_parking_loop();
+    let sites = [100.0, 135.0, 170.0].map(|x| test.build_house_near(vec2(x, 435.0)));
+    for site in sites {
+        assert!(offer_fixture_fire(&test.g, site));
+    }
+    events_update(&mut test.g);
+    test.g.write::<prototypes::GameTime>().tick.0 += 85 * TICKS_PER_MINUTE;
+    for count in 1..=sites.len() {
+        events_update(&mut test.g);
+        drain_commands(&mut test.g);
+        assert_eq!(
+            sites.iter().filter(|&&site| test.g.map().is_ruined(site)).count(),
+            count
+        );
+        assert_eq!(test.g.read::<ServiceIncidents>().active().count(), sites.len() - count);
+        test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        test.g.write::<prototypes::GameTime>().tick.0 += 1;
+    }
+}
+
+#[test]
 fn p9_placement_commissions_a_physical_stock_truck() {
     let (test, site) = fire_station_on_parking_loop();
     let apron = crate::souls::service_access::preview_fire_apron(&test.g, site).unwrap();
@@ -151,7 +176,7 @@ fn p9_placement_commissions_a_physical_stock_truck() {
     );
 }
 
-fn fire_station_on_parking_loop() -> (TestCtx, crate::map::BuildingID) {
+pub(crate) fn fire_station_on_parking_loop() -> (TestCtx, crate::map::BuildingID) {
     use crate::map::{BuildingKind, LaneKind};
     use crate::souls::service_access::preview_fire_apron;
     use geom::{vec3, Vec2, OBB};
@@ -215,14 +240,11 @@ fn fire_station_on_parking_loop() -> (TestCtx, crate::map::BuildingID) {
     (test, site)
 }
 
-fn staffed_fire_at_boarding() -> (TestCtx, crate::map::BuildingID, crate::map::BuildingID, Vec<crate::HumanID>) {
+pub(crate) fn staffed_fire_at_alarm() -> (TestCtx, crate::map::BuildingID, crate::map::BuildingID, Vec<crate::HumanID>) {
     use crate::souls::desire::{Work, WorkKind};
     use crate::souls::events::offer_fixture_fire;
     use crate::souls::goods_company::company_soul;
     use crate::souls::human::spawn_human;
-    use crate::souls::service_dispatch::{
-        service_station, ServiceTripPhase,
-    };
     use crate::transportation::Location;
     use crate::{BuildingKind, SoulID};
     use geom::{Vec2, OBB};
@@ -294,6 +316,13 @@ fn staffed_fire_at_boarding() -> (TestCtx, crate::map::BuildingID, crate::map::B
             prototypes::GameTime::new(Tick(16 * prototypes::TICKS_PER_HOUR + 1)),
         )]);
     assert!(offer_fixture_fire(&test.g, target));
+    (test, station, target, crew)
+}
+
+fn staffed_fire_at_boarding() -> (TestCtx, crate::map::BuildingID, crate::map::BuildingID, Vec<crate::HumanID>) {
+    use crate::souls::service_dispatch::{service_station, ServiceTripPhase};
+
+    let (mut test, station, target, crew) = staffed_fire_at_alarm();
     test.tick_fast();
     let phase = service_station(&test.g, station).unwrap().phase;
     assert_eq!(

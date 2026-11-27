@@ -1193,6 +1193,10 @@ impl Router {
             })
     }
 
+    pub(crate) fn references_vehicle(&self, id: VehicleID) -> bool {
+        self.personal_car == Some(id) || self.vehicle == Some(id) || self.plans_with(id)
+    }
+
     pub(crate) fn forget_vehicle(&mut self, id: VehicleID) -> bool {
         if self.personal_car == Some(id) {
             self.personal_car = None;

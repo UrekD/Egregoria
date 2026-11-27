@@ -767,7 +767,8 @@ impl Itinerary {
             route,
             on_road_entry,
             None,
-            |_, _, _| true,
+            false,
+            None::<fn(Option<&Traversable>, Vec3, Vec3) -> bool>,
         )
     }
 
@@ -780,11 +781,20 @@ impl Itinerary {
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
         mut admission: Option<&mut MovementAdmission<'_>>,
-        mut move_on: impl FnMut(Option<Traversable>, Vec3, Vec3) -> bool,
+        guard_local: bool,
+        mut move_on: Option<impl FnMut(Option<&Traversable>, Vec3, Vec3) -> bool>,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
-            return self.advance_egress(map, position, dist_to_move, |from, to| move_on(None, from, to));
+            return self.advance_egress(map, position, dist_to_move, |from, to| {
+                !guard_local || move_on.as_mut().is_none_or(|guard| guard(None, from, to))
+            });
         }
+        let mut segment_clear = |it: &Self, from, to| {
+            move_on.as_mut().is_none_or(|guard| {
+                let traversal = it.get_travers();
+                (!guard_local && traversal.is_none()) || guard(traversal, from, to)
+            })
+        };
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
             && !self.reversed_local_path.is_empty()
@@ -822,8 +832,7 @@ impl Itinerary {
                                 } else {
                                     position
                                 };
-                                if !move_on(self.get_travers().copied(), position, next)
-                                {
+                                if !segment_clear(self, position, next) {
                                     return position;
                                 }
                                 self.observe_road_entry(position, next, map, &mut on_road_entry);
@@ -841,8 +850,7 @@ impl Itinerary {
             }
             // Coincident waypoints still advance after a tolerance snap.
             if dist <= (dist_to_move + snap).max(0.0) {
-                if !move_on(self.get_travers().copied(), position, p)
-                {
+                if !segment_clear(self, position, p) {
                     return position;
                 }
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
@@ -879,8 +887,7 @@ impl Itinerary {
             }
 
             let next = position + (p - position).normalize_to(dist_to_move.max(0.0));
-            if !move_on(self.get_travers().copied(), position, next)
-            {
+            if !segment_clear(self, position, next) {
                 return position;
             }
             self.observe_road_entry(position, next, map, &mut on_road_entry);
@@ -1538,12 +1545,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let mut junction_frame = if map.has_junction_controller() {
         let mut grid = resources.write::<TransportGrid>();
         grid.refresh_admission_colliders(world);
-        let preference = resources
-            .read::<crate::souls::events::FireScenarioRules>()
-            .emergency_junction_preference;
-        let incidents = resources.read::<crate::souls::events::ServiceIncidents>();
+        let incidents = (fleet.has_outbound()
+            && resources.read::<crate::souls::events::FireScenarioRules>().emergency_junction_preference)
+            .then(|| resources.read::<crate::souls::events::ServiceIncidents>());
         JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick, &|truck| {
-            preference && fleet.is_live_outbound(world, &incidents, truck)
+            incidents.as_ref().is_some_and(|incidents| fleet.is_live_outbound(world, incidents, truck))
         })
     } else {
         junction_state.clear();
@@ -1595,6 +1601,25 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
             discharged: None,
         });
+        let sweep_owner = if sweeps { user } else { None };
+        let move_on = (sweep_owner.is_some() || truck.is_some()).then_some(
+            |traversal: Option<&Traversable>, from, to| {
+                if let Some(user) = sweep_owner {
+                    let start = timing.then(std::time::Instant::now);
+                    let clear = fleet.sweep_allows(user.owner, from, to, user.half_extent);
+                    if let Some(start) = start {
+                        sweep_elapsed += start.elapsed();
+                    }
+                    if !clear {
+                        return false;
+                    }
+                }
+                if let (Some(truck), Some(traversal)) = (truck, traversal) {
+                    freight.observe_truck_motion(truck, traversal.kind, from, to);
+                }
+                true
+            },
+        );
         *pos = it.update_guarded(
             *pos,
             speed * DELTA,
@@ -1608,24 +1633,8 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             },
             record,
             admission.as_mut(),
-            |traversal, from, to| {
-                if sweeps {
-                    if let Some(user) = user {
-                        let start = timing.then(std::time::Instant::now);
-                        let clear = fleet.sweep_allows(user.owner, from, to, user.half_extent);
-                        if let Some(start) = start {
-                            sweep_elapsed += start.elapsed();
-                        }
-                        if !clear {
-                            return false;
-                        }
-                    }
-                }
-                if let (Some(truck), Some(traversal)) = (truck, traversal) {
-                    freight.observe_truck_motion(truck, traversal.kind, from, to);
-                }
-                true
-            },
+            sweep_owner.is_some(),
+            move_on,
         );
         admission.map_or((None, None, None), |guard| {
             let observed_hold = match guard.user.owner {
@@ -1765,8 +1774,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 |_, _, _| None,
                 None::<fn(RoadID, PathKind)>,
                 None,
-                |traversal, from, to| {
-                    let Some(traversal) = traversal else { return true; };
+                false,
+                Some(|traversal: Option<&Traversable>, from, to| {
+                    let traversal = *traversal.expect("train movement guard requires a traversal");
                     let Some(track) = traversal.raw_points(map) else {
                         return false;
                     };
@@ -1794,7 +1804,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                         freight.observe_motion(id, traversal.kind, from, to, tick);
                     }
                     true
-                },
+                }),
             );
         }
         if let Some(index) = &mut observed {
