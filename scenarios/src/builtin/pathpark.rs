@@ -346,6 +346,10 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     if ctx.sim.world().humans.len() != POPULATION {
         return Err("mixed-supply opening did not commission 10,000 residents".into());
     }
+    println!(
+        "PathPark scale opening: {POPULATION} residents, {} tagged drivers in {DISTRICTS} districts",
+        offers.len()
+    );
     let garages: Vec<_> = districts
         .iter()
         .flat_map(|sites| [sites[4], sites[5]])
@@ -372,9 +376,11 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     if holds < 2 {
         return Err("mixed-supply save cut did not contain simultaneous garage holds".into());
     }
+    let mut extra = workload.finish(&ctx.sim);
     let mut resumed = ScenarioCtx::from_sim(ctx.round_tripped()?);
     freeze_scale_drivers(&mut resumed, &offers);
     resumed.run_ticks(128);
+    let mut workload = crate::runner::ParkingWorkload::new(&ctx.sim);
     advance(ctx, 128, &mut workload);
     if ctx.sim.hashes() != resumed.sim.hashes() {
         return Err("mixed-supply resumed parking holds diverged".into());
@@ -405,7 +411,9 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             _ => {}
         }
     }
-    let mut extra = workload.finish(&ctx.sim);
+    for (key, value) in workload.finish(&ctx.sim) {
+        *extra.entry(key).or_default() += value;
+    }
     extra.extend(BTreeMap::from([
         ("tagged_offers".to_owned(), offers.len() as f64),
         ("tagged_garage_arrivals".to_owned(), f64::from(garage)),
