@@ -736,7 +736,7 @@ impl BuildingParking {
         }
         let mut garages: Vec<_> = map
             .spatial_map()
-            .query_around(destination.xy(), 100.0, ProjectFilter::BUILDING)
+            .query_around(destination.xy(), 400.0, ProjectFilter::BUILDING)
             .filter_map(|object| {
                 let crate::map::ProjectKind::Building(id) = object else {
                     return None;
@@ -744,8 +744,11 @@ impl BuildingParking {
                 if !self.public_garages.contains(&id) {
                     return None;
                 }
-                let distance = self.sites[&id].layout.door.distance2(destination);
-                (distance <= 100.0_f32.powi(2))
+                let site = &self.sites[&id];
+                site.free_slot()?;
+                let door = site.layout.door;
+                let distance = door.distance2(destination);
+                (distance <= 400.0_f32.powi(2) && (door.z - destination.z).abs() < 4.0)
                     .then_some((ordered_float::OrderedFloat(distance), id))
             })
             .collect();

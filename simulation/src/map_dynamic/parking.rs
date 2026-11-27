@@ -119,7 +119,7 @@ impl ParkingManagement {
                 let Some(spots) = map.parking.closest_spots(lane, near) else {
                     continue;
                 };
-                for spot in spots.take(8).filter(|&spot| self.is_spot_free(spot)) {
+                for spot in spots.take(64).filter(|&spot| self.is_spot_free(spot)).take(8) {
                     let point = map.parking.get(spot).unwrap().trans.pos;
                     let distance = point.distance2(near);
                     if distance <= radius.powi(2) && (point.z - near.z).abs() < 4.0 {

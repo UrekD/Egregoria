@@ -331,7 +331,9 @@ fn pathpark_property_departure_uses_shared_garage_when_curbs_are_full() {
 #[test]
 fn pathpark_oversized_garage_batch_has_no_side_effects() {
     use crate::map::building_parking::GarageKind;
-    use crate::world_command::{CommandOutcomes, WorldCommand, MAX_TILED_COMMANDS};
+    use crate::world_command::{
+        CommandOutcomes, PrepareBudget, Rejection, WorldCommand, MAX_TILED_COMMANDS,
+    };
 
     let (mut ctx, _, _, _, garage) = property_trip();
     let mut entrance = ctx.g.building_parking(garage).unwrap().entrance;
@@ -346,6 +348,10 @@ fn pathpark_oversized_garage_batch_has_no_side_effects() {
         entrance,
     };
     assert!(command.validate_and_price(&ctx.g).is_ok());
+    assert!(matches!(
+        command.prepare_single(&ctx.g, &mut PrepareBudget::for_preview(1)),
+        Err(Rejection::WaterWorkLimit)
+    ));
     ctx.g
         .apply_commands(std::iter::repeat_n(&command, MAX_TILED_COMMANDS + 1));
     assert!(ctx.g.read::<CommandOutcomes>().accepted.is_empty());

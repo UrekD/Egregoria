@@ -189,6 +189,18 @@ fn parking_eligible(
             && basket.is_some_and(|seller| infos.building_owned_by(seller) == Some(site)))
 }
 
+fn active_parking_basket(
+    household: &HouseholdStock,
+    driver: HumanID,
+    resources: &Resources,
+) -> Option<SoulID> {
+    household
+        .reservation
+        .as_ref()
+        .filter(|offer| offer.shopper == driver && offer.expires > elapsed_ticks(resources).0)
+        .map(|offer| offer.seller)
+}
+
 fn routing_changed(
     world: &mut World,
     resources: &mut Resources,
@@ -362,7 +374,7 @@ fn routing_changed(
                         router.target_dest,
                         router.trip_purpose,
                         h.work.as_ref().map(|work| work.workplace),
-                        h.household.basket_seller(),
+                        active_parking_basket(&h.household, id, resources),
                     )
                 });
                 router.property_steps(
@@ -627,7 +639,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                             h.router.target_dest,
                             h.router.trip_purpose,
                             h.work.as_ref().map(|work| work.workplace),
-                            h.household.basket_seller(),
+                            active_parking_basket(&h.household, body, resources),
                         )
                     {
                         properties.release_arrival(car);
