@@ -51,13 +51,13 @@ def score(artifacts, fixture, run, build, pinned, cpu):
     identity = json.loads(stem.with_suffix(".workload.json").read_text())
     if (identity["fixture"], identity["run"], identity["build"]) != (fixture, run, build):
         raise ValueError(f"{stem} has the wrong run identity")
-    if (identity["workers"], identity["cpu"]) != (1, cpu):
+    if (count(identity["workers"], "workers"), count(identity["cpu"], "cpu")) != (1, cpu):
         raise ValueError(f"{stem} must use the pinned CPU and one simulation worker")
     inputs = pinned["inputs"][build]
     keys = ["runner_sha256", "assets_sha256", "prototypes_sha256"]
     if fixture == "lesce_osm":
         keys.extend(("slot_sha256", "sidecar_sha256"))
-        if identity["slot_revision"] != inputs["slot_revision"]:
+        if count(identity["slot_revision"], "slot_revision") != count(inputs["slot_revision"], "slot_revision"):
             raise ValueError(f"{stem} has the wrong slot revision")
     for key in keys:
         if identity[key] != digest(inputs[key], key):
@@ -126,6 +126,9 @@ def compare(manifest, artifacts):
     failed = []
     for fixture in FIXTURES:
         ceilings = manifest["fixtures"][fixture]
+        inputs = ceilings["inputs"]
+        if inputs["parent"]["assets_sha256"] != inputs["candidate"]["assets_sha256"]:
+            raise ValueError(f"{fixture} inputs do not pin a shared assets tree")
         tail_limit = positive(ceilings["p99_ms_per_tick"], fixture)
         rss_limit = positive(ceilings["rss_kib"], fixture)
         parent = []
