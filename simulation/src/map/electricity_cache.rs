@@ -302,18 +302,29 @@ impl ElectricityCache {
                 let Some(r) = b.connected_road else {
                     return Left(Left(std::iter::empty()));
                 };
-                Left(Right(Some(NetworkObjectID::Road(r)).into_iter()))
+                Left(Right(
+                    roads
+                        .get(r)
+                        .filter(|road| !road.is_walking_path())
+                        .map(|_| NetworkObjectID::Road(r))
+                        .into_iter(),
+                ))
             }
             NetworkObjectID::Intersection(i) => {
                 let Some(i) = intersections.get(i) else {
                     return Left(Left(std::iter::empty()));
                 };
-                Right(Left(i.roads.iter().map(|v| NetworkObjectID::Road(*v))))
+                Right(Left(i.roads.iter().filter_map(|&id| {
+                    (!roads.get(id)?.is_walking_path()).then_some(NetworkObjectID::Road(id))
+                })))
             }
             NetworkObjectID::Road(r) => {
                 let Some(r) = roads.get(r) else {
                     return Left(Left(std::iter::empty()));
                 };
+                if r.is_walking_path() {
+                    return Left(Left(std::iter::empty()));
+                }
                 Right(Right(common::iter::chain((
                     Some(NetworkObjectID::Intersection(r.src)).into_iter(),
                     Some(NetworkObjectID::Intersection(r.dst)).into_iter(),

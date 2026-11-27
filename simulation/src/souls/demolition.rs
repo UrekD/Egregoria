@@ -168,6 +168,9 @@ fn quote(
     site: BuildingID,
 ) -> Result<DemolitionPreview, DemolitionError> {
     let building = map.get(site).ok_or(Rejection::MissingReference)?;
+    if matches!(building.kind, BuildingKind::ParkingGarage(_) | BuildingKind::ParkingLot { .. }) {
+        return Err(Rejection::InvalidBuilding);
+    }
     let remnant = remnants.sites.get(&site);
     let cause = remnant.map(|remnant| remnant.cause);
     let original_kind = remnant.map_or(building.kind, |remnant| remnant.original_kind);
@@ -280,6 +283,9 @@ pub(crate) fn prepare_demolition(
     submitted: DemolitionQuote,
     work: &mut usize,
 ) -> Result<Money, DemolitionError> {
+    if sim.read::<crate::transportation::DrivewayTraffic>().properties.busy(site) {
+        return Err(Rejection::BusyConflict);
+    }
     if !valid_terms(submitted) {
         return Err(Rejection::StaleDemolitionQuote);
     }

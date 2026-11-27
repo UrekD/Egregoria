@@ -339,6 +339,9 @@ impl VehiclePicker {
     ) -> Option<(VehicleHit, f32)> {
         let (entity, depth) = match part {
             AnyEntity::VehicleID(id) => {
+                if sim.car_stored_inside_garage(id) {
+                    return None;
+                }
                 let vehicle = sim.get(id)?;
                 let bounds = self.road_bounds(vehicle.vehicle.kind);
                 (part, instance_depth(ray, vehicle.trans, bounds)?)

@@ -907,7 +907,8 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
 
     let key = id.data().as_ffi();
     if common::rand::randu(key as u32 ^ (key >> 32) as u32) < 0.7 {
-        let car = spawn_parked_vehicle(sim, VehicleKind::Car, housepos);
+        let car = crate::map::building_parking::spawn_at_home(sim, house, id)
+            .or_else(|| spawn_parked_vehicle(sim, VehicleKind::Car, housepos));
         sim.world
             .edit_human(id, |human| human.router = Router::new(car));
     }

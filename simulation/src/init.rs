@@ -325,6 +325,8 @@ fn register_systems_and_resources() {
     register_resource_default::<Map, Bincode>("map");
     register_junction_policies();
     register_junction_admission();
+    register_driveway_traffic();
+    register_property_parking();
     register_lane_scoring();
     register_land_ownership();
     register_pending_construction_cuts();
@@ -459,6 +461,69 @@ fn register_junction_admission() {
             }),
             load: Box::new(|sim, data| {
                 sim.insert(Bincode::decode::<JunctionAdmission>(data)?);
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_property_parking() {
+    use crate::transportation::DrivewayTraffic;
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "surface_lots",
+            optional: true,
+            save: Box::new(|sim, output| Bincode::encode_writer(&sim.map().surface_lots, output)),
+            load: Box::new(|sim, data| {
+                let frontage = Bincode::decode(data)?;
+                sim.map_mut().load_surface_lots(frontage)
+            }),
+        });
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "property_parking",
+            optional: true,
+            save: Box::new(|sim, output| sim.read::<DrivewayTraffic>().properties.save(output)),
+            load: Box::new(|sim, data| {
+                sim.write::<DrivewayTraffic>().properties =
+                    crate::map::building_parking::BuildingParking::load(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_driveway_traffic() {
+    use crate::transportation::DrivewayTraffic;
+
+    register_resource_noserialize::<DrivewayTraffic>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "driveway_traffic",
+            optional: true, // Required by the PathPark snapshot schema in SimulationDeser.
+            save: Box::new(|sim, output| {
+                let traffic = sim.read::<DrivewayTraffic>();
+                let revision = (!traffic.proof_is_empty() || traffic.properties.has_searches())
+                    .then(|| sim.map().directed_route_revision());
+                traffic.save(revision, output)
+            }),
+            load: Box::new(|sim, data| {
+                let (traffic, revision) = DrivewayTraffic::load(data)?;
+                match (traffic.is_empty(), revision) {
+                    (true, None) => {}
+                    (_, Some((topology, policy)))
+                        if topology < u64::MAX && policy < u64::MAX =>
+                    {
+                        let mut map = sim.map_mut();
+                        map.walking_topology_generation = topology;
+                        map.driving_policy_generation = policy;
+                    }
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "invalid saved driveway graph revision",
+                        ))
+                    }
+                }
+                sim.insert(traffic);
                 Ok(())
             }),
         });

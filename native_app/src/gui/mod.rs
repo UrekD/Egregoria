@@ -58,6 +58,8 @@ pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
     inspected_aura::inspected_aura(sim, uiworld);
     lotbrush::lotbrush(sim, uiworld);
     roadbuild::roadbuild(sim, uiworld);
+    footpath::update(sim, uiworld);
+    surface_lot::update(sim, uiworld);
     roadeditor::roadeditor(sim, uiworld);
     specialbuilding::specialbuilding(sim, uiworld);
     addtrain::addtrain(sim, uiworld);
@@ -68,6 +70,7 @@ pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
     // run last so other systems can have the chance to cancel select
     selectable::selectable(sim, uiworld);
     toolbox::transit::update_tool(uiworld, sim);
+    parkinglot::update(sim, uiworld);
     overlays::land_tiles::show_unowned_hover(sim, uiworld);
 }
 
@@ -174,11 +177,18 @@ pub enum Tool {
     Zoning,
     TransitStop,
     TransitLine,
+    ParkingGarage,
+    Footpath,
+    LocalOneWay,
+    ParkingLot,
 }
 
 impl Tool {
     pub fn is_roadbuild(&self) -> bool {
-        matches!(self, Tool::RoadbuildStraight | Tool::RoadbuildCurved)
+        matches!(
+            self,
+            Tool::RoadbuildStraight | Tool::RoadbuildCurved | Tool::LocalOneWay
+        )
     }
 
     pub fn show_arrows(&self) -> bool {
@@ -186,6 +196,7 @@ impl Tool {
             self,
             Tool::RoadbuildStraight
                 | Tool::RoadbuildCurved
+                | Tool::LocalOneWay
                 | Tool::RoadEditor
                 | Tool::Bulldozer
                 | Tool::Train
@@ -195,7 +206,11 @@ impl Tool {
     pub fn show_lots(&self) -> bool {
         matches!(
             self,
-            Tool::RoadbuildStraight | Tool::RoadbuildCurved | Tool::Bulldozer | Tool::LotBrush
+            Tool::RoadbuildStraight
+                | Tool::RoadbuildCurved
+                | Tool::LocalOneWay
+                | Tool::Bulldozer
+                | Tool::LotBrush
         )
     }
 }

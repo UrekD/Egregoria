@@ -508,9 +508,13 @@ impl ReplayJson {
         Ok(replay)
     }
 
-    pub(crate) fn decode_legacy_snapshot(bytes: &[u8], schema: crate::SnapshotSchema) -> Result<Replay, SaveLoadError> {
+    pub(crate) fn decode_legacy_snapshot(
+        bytes: &[u8],
+        schema: crate::SnapshotSchema,
+        snapshot_version: &str,
+    ) -> Result<Replay, SaveLoadError> {
         let header: ReplayHeader = JSON::decode(bytes).map_err(replay_corrupt)?;
-        if !schema.accepts_legacy_replay(&header.version) {
+        if !schema.accepts_legacy_replay(&header.version, snapshot_version) {
             return Err(SaveLoadError::IncompatibleReplay { version: header.version });
         }
         let legacy: LegacySnapshotReplay = JSON::decode(bytes).map_err(replay_corrupt)?;
@@ -982,7 +986,7 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     };
     let assert_discarded = |replay: &Replay| {
         let bytes = JSON::encode(replay).unwrap();
-        let restored = ReplayJson::decode_legacy_snapshot(&bytes, crate::SnapshotSchema::P6).unwrap();
+        let restored = ReplayJson::decode_legacy_snapshot(&bytes, crate::SnapshotSchema::P6, crate::PRE_P7_VERSION).unwrap();
         assert!(restored.obsolete_recording_discarded());
         assert!(!restored.enabled);
         assert_eq!(restored.command_count(), 0);
@@ -998,7 +1002,7 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
         r#"{{"version":"0.11.0","enabled":true,"registry":{registry},"commands":[[1,{{"Obsolete":[]}}]]}}"#
     );
     let obsolete = obsolete.as_bytes();
-    assert!(ReplayJson::decode_legacy_snapshot(obsolete, crate::SnapshotSchema::PreScale)
+    assert!(ReplayJson::decode_legacy_snapshot(obsolete, crate::SnapshotSchema::PreScale, crate::PRE_SCALE_VERSION)
         .unwrap()
         .obsolete_recording_discarded());
     assert!(matches!(
@@ -1011,9 +1015,9 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
 #[test]
 fn hotfix_release_rejects_old_replays_and_loads_their_snapshots() {
     let sim = crate::tests::TestCtx::new().g;
-    let registry = prototypes::prototypes().fingerprint();
-    assert_eq!(replay_version(), "0.13.1+commands.2");
-    for release in ["0.12.0", "0.12.9", "0.13.0"] {
+    let registry = crate::STOCK_PRE_FIRE_REGISTRY;
+    assert_eq!(replay_version(), "0.14.0+commands.7");
+    for release in ["0.12.0", "0.12.9", "0.13.0", "0.13.1"] {
         let mut prior = Replay {
             version: format!("{release}+commands.2"),
             enabled: true,
@@ -1027,10 +1031,6 @@ fn hotfix_release_rejects_old_replays_and_loads_their_snapshots() {
             ReplayJson::decode_sidecar(&bytes, Some(revision)),
             Err(SaveLoadError::IncompatibleReplay { version }) if version == prior.version
         ));
-        let embedded = ReplayJson::decode_snapshot(&bytes).unwrap();
-        assert!(embedded.obsolete_recording_discarded());
-        assert_eq!(embedded.command_count(), 0);
-
         let header = crate::RegistrySlotSnapshotHeader {
             slot: crate::SlotSnapshotHeader {
                 magic: crate::REGISTRY_SLOT_MAGIC,
@@ -1040,6 +1040,10 @@ fn hotfix_release_rejects_old_replays_and_loads_their_snapshots() {
             registry,
         };
         let mut resources = sim.snapshot_resources(true, usize::MAX).unwrap();
+        for name in ["service_incidents", "site_remnants", "fire_fleet", "driveway_traffic", "property_parking", "surface_lots"] {
+            resources.remove(name);
+        }
+        resources.insert("prototype_registry".into(), common::saveload::Bincode::encode(&registry).unwrap());
         resources.insert("replay".to_owned(), bytes);
         let payload = crate::SimulationSer {
             header: crate::SaveHeader {

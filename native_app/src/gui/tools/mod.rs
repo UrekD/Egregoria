@@ -1,11 +1,14 @@
 pub mod addtrain;
 pub mod bulldozer;
+pub(crate) mod footpath;
 pub mod inspected_aura;
 pub mod lotbrush;
+pub(crate) mod parkinglot;
 pub mod roadbuild;
 pub mod roadeditor;
 pub mod selectable;
 pub mod specialbuilding;
+pub(crate) mod surface_lot;
 pub mod terraforming;
 pub mod zoneedit;
 pub mod zoning;
@@ -48,8 +51,11 @@ pub(crate) fn cancel_interaction(uiw: &UiWorld) -> bool {
     let road = uiw.write::<InspectedRoad>().0.take().is_some();
     let tool = *uiw.read::<Tool>();
     if tool != Tool::Hand {
-        let keep_road_tool =
-            tool.is_roadbuild() && uiw.write::<RoadBuildResource>().cancel_placement();
+        let keep_road_tool = match tool {
+            Tool::Footpath => uiw.write::<footpath::FootpathTool>().cancel(),
+            Tool::ParkingLot => uiw.write::<surface_lot::SurfaceLotTool>().cancel(),
+            _ => tool.is_roadbuild() && uiw.write::<RoadBuildResource>().cancel_placement(),
+        };
         if !keep_road_tool {
             close_tool(uiw);
         }
@@ -67,13 +73,20 @@ pub(crate) fn cancel_interaction(uiw: &UiWorld) -> bool {
 pub(crate) fn close_tool(uiw: &UiWorld) {
     let mut tool = uiw.write::<Tool>();
     match *tool {
-        Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
+        Tool::RoadbuildStraight | Tool::RoadbuildCurved | Tool::LocalOneWay => {
             uiw.write::<RoadBuildResource>().cancel_placement();
         }
         Tool::Bulldozer => uiw.write::<BulldozerState>().reset_gesture(),
         Tool::SpecialBuilding => uiw.write::<SpecialBuildingResource>().opt = None,
         Tool::Terraforming => uiw.write::<TerraformingResource>().cancel_gesture(),
         Tool::Zoning => uiw.write::<ZoningState>().cancel_gesture(),
+        Tool::ParkingGarage => uiw.write::<parkinglot::ParkingGarageTool>().clear(),
+        Tool::Footpath => {
+            uiw.write::<footpath::FootpathTool>().cancel();
+        }
+        Tool::ParkingLot => {
+            uiw.write::<surface_lot::SurfaceLotTool>().cancel();
+        }
         _ => {}
     }
     *tool = Tool::Hand;
@@ -99,6 +112,9 @@ pub enum ToolCategory {
 pub enum ToolMode {
     RoadStraight,
     RoadCurved,
+    Footpath,
+    LocalOneWay,
+    ParkingLot,
     Intersections,
     Zoning,
     Utilities,
@@ -107,6 +123,7 @@ pub enum ToolMode {
     BusStop,
     BusLine,
     Trains,
+    ParkingGarage,
     Bulldoze,
     Landscaping,
 }
@@ -127,13 +144,24 @@ impl ToolCategory {
     /// Modes in shelf order; the first is selected until another one is used.
     pub fn modes(self) -> &'static [ToolMode] {
         match self {
-            ToolCategory::Roads => &[ToolMode::RoadStraight, ToolMode::RoadCurved],
+            ToolCategory::Roads => &[
+                ToolMode::RoadStraight,
+                ToolMode::RoadCurved,
+                ToolMode::Footpath,
+                ToolMode::LocalOneWay,
+                ToolMode::ParkingLot,
+            ],
             ToolCategory::Intersections => &[ToolMode::Intersections],
             ToolCategory::Zoning => &[ToolMode::Zoning],
             ToolCategory::Utilities => &[ToolMode::Utilities],
             ToolCategory::Services => &[ToolMode::Services],
             ToolCategory::Industry => &[ToolMode::Industry],
-            ToolCategory::Transport => &[ToolMode::BusStop, ToolMode::BusLine, ToolMode::Trains],
+            ToolCategory::Transport => &[
+                ToolMode::BusStop,
+                ToolMode::BusLine,
+                ToolMode::Trains,
+                ToolMode::ParkingGarage,
+            ],
             ToolCategory::Bulldoze => &[ToolMode::Bulldoze],
             ToolCategory::Landscaping => &[ToolMode::Landscaping],
         }
@@ -184,13 +212,19 @@ impl ToolCategory {
 impl ToolMode {
     pub fn category(self) -> ToolCategory {
         match self {
-            ToolMode::RoadStraight | ToolMode::RoadCurved => ToolCategory::Roads,
+            ToolMode::RoadStraight
+            | ToolMode::RoadCurved
+            | ToolMode::Footpath
+            | ToolMode::LocalOneWay
+            | ToolMode::ParkingLot => ToolCategory::Roads,
             ToolMode::Intersections => ToolCategory::Intersections,
             ToolMode::Zoning => ToolCategory::Zoning,
             ToolMode::Utilities => ToolCategory::Utilities,
             ToolMode::Services => ToolCategory::Services,
             ToolMode::Industry => ToolCategory::Industry,
-            ToolMode::BusStop | ToolMode::BusLine | ToolMode::Trains => ToolCategory::Transport,
+            ToolMode::BusStop | ToolMode::BusLine | ToolMode::Trains | ToolMode::ParkingGarage => {
+                ToolCategory::Transport
+            }
             ToolMode::Bulldoze => ToolCategory::Bulldoze,
             ToolMode::Landscaping => ToolCategory::Landscaping,
         }
@@ -200,12 +234,16 @@ impl ToolMode {
         match self {
             ToolMode::RoadStraight => Tool::RoadbuildStraight,
             ToolMode::RoadCurved => Tool::RoadbuildCurved,
+            ToolMode::Footpath => Tool::Footpath,
+            ToolMode::LocalOneWay => Tool::LocalOneWay,
+            ToolMode::ParkingLot => Tool::ParkingLot,
             ToolMode::Intersections => Tool::RoadEditor,
             ToolMode::Zoning => Tool::Zoning,
             ToolMode::Utilities | ToolMode::Services | ToolMode::Industry => Tool::SpecialBuilding,
             ToolMode::BusStop => Tool::TransitStop,
             ToolMode::BusLine => Tool::TransitLine,
             ToolMode::Trains => Tool::Train,
+            ToolMode::ParkingGarage => Tool::ParkingGarage,
             ToolMode::Bulldoze => Tool::Bulldozer,
             ToolMode::Landscaping => Tool::Terraforming,
         }
@@ -226,6 +264,9 @@ impl ToolMode {
             Tool::Hand | Tool::LotBrush => return None,
             Tool::RoadbuildStraight => ToolMode::RoadStraight,
             Tool::RoadbuildCurved => ToolMode::RoadCurved,
+            Tool::Footpath => ToolMode::Footpath,
+            Tool::LocalOneWay => ToolMode::LocalOneWay,
+            Tool::ParkingLot => ToolMode::ParkingLot,
             Tool::RoadEditor => ToolMode::Intersections,
             Tool::Zoning => ToolMode::Zoning,
             Tool::SpecialBuilding => match tab {
@@ -236,6 +277,7 @@ impl ToolMode {
             Tool::TransitStop => ToolMode::BusStop,
             Tool::TransitLine => ToolMode::BusLine,
             Tool::Train => ToolMode::Trains,
+            Tool::ParkingGarage => ToolMode::ParkingGarage,
             Tool::Bulldozer => ToolMode::Bulldoze,
             Tool::Terraforming => ToolMode::Landscaping,
         })
@@ -246,9 +288,13 @@ impl ToolMode {
         match self {
             ToolMode::RoadStraight => "Straight road",
             ToolMode::RoadCurved => "Curved road",
+            ToolMode::Footpath => "Footpath",
+            ToolMode::LocalOneWay => "Local one-way",
+            ToolMode::ParkingLot => "Parking lot",
             ToolMode::BusStop => "Bus stop",
             ToolMode::BusLine => "Bus line",
             ToolMode::Trains => "Trains",
+            ToolMode::ParkingGarage => "Parking garages",
             _ => self.category().label(),
         }
     }
@@ -258,9 +304,13 @@ impl ToolMode {
         match self {
             ToolMode::RoadStraight => "roads/straight",
             ToolMode::RoadCurved => "roads/curved",
+            ToolMode::Footpath => "roads/footpath",
+            ToolMode::LocalOneWay => "roads/local-one-way",
+            ToolMode::ParkingLot => "roads/parking-lot",
             ToolMode::BusStop => "transport/bus-stop",
             ToolMode::BusLine => "transport/bus-line",
             ToolMode::Trains => "transport/trains",
+            ToolMode::ParkingGarage => "transport/parking-garages",
             _ => self.category().path(),
         }
     }
@@ -462,7 +512,7 @@ mod toolbar1_tests {
     use super::*;
     use common::saveload::Encoder;
 
-    const TOOLS: [Tool; 12] = [
+    const TOOLS: [Tool; 16] = [
         Tool::Hand,
         Tool::RoadbuildStraight,
         Tool::RoadbuildCurved,
@@ -475,6 +525,10 @@ mod toolbar1_tests {
         Tool::Zoning,
         Tool::TransitStop,
         Tool::TransitLine,
+        Tool::ParkingGarage,
+        Tool::Footpath,
+        Tool::LocalOneWay,
+        Tool::ParkingLot,
     ];
     const TABS: [BuildingTab; 3] = [
         BuildingTab::Utilities,
@@ -529,6 +583,22 @@ mod toolbar1_tests {
             ToolCategory::Bulldoze.hotkey(),
             Some(InputAction::Bulldozer)
         );
+    }
+
+    #[test]
+    fn pathpark_tools_are_in_the_roads_shelf() {
+        for (path, mode) in [
+            ("roads/footpath", ToolMode::Footpath),
+            ("roads/local-one-way", ToolMode::LocalOneWay),
+            ("roads/parking-lot", ToolMode::ParkingLot),
+        ] {
+            assert!(ToolCategory::Roads.modes().contains(&mode));
+            assert_eq!(ToolSelection::parse(path), Some(ToolSelection::Mode(mode)));
+            assert_eq!(
+                ToolMode::from_tool(mode.tool(), BuildingTab::default()),
+                Some(mode)
+            );
+        }
     }
 
     #[test]

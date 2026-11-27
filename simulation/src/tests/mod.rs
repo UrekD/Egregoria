@@ -25,6 +25,9 @@ mod p5_spine_followups;
 mod p6_water;
 mod p7_road_edit;
 pub(crate) mod p9_fire;
+mod pathpark_growables;
+pub(crate) mod pathpark_lifecycle;
+mod pathpark_walk;
 mod population_scale;
 mod test_iso;
 mod vehicles;
@@ -565,6 +568,7 @@ fn w0_water_rejects_excess_lanes_before_topology_and_c1_keeps_the_inputs() {
     let from = MapProject::ground(vec3(32.0, 96.0, 10.0));
     let to = MapProject::ground(vec3(160.0, 96.0, 10.0));
     let pat = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0); 17],
         lanes_backward: vec![(LaneKind::Driving, 10.0); 16],
     };
@@ -748,6 +752,7 @@ fn w0_water_indexed_links_share_the_topology_budget() {
     .unwrap();
     sim.write::<Replay>().enabled = true;
     let pat = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0); 16],
         lanes_backward: vec![(LaneKind::Driving, 10.0); 15],
     };
@@ -803,6 +808,7 @@ fn w0_water_rejects_alternating_terrain_links_before_profiling() {
         })
         .collect();
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };
@@ -833,6 +839,7 @@ fn w0_water_profile_samples_are_shared_by_indexed_links() {
     })
     .unwrap();
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };
@@ -869,6 +876,7 @@ fn w0_water_profile_samples_include_split_road_rebuilds() {
     let mut map = Map::empty();
     assert!(map.install_environment(terrain));
     let pattern = LanePattern {
+        local_one_way: false,
         lanes_forward: vec![(LaneKind::Driving, 10.0)],
         lanes_backward: vec![],
     };
@@ -2096,6 +2104,8 @@ mod tiles_fix_regressions {
         }
         let bytes = Bincode::encode(&sim).unwrap();
         let mut legacy: SimulationDeser = Bincode::decode(&bytes).unwrap();
+        legacy._header.version = crate::VERSION.into();
+        legacy.res.remove("driveway_traffic").unwrap();
         legacy.res.remove("land_ownership").unwrap();
         let opts = *sim.read::<crate::SimulationOptions>();
         legacy.res.insert(

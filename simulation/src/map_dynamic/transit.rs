@@ -287,6 +287,10 @@ impl Transit {
         log::warn!("Transit line {line:?} suspended after three consecutive skipped stops");
     }
 
+    pub(crate) fn stored_stop_lane(&self, stop: StopID) -> Option<(LaneID, f32)> {
+        self.berths.get(&stop).copied().map(Berth::lane_offset)
+    }
+
     fn berth(&self, map: &Map, stop: StopID) -> Option<Berth> {
         if let Some(berth) = self.berths.get(&stop) {
             return Some(*berth);

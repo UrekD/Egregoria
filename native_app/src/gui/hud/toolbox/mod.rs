@@ -99,12 +99,33 @@ fn tool_properties(uiw: &UiWorld, sim: &Simulation, yakui_width: f32) -> bool {
             crate::gui::bulldozer::demolition_controls(uiw);
         }
         Tool::LotBrush => return false,
-        Tool::TransitStop | Tool::TransitLine | Tool::Train => {
+        Tool::TransitStop | Tool::TransitLine | Tool::Train | Tool::ParkingGarage => {
             transport_properties(uiw, sim, tool);
         }
         Tool::Zoning => crate::gui::zoning::properties(uiw, yakui_width),
-        Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
-            roadbuild::roadbuild_properties(uiw);
+        Tool::RoadbuildStraight
+        | Tool::RoadbuildCurved
+        | Tool::LocalOneWay
+        | Tool::Footpath
+        | Tool::ParkingLot => {
+            mincolumn(0.0, || {
+                padxy(12.0, 6.0, || {
+                    minrow(6.0, || {
+                        for &mode in ToolCategory::Roads.modes() {
+                            if mode_button(uiw, sim, mode, tool == mode.tool()) {
+                                select_mode(uiw, mode);
+                            }
+                        }
+                    });
+                });
+                let selected = *uiw.read::<Tool>();
+                match selected {
+                    Tool::Footpath => crate::gui::footpath::properties(uiw),
+                    Tool::ParkingLot => crate::gui::surface_lot::properties(uiw),
+                    Tool::LocalOneWay => roadbuild::local_properties(uiw),
+                    _ => roadbuild::roadbuild_properties(uiw),
+                }
+            });
         }
         Tool::RoadEditor => {
             roadedit::roadedit_properties(uiw);
@@ -140,6 +161,7 @@ fn transport_properties(uiw: &UiWorld, sim: &Simulation, tool: Tool) {
         });
         match tool {
             Tool::Train => train::train_properties(uiw),
+            Tool::ParkingGarage => crate::gui::parkinglot::properties(uiw),
             _ => transit::properties(uiw, tool),
         }
     });
@@ -226,7 +248,10 @@ fn remember_current_mode(uiw: &UiWorld) {
 pub(crate) fn select_mode(uiw: &UiWorld, mode: ToolMode) {
     // Straight and curved roads share the chained start point.
     let tool = *uiw.read::<Tool>();
-    if tool != mode.tool() && !(tool.is_roadbuild() && mode.tool().is_roadbuild()) {
+    if tool != mode.tool()
+        && !(matches!(tool, Tool::RoadbuildStraight | Tool::RoadbuildCurved)
+            && matches!(mode.tool(), Tool::RoadbuildStraight | Tool::RoadbuildCurved))
+    {
         close_tool(uiw);
     }
     if let Some(choice) = mode.building_tab() {

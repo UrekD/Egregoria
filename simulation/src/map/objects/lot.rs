@@ -88,7 +88,12 @@ impl Lot {
     }
 
     pub(crate) fn footprint_obstructed(map: &Map, shape: OBB, include_lots: bool) -> bool {
-        let mut filter = ProjectFilter::INTER | ProjectFilter::BUILDING;
+        let mut filter = ProjectFilter::INTER;
+        if map.surface_lot_count == 0 {
+            filter = filter | ProjectFilter::BUILDING;
+        } else if map.building_overlaps(shape) {
+            return true;
+        }
         if include_lots {
             filter = filter | ProjectFilter::LOT;
         }

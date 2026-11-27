@@ -258,6 +258,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                     true
                 }
                 CallDisposition::Exited => {
+                    crate::diagnostics::record_rail_completion();
                     cargo.close_call(&mut trace, call, true, None, now);
                     dispatch.free(*id);
                     false
@@ -310,6 +311,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
             continue;
         };
         let train = &mut world.trains[id];
+        crate::diagnostics::record_rail_offer();
         let mut call = CallManifest {
             key: FreightCallKey {
                 terminal,

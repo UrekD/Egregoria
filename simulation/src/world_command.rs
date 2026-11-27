@@ -1,3 +1,4 @@
+use crate::map::building_parking::{GarageKind, ParkingLayout, SurfaceLotDraft};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,9 +25,9 @@ use crate::map::road_edit::{
 use crate::map::{
     Building, BuildingID, BuildingKind, ConnectionError, Density, Environment, IntersectionID,
     JunctionRuleError, JunctionRules, LandDenial, LandTileId, LaneID, LaneKind, LanePattern,
-    LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, PreparedEffects,
-    ProjectKind, RoadID, TerraformKind, TilePurchased, TurnPolicy, WaterEdit, WaterEditError,
-    WaterEditOutcome, WaterTopologyWork, Zone, ZoneGrid, ZoneKind, ZonePaintError,
+    LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, PathEndpoint,
+    PreparedEffects, ProjectKind, RoadID, TerraformKind, TilePurchased, TurnPolicy, WaterEdit,
+    WaterEditError, WaterEditOutcome, WaterTopologyWork, Zone, ZoneGrid, ZoneKind, ZonePaintError,
     MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
@@ -343,6 +344,14 @@ macro_rules! define_world_command {
                 site: BuildingID,
                 quote: FireApronQuote,
             },
+            MapMakeWalkingPath {
+                from: PathEndpoint,
+                to: PathEndpoint,
+                control: Option<[i32; 2]>,
+            },
+            MapPlaceParkingGarage { kind: GarageKind, entrance: crate::map::CurbAnchor },
+            SetBuildingParkingOpen { building: BuildingID, open: bool },
+            MapPlaceParkingLot { draft: SurfaceLotDraft, quote: u64 },
         }
     };
 }
@@ -415,6 +424,7 @@ pub enum Rejection {
     DemolitionWorkLimit,
     FireAccess(AccessError),
     StaleFireApronQuote,
+    ParkingLotAccess,
 }
 
 impl From<LandDenial> for Rejection {
@@ -446,7 +456,7 @@ impl Rejection {
         }
     }
 
-    fn water_connection_error(error: ConnectionError) -> Self {
+    pub(crate) fn water_connection_error(error: ConnectionError) -> Self {
         match error {
             ConnectionError::WorkLimit => Self::WaterWorkLimit,
             ConnectionError::LandDenied(reason) => Self::LandDenied(reason),
@@ -501,7 +511,10 @@ impl PrepareBudget {
             guard_terraform,
             reject_surface: false,
             shared_topology: commands.iter().any(|command| {
-                matches!(command, MapUpgradeRoad { .. } | MapSetJunctionRules { .. })
+                matches!(
+                    command,
+                    MapUpgradeRoad { .. } | MapSetJunctionRules { .. } | MapMakeWalkingPath { .. }
+                )
             }),
             demolition_preparations: 32,
             remaining: MAX_WATER_BATCH_WORK,
@@ -633,8 +646,15 @@ pub(crate) enum PreparedAction<'a> {
         work: Option<WaterTopologyWork>,
         cost: Money,
     },
+    WalkingPath(crate::map::PreparedWalkingPath, Money),
     SpecialBuilding(crate::map::PreparedSpecialBuilding, Option<Box<FireApronPreview>>, Money),
     RetrofitFireApron(BuildingID, Box<FireApronPreview>, Money),
+    ParkingFacility {
+        building: crate::map::PreparedSpecialBuilding,
+        layout: ParkingLayout,
+        cost: Money,
+        surface: bool,
+    },
     RoadEdit(PreparedRoadEdit),
     JunctionEdit(PreparedJunctionEdit),
     Command(&'a WorldCommand, Money),
@@ -663,6 +683,17 @@ impl PreparedAction<'_> {
                     .map_err(Rejection::water_connection_error)?;
                 WorldCommand::charge_construction(sim, cost, construction);
             }
+            Self::WalkingPath(prepared, cost) => {
+                let road = sim
+                    .map_mut()
+                    .commit_walking_path(prepared)
+                    .map_err(Rejection::water_connection_error)?
+                    .road;
+                WorldCommand::charge_construction(sim, cost, construction);
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.walking_paths.insert(index, Ok(road));
+            }
             Self::SpecialBuilding(prepared, apron, cost) => {
                 let id = sim.map_mut().commit_special_building(prepared);
                 sim.write::<BuildingInfos>().insert(id);
@@ -674,6 +705,34 @@ impl PreparedAction<'_> {
             Self::RetrofitFireApron(site, apron, cost) => {
                 commission(sim, site, *apron);
                 WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::ParkingFacility {
+                building,
+                layout,
+                cost,
+                surface,
+            } => {
+                let id = sim.map_mut().commit_special_building(building);
+                sim.write::<BuildingInfos>().insert(id);
+                sim.write::<crate::transportation::DrivewayTraffic>()
+                    .properties
+                    .install(
+                        id,
+                        layout,
+                        &mut sim.write::<crate::map_dynamic::ParkingManagement>(),
+                    );
+                WorldCommand::charge_construction(sim, cost, construction);
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                if surface {
+                    let lot = sim
+                        .map()
+                        .public_parking_lot(id)
+                        .expect("new public lot identity");
+                    outcomes.parking_lots.insert(index, Ok(lot));
+                } else {
+                    outcomes.parking_garages.insert(index, Ok(id));
+                }
             }
             Self::RoadEdit(prepared) => {
                 let receipt = prepared.commit(sim)?;
@@ -728,6 +787,9 @@ pub struct CommandOutcomes {
     road_edits: BTreeMap<usize, Result<EditReceipt, Rejection>>,
     junction_edits: BTreeMap<usize, Result<JunctionEditReceipt, Rejection>>,
     demolitions: BTreeMap<usize, Result<DemolitionReceipt, Rejection>>,
+    walking_paths: BTreeMap<usize, Result<RoadID, Rejection>>,
+    parking_garages: BTreeMap<usize, Result<BuildingID, Rejection>>,
+    parking_lots: BTreeMap<usize, Result<crate::map::ParkingLotID, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -779,6 +841,14 @@ impl CommandOutcomes {
         self.tile_purchases.get(&index).copied()
     }
 
+    pub fn parking_lot(&self, index: usize) -> Option<Result<crate::map::ParkingLotID, Rejection>> {
+        self.parking_lots.get(&index).copied()
+    }
+
+    pub fn parking_garage(&self, index: usize) -> Option<Result<BuildingID, Rejection>> {
+        self.parking_garages.get(&index).copied()
+    }
+
     pub fn road_edit(&self, index: usize) -> Option<&Result<EditReceipt, Rejection>> {
         self.road_edits.get(&index)
     }
@@ -789,6 +859,9 @@ impl CommandOutcomes {
 
     pub fn demolition(&self, index: usize) -> Option<Result<DemolitionReceipt, Rejection>> {
         self.demolitions.get(&index).copied()
+        }
+    pub fn walking_path(&self, index: usize) -> Option<Result<RoadID, Rejection>> {
+        self.walking_paths.get(&index).copied()
     }
 
     /// Discards the completed batch's outcomes while preserving its sequence.
@@ -804,6 +877,9 @@ impl CommandOutcomes {
         self.road_edits.clear();
         self.junction_edits.clear();
         self.demolitions.clear();
+        self.walking_paths.clear();
+        self.parking_garages.clear();
+        self.parking_lots.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -1144,6 +1220,10 @@ impl WorldCommand {
                 | MapSetJunctionRules { .. }
                 | MapStartDemolition { .. }
                 | MapRetrofitFireApron { .. }
+                | MapMakeWalkingPath { .. }
+                | MapPlaceParkingGarage { .. }
+                | MapPlaceParkingLot { .. }
+                | SetBuildingParkingOpen { .. }
         )
     }
 
@@ -1157,6 +1237,10 @@ impl WorldCommand {
         construction: BudgetCategory,
         water: &mut PrepareBudget,
     ) -> Option<Rejection> {
+        if let Err(reason) = self.guard_driveways(sim, &mut water.remaining) {
+            self.reject_unadmitted(sim, reason);
+            return Some(reason);
+        }
         if let MapStartDemolition { site, quote } = *self {
             let result = if water.demolition_preparations == 0 {
                 Err(Rejection::DemolitionWorkLimit)
@@ -1181,8 +1265,22 @@ impl WorldCommand {
             let outcome = if water.reject_surface {
                 Err(WaterEditError::Limit)
             } else {
-                sim.map_mut()
-                    .apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
+                let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+                let mut map = sim.map_mut();
+                if traffic.is_empty() {
+                    map.apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
+                } else {
+                    map.environment()
+                        .prepare_water_edit(edit)
+                        .and_then(|prepared| {
+                            traffic.guard_water(&prepared, &mut water.remaining)?;
+                            map.commit_water_edit(
+                                prepared,
+                                &mut sim.zone_grid_mut(),
+                                &mut water.remaining,
+                            )
+                        })
+                }
             };
             let rejection = outcome.as_ref().err().map(Rejection::water_error);
             if let Some(reason) = rejection {
@@ -1214,6 +1312,8 @@ impl WorldCommand {
                     .environment()
                     .prepare_water_terraform(tick, kind, center, radius, amount, level, slope)
                     .and_then(|prepared| {
+                        sim.read::<crate::transportation::DrivewayTraffic>()
+                            .guard_water(&prepared, &mut water.remaining)?;
                         map.commit_water_edit(
                             prepared,
                             &mut sim.zone_grid_mut(),
@@ -1301,9 +1401,6 @@ impl WorldCommand {
             if projects.len() > MAX_WIRE_COMMANDS || links.len() > MAX_WIRE_COMMANDS)
         {
             return Some(Ok(Rejection::WaterWorkLimit));
-        }
-        if matches!(self, MapRemoveBuilding(_)) {
-            return Some(Ok(Rejection::LegacyBuildingRemoval));
         }
         let finite_pattern = |pattern: &LanePattern| {
             pattern.lanes_forward.len() <= 32
@@ -1439,8 +1536,13 @@ impl WorldCommand {
                 change: RoadUpgrade::ReverseOneWay,
                 ..
             }
+            | MapMakeWalkingPath { .. }
+            | MapPlaceParkingGarage { .. }
+            | MapPlaceParkingLot { .. }
+            | SetBuildingParkingOpen { .. }
             | BuyTile { .. } => true,
-            EditWater(_) | MapRemoveBuilding(_) => unreachable!(),
+            MapRemoveBuilding(_) => true,
+            EditWater(_) => unreachable!(),
         };
         (!fits).then_some(Ok(Rejection::InvalidCommandEncoding))
     }
@@ -1535,6 +1637,21 @@ impl WorldCommand {
             let index = outcomes.command_ranges.len();
             outcomes.demolitions.insert(index, Err(reason));
         }
+        if matches!(self, MapPlaceParkingGarage { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.parking_garages.insert(index, Err(reason));
+        }
+        if matches!(self, MapPlaceParkingLot { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.parking_lots.insert(index, Err(reason));
+        }
+        if matches!(self, MapMakeWalkingPath { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.walking_paths.insert(index, Err(reason));
+        }
         if matches!(self, EditWater(_)) {
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -1565,6 +1682,10 @@ impl WorldCommand {
             AddTrain { .. } => "AddTrain",
             SpawnTrain { .. } => "SpawnTrain",
             MapMakeConnection { .. } => "MapMakeConnection",
+            MapMakeWalkingPath { .. } => "MapMakeWalkingPath",
+            MapPlaceParkingGarage { .. } => "MapPlaceParkingGarage",
+            MapPlaceParkingLot { .. } => "MapPlaceParkingLot",
+            SetBuildingParkingOpen { .. } => "SetBuildingParkingOpen",
             MapMakeMultipleConnections(..) => "MapMakeMultipleConnections",
             MapUpdateIntersectionPolicy { .. } => "MapUpdateIntersectionPolicy",
             MapBuildSpecialBuilding { .. } => "MapBuildSpecialBuilding",
@@ -1649,7 +1770,14 @@ impl WorldCommand {
                 map.get(*id).is_some()
             }
             MapRemoveRoad(id) => map.get(*id).is_some(),
-            MapRemoveBuilding(_) => return Err(Rejection::LegacyBuildingRemoval),
+            MapRemoveBuilding(id) => {
+                let site = map.get(*id).ok_or(Rejection::MissingReference)?;
+                if !matches!(site.kind, BuildingKind::ParkingGarage(_) | BuildingKind::ParkingLot { .. }) {
+                    return Err(Rejection::LegacyBuildingRemoval);
+                }
+                map.authorize_building_removal(*id)?;
+                true
+            }
             MapLoadParis | MapLoadTestField { .. } | SpawnRandomCars { .. }
                 if map.land_ownership().is_tiled() =>
             {
@@ -1780,7 +1908,9 @@ impl WorldCommand {
                     }
                     BuildingKind::House
                     | BuildingKind::ExternalTrading
-                    | BuildingKind::TrainStation => {
+                    | BuildingKind::TrainStation
+                    | BuildingKind::ParkingGarage(_)
+                    | BuildingKind::ParkingLot { .. } => {
                         return Err(Rejection::InvalidBuilding);
                     }
                 };
@@ -1828,6 +1958,10 @@ impl WorldCommand {
             Init(_)
             | BuyTile { .. }
             | MapMakeConnection { .. }
+            | MapMakeWalkingPath { .. }
+            | MapPlaceParkingGarage { .. }
+            | MapPlaceParkingLot { .. }
+            | SetBuildingParkingOpen { .. }
             | MapMakeMultipleConnections(..)
             | EditWater(_)
             | SendMessage { .. }
@@ -1863,6 +1997,7 @@ impl WorldCommand {
         }
         let map = sim.map();
         let mut budget = PrepareBudget::new(&[self], map.environment());
+        self.guard_driveways(sim, &mut budget.remaining)?;
         self.admitted(map.land_ownership().is_tiled(), &budget)?;
         drop(map);
         match self {
@@ -1898,6 +2033,9 @@ impl WorldCommand {
                         *level,
                         *slope,
                     )
+                    .map_err(Self::terraform_error)?;
+                sim.read::<crate::transportation::DrivewayTraffic>()
+                    .guard_water(&prepared, &mut budget.remaining)
                     .map_err(Self::terraform_error)?;
                 let water = map
                     .preview_prepared_water(&prepared, &sim.read::<ZoneGrid>())
@@ -1941,6 +2079,10 @@ impl WorldCommand {
                         ..ActionPreview::priced(cost)
                     })
                 }
+                PreparedAction::WalkingPath(prepared, cost) => Ok(ActionPreview {
+                    road: Some(prepared.preview()),
+                    ..ActionPreview::priced(cost)
+                }),
                 PreparedAction::RoadEdit(prepared) => {
                     Ok(ActionPreview::priced(prepared.preview.cost))
                 }
@@ -1955,9 +2097,209 @@ impl WorldCommand {
                     fire_apron: Some(fire_apron),
                     ..ActionPreview::priced(cost)
                 }),
-                PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
+                PreparedAction::ParkingFacility { cost, .. }
+                | PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
             },
         }
+    }
+
+    fn guard_driveways(&self, sim: &Simulation, remaining: &mut usize) -> Result<(), Rejection> {
+        use crate::transportation::DrivewayTraffic;
+        use geom::AABB;
+
+        let traffic = sim.read::<DrivewayTraffic>();
+        if traffic.is_empty() {
+            return Ok(());
+        }
+        match self {
+            MapRemoveBuilding(id) => {
+                return if traffic.properties.busy(*id) {
+                    Err(Rejection::BusyConflict)
+                } else {
+                    Ok(())
+                }
+            }
+            MapLoadParis | MapLoadTestField { .. } => return Err(Rejection::BusyConflict),
+            MapRemoveRoad(_)
+            | MapUpgradeRoad { .. }
+            | MapRemoveIntersection(_)
+            | MapSetJunctionRules { .. }
+            | MapUpdateIntersectionPolicy { .. }
+            | MapMakeConnection { .. }
+            | MapMakeMultipleConnections(..)
+            | MapMakeWalkingPath { .. }
+            | Terraform { .. }
+            | MapBuildSpecialBuilding { .. }
+            | MapBuildHouse(_) => {}
+            _ => return Ok(()),
+        }
+        let map = sim.map();
+        let protected = traffic
+            .protected_motion_roads(&map, remaining)
+            .map_err(|error| Rejection::water_error(&error))?;
+        let retire_vacant = matches!(self, MapRemoveRoad(_));
+        // Upgrade and demolition have their own checks for lot frontage.
+        let check_surface_neighbors = !matches!(
+            self,
+            MapUpgradeRoad { .. } | MapRemoveRoad(_) | MapRemoveIntersection(_)
+        );
+        let protects = |road| {
+            protected.contains(&road)
+                || traffic
+                    .properties
+                    .protects_non_surface_road(road, retire_vacant)
+                || (check_surface_neighbors && traffic.properties.protects_surface_road(road))
+        };
+        let touches_junction = |id| {
+            map.get(id).is_some_and(|joint: &crate::map::Intersection| {
+                joint.roads.iter().any(|&road| protects(road))
+            })
+        };
+        let touches_road = |id| {
+            protects(id)
+                || map.get(id).is_some_and(|road: &crate::map::Road| {
+                    touches_junction(road.src) || touches_junction(road.dst)
+                })
+        };
+        let touches_project = |kind| match kind {
+            ProjectKind::Road(road) => touches_road(road),
+            ProjectKind::Intersection(joint) => touches_junction(joint),
+            _ => false,
+        };
+        let swept = |a: Vec2, b: Vec2, control: Option<Vec2>, width: f32| {
+            let c = control.unwrap_or(a);
+            traffic.overlaps(
+                &AABB {
+                    ll: a.min(b).min(c),
+                    ur: a.max(b).max(c),
+                }
+                .expand(width),
+            )
+        };
+        if matches!(
+            self,
+            MapMakeConnection { .. }
+                | MapMakeMultipleConnections(..)
+                | MapMakeWalkingPath { .. }
+                | Terraform { .. }
+                | MapBuildSpecialBuilding { .. }
+                | MapBuildHouse(_)
+        ) {
+            let checks = match self {
+                MapMakeMultipleConnections(_, links) => links.len(),
+                _ => 1,
+            };
+            crate::map::spend_water_work(remaining, traffic.site_count().saturating_mul(checks))
+                .map_err(|error| Rejection::water_error(&error))?;
+        }
+        let blocked = match self {
+            MapRemoveRoad(road) => touches_road(*road),
+            MapUpgradeRoad { road, change, .. } => {
+                let changes_geometry = match change {
+                    RoadUpgrade::Replace(pattern) => map.get(*road).is_some_and(|current| {
+                        let current = current.pattern(map.lanes());
+                        let kinds = |lanes: &[(LaneKind, f32)]| -> Vec<LaneKind> {
+                            lanes.iter().map(|(kind, _)| *kind).collect()
+                        };
+                        kinds(&current.lanes_forward) != kinds(&pattern.lanes_forward)
+                            || kinds(&current.lanes_backward) != kinds(&pattern.lanes_backward)
+                    }),
+                    RoadUpgrade::ReverseOneWay => true,
+                };
+                protects(*road) || (changes_geometry && touches_road(*road))
+            }
+
+            MapRemoveIntersection(joint) => map
+                .get(*joint)
+                .is_some_and(|intersection| intersection.roads.iter().copied().any(touches_road)),
+            MapSetJunctionRules {
+                junction: joint, ..
+            }
+            | MapUpdateIntersectionPolicy { inter: joint, .. } => touches_junction(*joint),
+            MapMakeConnection {
+                from,
+                to,
+                inter,
+                pat,
+            } => {
+                touches_project(from.kind)
+                    || touches_project(to.kind)
+                    || swept(from.pos.xy(), to.pos.xy(), *inter, pat.width())
+            }
+            MapMakeMultipleConnections(projects, links) => {
+                links.iter().any(|(from, to, control, pattern)| {
+                    let Some((a, b)) = projects.get(*from).zip(projects.get(*to)) else {
+                        return false;
+                    };
+                    touches_project(a.kind)
+                        || touches_project(b.kind)
+                        || swept(a.pos.xy(), b.pos.xy(), *control, pattern.width())
+                })
+            }
+            MapMakeWalkingPath { from, to, control } => {
+                let xy = |[x, y]: [i32; 2]| Vec2::new(x as f32 * 0.01, y as f32 * 0.01);
+                let position = |endpoint: &PathEndpoint| match *endpoint {
+                    PathEndpoint::Ground { point_cm, .. } => Some(xy(point_cm)),
+                    _ => map.path_endpoint_position(*endpoint).map(|p| p.xy()),
+                };
+                [from, to]
+                    .iter()
+                    .filter_map(|endpoint| endpoint.road())
+                    .any(touches_road)
+                    || position(from)
+                        .zip(position(to))
+                        .is_some_and(|(a, b)| swept(a, b, control.map(xy), 3.0))
+            }
+            Terraform { center, radius, .. } => traffic.overlaps(&AABB {
+                ll: *center - Vec2::splat(*radius),
+                ur: *center + Vec2::splat(*radius),
+            }),
+            MapBuildSpecialBuilding { pos, .. } => {
+                use geom::Shape;
+                traffic.overlaps_non_surface(&pos.bbox()) || map.surface_access_obstructed_by(*pos)
+            }
+            MapBuildHouse(lot) => {
+                use geom::Shape;
+                map.get(*lot).is_some_and(|lot| {
+                    traffic.overlaps_non_surface(&lot.shape.bbox())
+                        || map.surface_access_obstructed_by(lot.shape)
+                })
+            }
+            _ => false,
+        };
+        if blocked {
+            return Err(Rejection::BusyConflict);
+        }
+        let demolition = match self {
+            MapRemoveRoad(road) if map.get(*road).is_some() => Some(ProjectKind::Road(*road)),
+            MapRemoveIntersection(joint) if map.get(*joint).is_some() => {
+                Some(ProjectKind::Intersection(*joint))
+            }
+            _ => None,
+        };
+        if let Some(edit) = demolition {
+            traffic
+                .properties
+                .guard_surface_demolition(&map, edit, remaining)?;
+        }
+        Ok(())
+    }
+
+    fn check_parking_facility(
+        sim: &Simulation,
+        layout: &ParkingLayout,
+        budget: &mut PrepareBudget,
+    ) -> Result<(), Rejection> {
+        let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+        crate::map::spend_water_work(&mut budget.remaining, traffic.proof_site_count())
+            .map_err(|error| Rejection::water_error(&error))?;
+        let parking = sim.read::<ParkingManagement>();
+        if traffic.overlaps_proof_pad(&layout.bounds())
+            || !traffic.properties.fits(&parking, layout, None)
+        {
+            return Err(Rejection::BusyConflict);
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_single<'a>(
@@ -2017,12 +2359,97 @@ impl WorldCommand {
                 let cells = ZoneGrid::eligible_paint_cells(&sim.map(), area, *kind, *density)?;
                 return Ok(PreparedAction::Paint(cells));
             }
+            MapPlaceParkingGarage { kind, entrance } => {
+                let map = sim.map();
+                let (building, layout) =
+                    map.prepare_parking_garage(*kind, *entrance, &mut budget.remaining)?;
+                Self::check_parking_facility(sim, &layout, budget)?;
+                let cost = Self::affordable_cost(sim, Some(kind.cost()))?;
+                return Ok(PreparedAction::ParkingFacility {
+                    building,
+                    layout,
+                    cost,
+                    surface: false,
+                });
+            }
+            MapPlaceParkingLot { draft, quote } => {
+                let (building, layout, expected) = sim
+                    .map()
+                    .prepare_surface_lot(*draft, &mut budget.remaining)?;
+                if expected != *quote {
+                    return Err(Rejection::StaleRoadQuote);
+                }
+                Self::check_parking_facility(sim, &layout, budget)?;
+                let cost = Self::affordable_cost(sim, Some(draft.cost()))?;
+                return Ok(PreparedAction::ParkingFacility {
+                    building,
+                    layout,
+                    cost,
+                    surface: true,
+                });
+            }
+            SetBuildingParkingOpen { building, .. } => {
+                let map = sim.map();
+                map.authorize_land_effects(PreparedEffects::Building(*building))?;
+                if sim.building_parking(*building).is_none() {
+                    return Err(Rejection::MissingReference);
+                }
+            }
+            MapMakeWalkingPath { from, to, control } => {
+                let map = sim.map();
+                let admission =
+                    sim.read::<crate::transportation::junction_admission::JunctionAdmission>();
+                let mut work = WaterTopologyWork::new();
+                work.remaining = budget.remaining;
+                let prepared =
+                    map.prepare_walking_path(*from, *to, *control, &admission, &mut work);
+                budget.remaining = work.remaining;
+                let prepared = prepared.map_err(Rejection::water_connection_error)?;
+                let mut split_roads = prepared.split_roads().peekable();
+                if split_roads.peek().is_some() {
+                    use crate::map::TraverseKind;
+                    use crate::map_dynamic::ItineraryTarget;
+
+                    let roads: BTreeSet<_> = split_roads.collect();
+                    let replaced = |lane| {
+                        map.get(lane)
+                            .is_some_and(|lane: &crate::map::Lane| roads.contains(&lane.parent))
+                    };
+                    let world = sim.world();
+                    let itineraries = world
+                        .vehicles
+                        .values()
+                        .map(|actor| &actor.it)
+                        .chain(world.humans.values().map(|actor| &actor.it))
+                        .chain(world.trains.values().map(|actor| &actor.it));
+                    for itinerary in itineraries {
+                        crate::map::spend_water_work(&mut budget.remaining, 1)
+                            .map_err(|error| Rejection::water_error(&error))?;
+                        let loses_target = matches!(itinerary.target(),
+                            Some(ItineraryTarget::DirectedLane(lane, _)) if replaced(lane));
+                        let loses_current = itinerary.get_travers().is_some_and(|t| match t.kind {
+                            TraverseKind::Lane(lane) => replaced(lane),
+                            TraverseKind::Turn(turn) => replaced(turn.src) || replaced(turn.dst),
+                        });
+                        if loses_target || loses_current {
+                            return Err(Rejection::BusyConflict);
+                        }
+                    }
+                }
+                let (a, b) = prepared.positions();
+                let pattern = crate::map::SmallRoadPreset::WalkingPath.lane_pattern();
+                let cost = Self::affordable_cost(sim, Government::connection_cost(a, b, &pattern))?;
+                return Ok(PreparedAction::WalkingPath(prepared, cost));
+            }
             MapMakeConnection {
                 from,
                 to,
                 inter,
                 pat,
             } => {
+                if pat.is_walking_only() {
+                    return Err(Rejection::InvalidConnection);
+                }
                 let map = sim.map();
                 let shared_topology = map.land_ownership().is_tiled()
                     || budget.shared_topology
@@ -2198,6 +2625,12 @@ impl WorldCommand {
             return Err(Rejection::InvalidBatchIndex);
         }
 
+        if links
+            .iter()
+            .any(|(_, _, _, pattern)| pattern.is_walking_only())
+        {
+            return Err(Rejection::InvalidConnection);
+        }
         let mut map = sim.map_mut();
         let shared_topology = tiled
             || batch.shared_topology
@@ -2394,11 +2827,36 @@ impl WorldCommand {
                 .try_remove_intersection(id)
                 .map_err(Rejection::water_connection_error)?,
             MapRemoveRoad(id) => {
-                sim.map_mut()
-                    .try_remove_road(id)
+                use crate::map_dynamic::ParkingManagement;
+                use crate::transportation::DrivewayTraffic;
+
+                let mut traffic = sim.write::<DrivewayTraffic>();
+                let mut map = sim.map_mut();
+                let affected = if traffic.properties.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    let road = map.get(id).ok_or(Rejection::MissingReference)?;
+                    [road.src, road.dst]
+                        .into_iter()
+                        .filter_map(|joint| map.get(joint))
+                        .flat_map(|joint| joint.roads.iter().copied())
+                        .collect()
+                };
+                map.try_remove_road(id)
                     .map_err(Rejection::water_connection_error)?;
+                if !affected.is_empty() {
+                    traffic.properties.retire_invalidated_vacant(
+                        &mut map,
+                        &affected,
+                        &mut sim.write::<ParkingManagement>(),
+                    );
+                }
             }
-            MapRemoveBuilding(_) => return Err(Rejection::LegacyBuildingRemoval),
+            MapRemoveBuilding(id) => {
+                if !crate::souls::lifecycle::remove_site(sim, id) {
+                    return Err(Rejection::MutationFailed);
+                }
+            }
             MapStartDemolition { .. } => unreachable!("handled by apply_in_batch"),
             MapRetrofitFireApron { .. } => unreachable!("prepared fire apron"),
             MapBuildHouse(id) => {
@@ -2410,6 +2868,7 @@ impl WorldCommand {
                 residence::on_house_built(sim, building);
             }
             MapMakeConnection { .. }
+            | MapMakeWalkingPath { .. }
             | MapMakeMultipleConnections(..)
             | MapUpgradeRoad { .. }
             | MapSetJunctionRules { .. }
@@ -2429,7 +2888,18 @@ impl WorldCommand {
                     i.turn_policy = tp;
                 })
                 .map_err(Rejection::water_connection_error)?,
-            MapBuildSpecialBuilding { .. } => unreachable!(),
+            MapBuildSpecialBuilding { .. }
+            | MapPlaceParkingGarage { .. }
+            | MapPlaceParkingLot { .. } => unreachable!(),
+            SetBuildingParkingOpen { building, open } => {
+                if !sim
+                    .write::<crate::transportation::DrivewayTraffic>()
+                    .properties
+                    .set_open(building, open)
+                {
+                    return Err(Rejection::MissingReference);
+                }
+            }
             SetGameTime(gt) => {
                 let mut time = sim.write::<GameTime>();
                 sim.write::<Budget>().shift_clock(time.tick, gt.tick);
@@ -2748,4 +3218,18 @@ fn p7_mixed_dry_connections_share_remaining_work_at_each_index() {
         ]
     );
     assert_eq!(sim.hashes(), before);
+}
+
+impl Simulation {
+    pub fn quote_surface_lot(&self, draft: SurfaceLotDraft) -> Result<(u64, Money), Rejection> {
+        let mut budget = PrepareBudget::for_preview(MAX_WATER_BATCH_WORK);
+        let (_, layout, quote) = self
+            .map()
+            .prepare_surface_lot(draft, &mut budget.remaining)?;
+        WorldCommand::check_parking_facility(self, &layout, &mut budget)?;
+        Ok((
+            quote,
+            WorldCommand::affordable_cost(self, Some(draft.cost()))?,
+        ))
+    }
 }

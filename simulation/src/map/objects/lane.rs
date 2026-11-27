@@ -85,6 +85,8 @@ pub struct LanePattern {
     pub lanes_forward: Vec<(LaneKind, f32)>,
     #[serde(deserialize_with = "decode_lane_pattern_side")]
     pub lanes_backward: Vec<(LaneKind, f32)>,
+    #[serde(default)]
+    pub local_one_way: bool,
 }
 
 fn decode_lane_pattern_side<'de, D: serde::Deserializer<'de>>(
@@ -93,7 +95,57 @@ fn decode_lane_pattern_side<'de, D: serde::Deserializer<'de>>(
     crate::world_command::bounded_command_vec::<_, _, 32>(deserializer)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SmallRoadPreset {
+    WalkingPath,
+    LocalOneWay { curb_parking: bool },
+}
+
+impl SmallRoadPreset {
+    pub fn lane_pattern(self) -> LanePattern {
+        match self {
+            Self::WalkingPath => LanePattern {
+                lanes_forward: vec![(LaneKind::Walking, 1.4)],
+                lanes_backward: Vec::new(),
+                local_one_way: false,
+            },
+            Self::LocalOneWay { curb_parking } => {
+                let mut pattern = LanePatternBuilder::local_one_way(curb_parking).build();
+                pattern.local_one_way = true;
+                pattern
+            }
+        }
+    }
+}
+
 impl LanePattern {
+    pub(super) fn has_local_one_way_layout(&self) -> bool {
+        let is_driving_side = |side: &[(LaneKind, f32)]| {
+            matches!(
+                side,
+                [(LaneKind::Driving, _), (LaneKind::Walking, _)]
+                    | [
+                        (LaneKind::Driving, _),
+                        (LaneKind::Parking, _),
+                        (LaneKind::Walking, _)
+                    ]
+            )
+        };
+        let is_walk_side = |side: &[(LaneKind, f32)]| matches!(side, [(LaneKind::Walking, _)]);
+        (is_driving_side(&self.lanes_forward) && is_walk_side(&self.lanes_backward))
+            || (is_walk_side(&self.lanes_forward) && is_driving_side(&self.lanes_backward))
+    }
+
+    pub(crate) fn is_walking_only(&self) -> bool {
+        let mut lanes = self.lanes().peekable();
+        lanes.peek().is_some() && lanes.all(|(kind, _, _)| kind == LaneKind::Walking)
+    }
+
+    pub(crate) fn is_walking_path(&self) -> bool {
+        matches!(self.lanes_forward.as_slice(), [(LaneKind::Walking, _)])
+            && self.lanes_backward.is_empty()
+    }
+
     pub fn lanes(&self) -> impl Iterator<Item = (LaneKind, LaneDirection, f32)> + '_ {
         self.lanes_forward
             .iter()
@@ -139,6 +191,13 @@ impl LanePatternBuilder {
             one_way: false,
             rail: false,
         }
+    }
+
+    pub const fn local_one_way(curb_parking: bool) -> Self {
+        Self::new()
+            .one_way(true)
+            .parking(curb_parking)
+            .speed_limit(7.0)
     }
 
     pub const fn n_lanes(mut self, n_lanes: u32) -> Self {
@@ -230,6 +289,7 @@ impl LanePatternBuilder {
                 .map(|x| (x, self.speed_limit))
                 .collect(),
             lanes_forward: forward.into_iter().map(|x| (x, self.speed_limit)).collect(),
+            local_one_way: false,
         }
     }
 }

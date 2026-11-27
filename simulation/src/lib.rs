@@ -7,7 +7,7 @@ use crate::map::{
     BuildingKind, LotLayout, Map, WaterBasin, WaterBodyId, WaterEdit, WaterEditError,
     WaterEditOutcome, WaterEditPreview, WaterStroke,
 };
-use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
+use crate::map_dynamic::{transit, Itinerary, ItineraryLeader, ParkingManagement};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
@@ -132,16 +132,39 @@ const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
+#[cfg(test)]
 const PRE_FIRE_VERSION: &str = "0.12.0";
 const PRE_FLEET_VERSION: &str = "0.13.0";
 const STOCK_PRE_FIRE_REGISTRY: u64 = 0x3043_cb34_6553_1b7d;
 const STOCK_PRE_SCALE_REGISTRY: u64 = 0x72b8_f131_c320_71d4;
 const VERSION: &str = include_str!("../../VERSION");
+const PRE_PROPERTY_PARKING_VERSION: &str = "0.12.0+pathpark.1";
+const PROPERTY_PARKING_VERSION: &str = "0.12.0+pathpark.2";
+const SURFACE_LOT_SNAPSHOT_VERSION: &str = "0.12.0+pathpark.3";
+const PATHPARK_SNAPSHOT_VERSION: &str = "0.12.0+pathpark.4";
+
+fn has_property_parking(version: &str) -> bool {
+    matches!(
+        version,
+        VERSION | PROPERTY_PARKING_VERSION | SURFACE_LOT_SNAPSHOT_VERSION | PATHPARK_SNAPSHOT_VERSION
+    )
+}
+
+fn pathpark_preview_snapshot(version: &str) -> bool {
+    matches!(
+        version,
+        PRE_PROPERTY_PARKING_VERSION
+            | PROPERTY_PARKING_VERSION
+            | SURFACE_LOT_SNAPSHOT_VERSION
+            | PATHPARK_SNAPSHOT_VERSION
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SnapshotSchema {
     Current,
     P9Wave1,
+    PathPark,
     P7P8,
     P6,
     PreOrigin,
@@ -152,41 +175,76 @@ impl SnapshotSchema {
     fn for_version(version: &str) -> Option<Self> {
         Some(match version {
             VERSION => Self::Current,
-            PRE_FLEET_VERSION => Self::P9Wave1,
-            PRE_FIRE_VERSION => Self::P7P8,
             PRE_P7_VERSION => Self::P6,
             PRE_ORIGIN_VERSION => Self::PreOrigin,
             PRE_SCALE_VERSION => Self::PreScale,
+            version if pathpark_preview_snapshot(version) => Self::PathPark,
+            version if ["0.12.", "0.13."].iter().any(|prefix| {
+                version.strip_prefix(prefix).is_some_and(|patch| {
+                    !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            }) => Self::P7P8,
             _ => return None,
         })
     }
 
+    fn for_registry(version: &str, fingerprint: Option<u64>) -> Result<Self, SaveLoadError> {
+        let schema = Self::for_version(version).ok_or_else(|| SaveLoadError::Incompatible {
+            version: version.to_owned(),
+        })?;
+        // The unreleased P9 Wave 1 build shared the v0.13.0 version string.
+        let schema = if version == PRE_FLEET_VERSION
+            && Self::P9Wave1.check_registry(fingerprint).is_ok()
+        {
+            Self::P9Wave1
+        } else {
+            schema
+        };
+        schema.check_registry(fingerprint)?;
+        Ok(schema)
+    }
+
     fn registry(self) -> Result<u64, SaveLoadError> {
         let installed = prototypes::try_prototypes().ok_or(SaveLoadError::PrototypeRegistry)?;
-        if matches!(self, Self::Current | Self::P9Wave1) {
-            return Ok(installed.fingerprint());
-        }
         let projection = installed.pre_fire_fingerprint();
-        let pre_scale_stock = self == Self::PreScale && projection == STOCK_PRE_SCALE_REGISTRY;
-        if projection != STOCK_PRE_FIRE_REGISTRY && !pre_scale_stock {
-            return Err(SaveLoadError::PrototypeRegistry);
+        match self {
+            Self::Current => Ok(installed.fingerprint()),
+            Self::P9Wave1 => Ok(installed.pre_parking_fingerprint()),
+            Self::PathPark => Ok(installed.pathpark_fingerprint()),
+            Self::PreScale if matches!(projection, STOCK_PRE_FIRE_REGISTRY | STOCK_PRE_SCALE_REGISTRY) => {
+                Ok(STOCK_PRE_SCALE_REGISTRY)
+            }
+            Self::P7P8 | Self::P6 | Self::PreOrigin if projection == STOCK_PRE_FIRE_REGISTRY => {
+                Ok(STOCK_PRE_FIRE_REGISTRY)
+            }
+            _ => Err(SaveLoadError::PrototypeRegistry),
         }
-        Ok(if self == Self::PreScale { STOCK_PRE_SCALE_REGISTRY } else { STOCK_PRE_FIRE_REGISTRY })
     }
 
     fn check_registry(self, fingerprint: Option<u64>) -> Result<(), SaveLoadError> {
-        if fingerprint == Some(self.registry()?) {
+        if fingerprint == Some(self.registry()?)
+            || (self == Self::PathPark
+                && prototypes::try_prototypes().is_some_and(|installed| {
+                    fingerprint == Some(installed.pre_fire_fingerprint())
+                }))
+        {
             Ok(())
         } else {
             Err(SaveLoadError::PrototypeRegistry)
         }
     }
 
-    fn accepts_legacy_replay(self, version: &str) -> bool {
+    fn accepts_legacy_replay(self, version: &str, snapshot_version: &str) -> bool {
         match self {
             Self::Current => false,
             Self::P9Wave1 => version == "0.13.0+commands.3",
-            Self::P7P8 => version == "0.12.0+commands.2",
+            Self::PathPark => version == match snapshot_version {
+                PRE_PROPERTY_PARKING_VERSION => "0.12.0+commands.3",
+                PROPERTY_PARKING_VERSION => "0.12.0+commands.4",
+                SURFACE_LOT_SNAPSHOT_VERSION => "0.12.0+commands.5",
+                _ => "0.12.0+commands.6",
+            },
+            Self::P7P8 => version.split_once('+') == Some((snapshot_version, "commands.2")),
             Self::P6 => matches!(version, "0.11.1" | "0.11.1+commands.2"),
             Self::PreOrigin => matches!(version, "0.11.1" | "0.11.1-scale-p1"),
             Self::PreScale => matches!(version, "0.11.0" | "0.11.0+commands.1" | "0.11.0+commands.2"),
@@ -852,8 +910,16 @@ impl Simulation {
     }
 
     pub fn preview_water_edit(&self, edit: &WaterEdit) -> Result<WaterEditPreview, WaterEditError> {
-        self.map()
-            .preview_water_edit(edit, &self.read::<crate::map::ZoneGrid>())
+        let map = self.map();
+        let zones = self.read::<crate::map::ZoneGrid>();
+        let traffic = self.read::<crate::transportation::DrivewayTraffic>();
+        if traffic.is_empty() {
+            return map.preview_water_edit(edit, &zones);
+        }
+        let prepared = map.environment().prepare_water_edit(edit)?;
+        let mut remaining = crate::map::MAX_WATER_BATCH_WORK;
+        traffic.guard_water(&prepared, &mut remaining)?;
+        map.preview_prepared_water(&prepared, &zones)
     }
 
     pub fn carve_river(
@@ -915,7 +981,11 @@ impl Simulation {
             && commands.iter().any(|command| {
                 matches!(
                     command,
-                    WorldCommand::MapUpgradeRoad { .. } | WorldCommand::MapSetJunctionRules { .. }
+                    WorldCommand::MapUpgradeRoad { .. }
+                        | WorldCommand::MapSetJunctionRules { .. }
+                        | WorldCommand::MapMakeWalkingPath { .. }
+                        | WorldCommand::MapPlaceParkingGarage { .. }
+                        | WorldCommand::MapPlaceParkingLot { .. }
                 )
             })
         {
@@ -1164,7 +1234,12 @@ impl Simulation {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
-        if enveloped && data._header.version != version {
+        let payload_release = if pathpark_preview_snapshot(&data._header.version) {
+            "0.12.0"
+        } else {
+            &data._header.version
+        };
+        if enveloped && payload_release != version {
             return Err(SaveLoadError::Corrupt {
                 version: Some(version),
                 reason: "snapshot payload version does not match the slot header".into(),
@@ -1498,10 +1573,14 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
-        let schema = SnapshotSchema::for_version(&self.version).ok_or_else(|| SaveLoadError::Incompatible {
-            version: self.version.clone(),
-        })?;
-        schema.check_registry(self.registry)
+        SnapshotSchema::for_registry(&self.version, self.registry).map(|_| ())
+            .or_else(|error| {
+                if self.version == "0.12.0" {
+                    SnapshotSchema::PathPark.check_registry(self.registry)
+                } else {
+                    Err(error)
+                }
+            })
     }
 
     fn check_load_compatibility(&self) -> Result<(), SaveLoadError> {
@@ -2096,9 +2175,6 @@ impl<'de> Deserialize<'de> for Simulation {
 
 impl SimulationDeser {
     fn into_sim(self) -> Result<Simulation, SaveLoadError> {
-        let schema = SnapshotSchema::for_version(&self._header.version).ok_or_else(|| SaveLoadError::Incompatible {
-            version: self._header.version.clone(),
-        })?;
         let t = Instant::now();
         let corrupt = |reason| SaveLoadError::Corrupt {
             version: Some(self._header.version.clone()),
@@ -2110,7 +2186,8 @@ impl SimulationDeser {
             .map(|bytes| Bincode::decode(bytes))
             .transpose()
             .map_err(|error| corrupt(error.to_string()))?;
-        schema.check_registry(registry)?;
+        let version = self._header.version.as_str();
+        let schema = SnapshotSchema::for_registry(version, registry)?;
         let has_incidents = matches!(schema, SnapshotSchema::Current | SnapshotSchema::P9Wave1);
         for (resource, required) in [
             ("service_incidents", has_incidents),
@@ -2133,6 +2210,7 @@ impl SimulationDeser {
             }
         }
 
+        let requires_driveways = schema == SnapshotSchema::Current || pathpark_preview_snapshot(version);
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
                 if schema != SnapshotSchema::Current {
@@ -2148,7 +2226,7 @@ impl SimulationDeser {
                         ReplayJson::RESOURCE_NAME => {
                             let data = self.res.get(l.name)
                                 .ok_or_else(|| corrupt("Missing resource replay".into()))?;
-                            let replay = ReplayJson::decode_legacy_snapshot(data, schema)?;
+                            let replay = ReplayJson::decode_legacy_snapshot(data, schema, version)?;
                             sim.insert(replay);
                             continue;
                         }
@@ -2156,21 +2234,55 @@ impl SimulationDeser {
                     }
                 }
                 let Some(data) = self.res.get(l.name) else {
-                    if l.optional {
+                    let required = (requires_driveways && l.name == "driveway_traffic")
+                        || (has_property_parking(&self._header.version)
+                            && l.name == "property_parking")
+                        || (matches!(
+                            self._header.version.as_str(),
+                            VERSION | PATHPARK_SNAPSHOT_VERSION | SURFACE_LOT_SNAPSHOT_VERSION
+                        ) && l.name == "surface_lots");
+                    if l.optional && !required {
                         continue;
                     }
                     return Err(corrupt(format!("Missing resource {}", l.name)));
                 };
+                if l.name == "property_parking" && !has_property_parking(&self._header.version) {
+                    use crate::map::building_parking::BuildingParking;
+                    let empty = Bincode::encode(&BuildingParking::default())
+                        .map_err(|error| corrupt(error.to_string()))?;
+                    if data != &empty {
+                        return Err(corrupt("unexpected property parking resource".into()));
+                    }
+                    continue;
+                }
+                if l.name == "driveway_traffic" && !requires_driveways {
+                    // Pre-PathPark snapshots omit this entry. The experimental
+                    // proof also wrote an empty u64/count pair on stock maps.
+                    use crate::transportation::DrivewayTraffic;
+                    let empty_legacy =
+                        Bincode::decode::<(u64, usize)>(data).is_ok_and(|(_, count)| count == 0);
+                    let empty_current = Bincode::decode::<(DrivewayTraffic, Option<(u64, u64)>)>(
+                        data,
+                    )
+                    .is_ok_and(|(traffic, revision)| traffic.is_empty() && revision.is_none());
+                    if !empty_legacy && !empty_current {
+                        return Err(corrupt("unsupported legacy driveway records".into()));
+                    }
+                    continue;
+                }
                 (l.load)(&mut sim, data)
                     .map_err(|error| corrupt(format!("Could not decode resource {}: {error}", l.name)))?;
             }
         }
 
+        if !self.res.contains_key("surface_lots") {
+            sim.map_mut().restore_legacy_parking_lot_ids();
+        }
         let options = *sim.read::<SimulationOptions>();
         let origin: MapOrigin = match self.res.get("map_origin") {
             Some(bytes) => Bincode::decode(bytes)
                 .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if has_incidents || matches!(schema, SnapshotSchema::P7P8 | SnapshotSchema::P6) => {
+            None if !matches!(schema, SnapshotSchema::PreOrigin | SnapshotSchema::PreScale) => {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2226,6 +2338,33 @@ impl SimulationDeser {
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.map_mut().migrated_roundabout_paths.clear();
         sim.write::<transit::Transit>().rebuild_berth_index();
+        let mut surface_work = 16 * map::MAX_WATER_BATCH_WORK;
+        sim.read::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .restore_surface_footprints(&mut sim.map_mut(), &mut surface_work)
+            .map_err(|reason| corrupt(reason.to_owned()))?;
+        sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .restore(
+                &sim.map(),
+                sim.world(),
+                &sim.read::<crate::transportation::TransportGrid>(),
+                &mut sim.write::<ParkingManagement>(),
+                &mut surface_work,
+            )
+            .map_err(|reason| corrupt(reason.into_owned()))?;
+        sim.read::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .restore_surface_geometry(&mut sim.map_mut(), &mut surface_work)
+            .map_err(|reason| corrupt(reason.to_owned()))?;
+        sim.read::<crate::transportation::DrivewayTraffic>()
+            .validate_loaded(
+                &sim.map(),
+                sim.world(),
+                &sim.read::<crate::transportation::TransportGrid>(),
+                elapsed,
+            )
+            .map_err(|reason| corrupt(reason.to_owned()))?;
         if sim
             .map()
             .lane_scoring_pilot()

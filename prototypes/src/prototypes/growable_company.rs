@@ -1,6 +1,6 @@
 use crate::{
     get_lua, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, GrowableChainKey,
-    GrowableCompanyID, GrowableMassing, GrowableZoneKind, Prototype, MAX_PROFILED_SLOTS,
+    GrowableCompanyID, GrowableMassing, GrowableParking, GrowableZoneKind, Prototype, MAX_PROFILED_SLOTS,
 };
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
@@ -86,10 +86,30 @@ pub struct GrowableCompanyPrototype {
     pub lot_size_min: f32,
     pub growable: bool,
     pub massing: Option<GrowableMassing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parking: Option<GrowableParking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parking_by_level: Option<[Option<GrowableParking>; 4]>,
     mixed_use: bool,
 }
 
 impl GrowableCompanyPrototype {
+    pub fn parking_at_level(&self, level: u8) -> Option<GrowableParking> {
+        if level == self.level {
+            return self.parking;
+        }
+        level
+            .checked_sub(2)
+            .and_then(|index| {
+                self.parking_by_level
+                    .as_ref()?
+                    .get(usize::from(index))
+                    .copied()
+                    .flatten()
+            })
+            .or(self.parking)
+    }
+
     pub fn chain_key(&self) -> GrowableChainKey {
         GrowableChainKey {
             zone_kind: if self.mixed_use {
@@ -130,6 +150,36 @@ impl Prototype for GrowableCompanyPrototype {
                 validate_profile_recipe_lua(&recipe)?;
             }
         }
+        let parking = get_lua::<Option<GrowableParking>>(table, "parking")?;
+        let parking_by_level = get_lua::<Option<Table>>(table, "parking_by_level")?
+            .map(|levels| {
+                let mut ordered = [None; 4];
+                for pair in levels.pairs::<Value, GrowableParking>() {
+                    let (tier, spec) = pair?;
+                    let level = profile_integer(tier, 5, "parking_by_level key")?;
+                    let index = level.checked_sub(2).ok_or_else(|| {
+                        mlua::Error::external("parking_by_level starts at level 2")
+                    })? as usize;
+                    ordered[index] = Some(spec);
+                }
+                Ok::<_, mlua::Error>(ordered)
+            })
+            .transpose()?;
+        let growable = get_lua::<bool>(table, "growable")?;
+        for parking in parking
+            .into_iter()
+            .chain(parking_by_level.into_iter().flatten().flatten())
+        {
+            if !growable
+                || kind == GrowableZoneKind::MixedUse
+                || matches!(parking, GrowableParking::Surface(_))
+                    && kind != GrowableZoneKind::Pure(ZoneKind::Commercial)
+            {
+                return Err(mlua::Error::external(
+                    "parking declaration is not supported for this growable company role",
+                ));
+            }
+        }
         let base = GoodsCompanyPrototype::from_lua(table)?;
         Ok(Self {
             id: Self::ID::new(&base.name),
@@ -141,8 +191,10 @@ impl Prototype for GrowableCompanyPrototype {
             density: get_lua(table, "density")?,
             level,
             lot_size_min: get_lua(table, "lot_size_min")?,
-            growable: get_lua(table, "growable")?,
+            growable,
             massing,
+            parking,
+            parking_by_level,
             mixed_use: kind == GrowableZoneKind::MixedUse,
         })
     }

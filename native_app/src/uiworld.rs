@@ -168,6 +168,7 @@ pub struct ReceivedCommands {
     placements: Vec<PlacementResult>,
     pub tile_purchases: Vec<TilePurchaseReceipt>,
     pub(crate) traffic_edits: Vec<crate::gui::traffic_repair::TrafficEditReceipt>,
+    pub(crate) lot_placements: Vec<crate::network::LotPlacementReceipt>,
     pub(crate) rejections: Vec<(u64, Vec<(usize, &'static str, Rejection)>)>,
 }
 
@@ -198,7 +199,11 @@ impl ReceivedCommands {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, input)| {
-                        if !matches!(input, WorldCommand::MapBuildSpecialBuilding { .. }) {
+                        if !matches!(
+                            input,
+                            WorldCommand::MapBuildSpecialBuilding { .. }
+                                | WorldCommand::MapPlaceParkingLot { .. }
+                        ) {
                             return None;
                         }
                         let outcome = if batch.accepted_indices.contains(&index) {

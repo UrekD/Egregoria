@@ -133,7 +133,7 @@ fn check_scaled_showcase_food(
     Ok(())
 }
 
-fn publish(sim: &Simulation, root: &Path, id: &str, name: &str) -> Result<(), String> {
+pub(super) fn publish(sim: &Simulation, root: &Path, id: &str, name: &str) -> Result<(), String> {
     let id = SlotId::new(id).map_err(|error| error.to_string())?;
     // Give identical simulated states identical snapshot headers. The slot API
     // still records the current publication time in the metadata sidecar.

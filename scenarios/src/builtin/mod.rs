@@ -4,6 +4,7 @@ pub mod determinism;
 mod economy_loop;
 mod fire;
 pub mod growth_basic;
+pub mod pathpark;
 pub mod perf;
 pub mod services_basic;
 pub mod services_neglect;
@@ -46,6 +47,10 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     fire::RUINS,
     fire::RESUME,
     growth_basic::SCENARIO,
+    pathpark::BASIC,
+    pathpark::PRESSURE,
+    pathpark::EDITS,
+    pathpark::GROWABLES,
     services_basic::SCENARIO,
     services_neglect::SCENARIO,
     transit_basic::SCENARIO,

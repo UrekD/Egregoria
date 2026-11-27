@@ -256,6 +256,10 @@ fn removal_candidate(sim: &Simulation, target: ProjectKind) -> Option<WorldComma
         ProjectKind::Intersection(id) => WorldCommand::MapRemoveIntersection(id),
         ProjectKind::Road(id) => WorldCommand::MapRemoveRoad(id),
         ProjectKind::Building(site) => {
+            let kind = sim.map().get(site)?.kind;
+            if matches!(kind, BuildingKind::ParkingGarage(_) | BuildingKind::ParkingLot { .. }) {
+                return Some(WorldCommand::MapRemoveBuilding(site));
+            }
             let preview = demolition_quote(sim, site).ok()?;
             if preview.original_kind == BuildingKind::ExternalTrading
                 || demolition_status(sim, site).is_some_and(|status| status.quote.is_some())
@@ -449,7 +453,8 @@ impl DemolitionPreview {
                     .extend(map.intersections()[id].roads.iter().copied());
                 self.junctions.insert(id)
             }
-            WorldCommand::MapStartDemolition { site, .. } => self.buildings.insert(site),
+            WorldCommand::MapRemoveBuilding(site)
+            | WorldCommand::MapStartDemolition { site, .. } => self.buildings.insert(site),
             _ => false,
         };
         if added {

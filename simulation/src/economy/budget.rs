@@ -289,16 +289,28 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
         .map(|road| f64::from(road.length()) * road.n_lanes() as f64)
         .sum();
     let road_upkeep = Money::from_float_bucks(lane_metres * ROAD_UPKEEP_PER_LANE_KM_DAY / 1000.0);
+    let parking = resources.read::<crate::transportation::DrivewayTraffic>();
     let special_building_value: i128 = map
         .buildings()
         .values()
-        .filter(|building| match building.kind {
-            BuildingKind::GoodsCompany(id) => !id.is_service() && !id.is_growable(),
-            BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => true,
-            BuildingKind::House | BuildingKind::ExternalTrading | BuildingKind::SiteRemnant => false,
+        .filter_map(|building| match building.kind {
+            BuildingKind::ParkingGarage(kind) => {
+                Some(i128::from(kind.daily_upkeep().inner()) * SPECIAL_BUILDING_UPKEEP_DIVISOR)
+            }
+            BuildingKind::ParkingLot { .. } => parking
+                .properties
+                .daily_upkeep(building.id)
+                .map(|cost| i128::from(cost.inner()) * SPECIAL_BUILDING_UPKEEP_DIVISOR),
+            BuildingKind::GoodsCompany(id) if !id.is_service() && !id.is_growable() => {
+                Government::special_building_price(building.kind)
+                    .map(|price| i128::from(price.inner()))
+            }
+            BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => {
+                Government::special_building_price(building.kind)
+                    .map(|price| i128::from(price.inner()))
+            }
+            _ => None,
         })
-        .filter_map(|building| Government::special_building_price(building.kind))
-        .map(|price| i128::from(price.inner()))
         .sum();
     let service_upkeep: i128 = map
         .buildings()

@@ -179,17 +179,43 @@ impl Intersection {
 
     const MIN_INTERFACE: f32 = 9.0;
     pub fn update_interface_radius(&mut self, roads: &mut Roads) {
+        let arms = crate::map::turn_policy::non_path_arms(&self.roads, roads);
+        let motor_junction = !arms.is_empty();
+        let arms = if motor_junction { &*arms } else { &self.roads };
+        self.update_arm_interfaces(roads, arms, motor_junction);
+        for &id in &self.roads {
+            if !motor_junction || !roads[id].is_walking_path() {
+                continue;
+            }
+            let path = &roads[id];
+            let direction = path.dir_from(self.id);
+            let trim = arms
+                .iter()
+                .map(|&arm| {
+                    let road = &roads[arm];
+                    let lateral = road.dir_from(self.id).perpendicular().dot(direction).abs();
+                    (road.width * 0.5 + 0.25) / lateral.max(0.35)
+                })
+                .fold(1.0, f32::max);
+            roads[id].set_interface(self.id, trim);
+        }
+        if arms.len() != self.roads.len() || self.roads.len() > 2 || self.turn_policy.roundabout.is_some() {
+            self.update_radius(roads);
+        }
+    }
+
+    fn update_arm_interfaces(&self, roads: &mut Roads, arms: &[RoadID], motor_junction: bool) {
         let roundabout = self
             .turn_policy
             .roundabout
-            .filter(|policy| policy.radius >= 4.0 && !self.has_rail_arm(roads));
-        self.set_interfaces(roads, false);
-        let Some(roundabout) = roundabout.filter(|_| self.roads.len() >= 2) else {
+            .filter(|policy| motor_junction && policy.radius >= 4.0 && !self.has_rail_arm(roads));
+        self.set_interfaces(roads, arms, false);
+        let Some(roundabout) = roundabout.filter(|_| arms.len() >= 2) else {
             return;
         };
         // Leave space for the longest vehicle admitted by the junction. A road
         // that cannot accommodate a ring retains its ordinary junction setback.
-        if self.roads.iter().any(|&id| {
+        if arms.iter().any(|&id| {
             let road = &roads[id];
             road.length()
                 - road.interface_from(road.other_end(self.id).unwrap())
@@ -198,10 +224,10 @@ impl Intersection {
         }) {
             return;
         }
-        self.set_interfaces(roads, true);
+        self.set_interfaces(roads, arms, true);
         // Give neighboring mouth edges separate angular sectors. The ordinary
         // junction setback only clears the deck centerlines at shallow angles.
-        for (&a, &b) in self.roads.iter().zip(self.roads.iter().cycle().skip(1)) {
+        for (&a, &b) in arms.iter().zip(arms.iter().cycle().skip(1)) {
             let a_road = &roads[a];
             let b_road = &roads[b];
             let gap = a_road
@@ -214,7 +240,7 @@ impl Intersection {
                 roads[b].max_interface(self.id, setback);
             }
         }
-        for &id in &self.roads {
+        for &id in arms {
             let road = &mut roads[id];
             let approach = road
                 .interface_from(self.id)
@@ -225,12 +251,12 @@ impl Intersection {
                 approach.min(road.length() - other - (roundabout_exit_storage() + 0.05)),
             );
         }
-        self.update_radius(roads);
     }
 
-    fn set_interfaces(&mut self, roads: &mut Roads, roundabout: bool) {
+    fn set_interfaces(&self, roads: &mut Roads, arms: &[RoadID], roundabout: bool) {
         let id = self.id;
-        match *self.roads {
+        let position = self.pos;
+        match *arms {
             [] => return,
             [r1_id] => {
                 let r = &mut roads[r1_id];
@@ -250,7 +276,7 @@ impl Intersection {
                 }
 
                 let ray1 = Ray::new(
-                    self.pos.xy()
+                    position.xy()
                         + dir1.perpendicular()
                             * dir1.perpendicular().dot(elbow).signum()
                             * r1w
@@ -258,7 +284,7 @@ impl Intersection {
                     dir1,
                 );
                 let ray2 = Ray::new(
-                    self.pos.xy()
+                    position.xy()
                         + dir2.perpendicular()
                             * dir2.perpendicular().dot(elbow).signum()
                             * r2w
@@ -279,20 +305,20 @@ impl Intersection {
             _ => {}
         }
 
-        for &r in &self.roads {
+        for &r in arms {
             let r = &mut roads[r];
             r.set_interface(id, Self::empty_interface(r.width));
         }
 
-        for i in 0..self.roads.len() {
-            let r1_id = self.roads[i];
-            let r2_id = self.roads[(i + 1) % self.roads.len()];
+        for i in 0..arms.len() {
+            let r1_id = arms[i];
+            let r2_id = arms[(i + 1) % arms.len()];
 
             let (r1, r2) = (&roads[r1_id], &roads[r2_id]);
             let (dir1, dir2) = (r1.dir_from(id), r2.dir_from(id));
 
             let min_dist = if dir1.angle(dir2).abs() < 0.17453292 {
-                self.interface_calc_numerically(r1.width, r2.width, r1, r2)
+                Self::interface_calc_numerically(id, position, r1.width, r2.width, r1, r2)
             } else {
                 Self::interface_calc_formula(r1.width, r2.width, dir1, dir2)
             };
@@ -300,8 +326,6 @@ impl Intersection {
             roads[r1_id].max_interface(id, min_dist);
             roads[r2_id].max_interface(id, min_dist);
         }
-
-        self.update_radius(roads);
     }
 
     fn interface_calc_formula(w1: f32, w2: f32, dir1: Vec2, dir2: Vec2) -> f32 {
@@ -316,7 +340,14 @@ impl Intersection {
         (w * 1.1 / sin).min(50.0)
     }
 
-    fn interface_calc_numerically(&self, w1: f32, w2: f32, r1: &Road, r2: &Road) -> f32 {
+    fn interface_calc_numerically(
+        id: IntersectionID,
+        position: Vec3,
+        w1: f32,
+        w2: f32,
+        r1: &Road,
+        r2: &Road,
+    ) -> f32 {
         let w: f32 = (w1 + w2) * 0.80;
 
         let mut points1: Vec<(Vec3, Vec3)> = r1
@@ -328,10 +359,10 @@ impl Intersection {
             .points_dirs_along((1..r2.points().length() as i32).map(|d| d as f32))
             .collect();
 
-        if r1.src != self.id {
+        if r1.src != id {
             points1.reverse();
         }
-        if r2.src != self.id {
+        if r2.src != id {
             points2.reverse();
         }
 
@@ -340,7 +371,7 @@ impl Intersection {
             .zip(points2)
             .map(|((p1, _), (p2, _))| (p1.xy(), p2.xy()))
             .find(|p| p.0.distance(p.1) > w)
-            .map(|p| (self.pos.xy().distance(p.0) + self.pos.xy().distance(p.0)) * 0.5)
+            .map(|p| (position.xy().distance(p.0) + position.xy().distance(p.0)) * 0.5)
             .unwrap_or(50.0)
     }
 
@@ -467,6 +498,14 @@ impl Intersection {
                 None
             }
         })
+    }
+
+    pub(crate) fn next_turn(&self, after: Option<TurnID>) -> Option<&Turn> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let turns = self.legal_turns.as_ref().unwrap_or(&self.turns);
+        turns
+            .range::<TurnID, _>((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
     }
 
     pub fn turns(&self) -> impl ExactSizeIterator<Item = &Turn> {

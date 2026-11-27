@@ -26,6 +26,10 @@ impl Government {
 
     pub(crate) fn checked_action_cost(action: &WorldCommand, sim: &Simulation) -> Option<Money> {
         match action {
+            WorldCommand::MapMakeWalkingPath { .. } => {
+                action.preview(sim).ok().map(|quote| quote.cost)
+            }
+            WorldCommand::MapPlaceParkingLot { draft, .. } => Some(draft.cost()),
             WorldCommand::MapBuildHouse(_) => Self::checked_bucks(100),
             WorldCommand::SpawnTrain { wagons, .. } => {
                 let count = i64::try_from(wagons.len()).ok()?;

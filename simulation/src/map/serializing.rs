@@ -244,7 +244,7 @@ impl SerializedMap {
                 if self
                     .roads
                     .get(road)
-                    .is_none_or(|r| !r.connected_buildings.contains(&id))
+                    .is_none_or(|r| r.is_walking_path() || !r.connected_buildings.contains(&id))
                 {
                     return Err(format!("building {id:?} has an invalid road {road:?}"));
                 }
@@ -372,7 +372,13 @@ impl SerializedMap {
         for (id, lot) in self.lots.iter() {
             lots_by_road.entry(lot.parent).or_default().insert(id);
         }
+        let surface_lot_count = self
+            .buildings
+            .values()
+            .filter(|building| matches!(building.kind, crate::map::BuildingKind::ParkingLot { .. }))
+            .count();
         let mut m = Map {
+            surface_lot_count,
             roads: self.roads,
             lanes: self.lanes,
             intersections: self.intersections,

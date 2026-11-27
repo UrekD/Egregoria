@@ -22,6 +22,7 @@ pub struct ParkingManagement {
     service_spots: BTreeMap<ParkingSpotID, ServiceCurbOwner>,
     #[serde(skip)]
     tagged: bool,
+    masked_spots: BTreeMap<ParkingSpotID, u32>,
     #[serde(skip)]
     pub(crate) reroute_failures: RerouteFailures,
     #[serde(skip)]
@@ -89,6 +90,14 @@ impl ParkingManagement {
     }
 
     pub fn is_spot_free(&self, spot: ParkingSpotID) -> bool {
+        self.is_unreserved(spot) && !self.is_masked(spot)
+    }
+
+    pub(crate) fn is_masked(&self, spot: ParkingSpotID) -> bool {
+        self.masked_spots.contains_key(&spot)
+    }
+
+    pub(crate) fn is_unreserved(&self, spot: ParkingSpotID) -> bool {
         !self.reserved_spots.contains(&spot) && !self.service_spots.contains_key(&spot)
     }
 
@@ -157,6 +166,125 @@ impl ParkingManagement {
         for spot in spots {
             if self.service_spots.get(spot) == Some(&owner) {
                 self.service_spots.remove(spot);
+            }
+        }
+    }
+
+    pub(crate) fn reserve_exact(&mut self, spot: ParkingSpotID) -> Option<SpotReservation> {
+        (self.is_spot_free(spot) && self.reserved_spots.insert(spot))
+            .then_some(SpotReservation(spot))
+    }
+
+    pub(crate) fn property_curb_candidates(
+        &self,
+        map: &Map,
+        near: Vec3,
+        remaining: &mut usize,
+    ) -> (Vec<ParkingSpotID>, Vec<ParkingSpotID>) {
+        use ordered_float::OrderedFloat;
+        if *remaining == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let radius = 400.0_f32;
+        let mut lanes = Vec::new();
+        let mut inspections = 48;
+        let projection_limit = (*remaining).min(192);
+        let mut projection_work = projection_limit;
+        for hit in map
+            .spatial_map()
+            .parking_roads(near.xy(), radius)
+            .take(16)
+        {
+            let Some(left) = projection_work.checked_sub(1) else {
+                break;
+            };
+            projection_work = left;
+            inspections -= 1;
+            let Some(road) = map.get(hit) else { continue };
+            for (lane, kind) in road.lanes_iter() {
+                let Some(left) = projection_work.checked_sub(1) else {
+                    break;
+                };
+                projection_work = left;
+                if kind != LaneKind::Parking {
+                    continue;
+                }
+                if let Some(spots) = map.parking.curb_spots_near(
+                    &map.lanes()[lane],
+                    near,
+                    &mut projection_work,
+                ) {
+                    lanes.push(spots);
+                }
+            }
+        }
+        *remaining -= projection_limit - projection_work;
+        // Interleave lanes so a full stretch of curb cannot consume the whole
+        // inspection allowance before a different street is even considered.
+        let mut curb = Vec::new();
+        let mut street = Vec::new();
+        while inspections > 0 && *remaining > 0 && !lanes.is_empty() {
+            lanes.retain_mut(|spots| {
+                if inspections == 0 || *remaining == 0 {
+                    return false;
+                }
+                let Some(spot) = spots.next() else {
+                    return false;
+                };
+                inspections -= 1;
+                *remaining -= 1;
+                let bay = map.parking.get(spot).unwrap();
+                let distance = bay.trans.pos.distance2(near);
+                if distance <= radius.powi(2)
+                    && (bay.trans.pos.z - near.z).abs() < 4.0
+                    && self.is_spot_free(spot)
+                {
+                    let candidates = if distance <= NEAR_PARKING_RADIUS.powi(2) {
+                        &mut curb
+                    } else {
+                        &mut street
+                    };
+                    candidates.push((OrderedFloat(distance), spot, bay.parent));
+                }
+                true
+            });
+        }
+        let ranked = |mut candidates: Vec<_>| {
+            const LIMIT: usize = 8;
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut lanes = BTreeSet::new();
+            let mut first = Vec::new();
+            let mut rest = Vec::new();
+            for (_, spot, lane) in candidates {
+                // A run of bays on an unreachable approach must not crowd out
+                // the other direction before the feasibility checks begin.
+                if lanes.insert(lane) {
+                    first.push(spot);
+                    if first.len() == LIMIT {
+                        break;
+                    }
+                } else {
+                    rest.push(spot);
+                }
+            }
+            first.extend(rest.into_iter().take(LIMIT - first.len()));
+            first
+        };
+        (ranked(curb), ranked(street))
+    }
+
+    pub(crate) fn mask(&mut self, spot: ParkingSpotID) {
+        *self.masked_spots.entry(spot).or_default() += 1;
+    }
+
+    pub(crate) fn unmask(&mut self, spot: ParkingSpotID) {
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.masked_spots.entry(spot)
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
             }
         }
     }
@@ -263,7 +391,7 @@ impl ParkingManagement {
                             map.parking
                                 .get(spot)
                                 .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
-                        }) && !self.service_spots.contains_key(&spot) && self.reserved_spots.insert(spot)
+                        }) && self.is_spot_free(spot) && self.reserved_spots.insert(spot)
                         {
                             if let Some(stats) = observation {
                                 if lane.parent != start_road {

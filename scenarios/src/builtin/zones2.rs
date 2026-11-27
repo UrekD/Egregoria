@@ -520,6 +520,10 @@ fn remove_pure_site(sim: &mut Simulation, kind: ZoneKind, surplus: f64) -> Resul
                 if site.zone.kind != kind || site.site != GrowableSiteState::Active {
                     return None;
                 }
+                // A matched control can retire a different site of the same capacity.
+                if sim.building_parking(id).is_some_and(|parking| parking.occupied != 0 || parking.held != 0) {
+                    return None;
+                }
                 let (slots, users) = if kind == Residential {
                     (site.housing_slots, site.occupants)
                 } else {
@@ -721,9 +725,92 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 }
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
+    // Give property users time to drive out before the staffed frontage cut.
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 18 * TICKS_PER_HOUR)?;
+    let close = frontage_closures(&live.sim);
+    if !close.is_empty() {
+        prepare_draining_parking(live)?;
+        run_teardown_batch(live, &close, 1)?;
+    }
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
+    let close = frontage_closures(&live.sim);
+    if !close.is_empty() {
+        run_teardown_batch(live, &close, 1)?;
+    }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
-    stage_teardown_hires(live)?;
-    let (roads, affected) = staffed_teardown_frontage(&live.sim)?;
+    let mut next_stage = elapsed(&live.sim);
+    let staging_deadline = next_stage + TICKS_PER_DAY;
+    let mut staged = 0;
+    let (roads, affected) = loop {
+        let missing = match staffed_teardown_frontage(&live.sim) {
+            Ok(frontage) => break frontage,
+            Err(missing) => missing,
+        };
+        let now = elapsed(&live.sim);
+        if now >= staging_deadline {
+            let roads = {
+                let map = live.sim.map();
+                mixed_sellers(&live.sim)
+                    .filter_map(|seller| {
+                        let SoulID::GoodsCompany(company) = seller else {
+                            return None;
+                        };
+                        let id = live.sim.world().companies[company].comp.building;
+                        map.get(id)?.connected_road
+                    })
+                    .collect::<BTreeSet<_>>()
+            };
+            let blocked: Vec<_> = roads
+                .iter()
+                .filter_map(|&road| {
+                    WorldCommand::MapRemoveRoad(road)
+                        .validate_and_price(&live.sim)
+                        .err()
+                        .map(|error| (road, error))
+                })
+                .collect();
+            let adjacent_roads: BTreeSet<_> = {
+                let map = live.sim.map();
+                frontage_and_adjacent(&map, blocked.iter().map(|&(road, _)| road))
+            };
+            let claims: Vec<_> = live
+                .sim
+                .map()
+                .buildings()
+                .keys()
+                .filter_map(|id| {
+                    let parking = live.sim.building_parking(id)?;
+                    (adjacent_roads.contains(&parking.entrance.road)
+                        && (parking.held != 0 || parking.occupied != 0))
+                        .then_some((
+                            id,
+                            parking.entrance.road,
+                            parking.open,
+                            parking.occupied,
+                            parking.held,
+                            parking.missing_owners,
+                        ))
+                })
+                .collect();
+            return Err(format!(
+                "{missing} after {staged} worker housing changes with {}/{} frontage roads removable; blocked roads {blocked:?}; adjacent claims (building, road, open, occupied, held, missing owners) {claims:?}",
+                roads.len() - blocked.len(),
+                roads.len(),
+            ));
+        }
+        if staged < 4 && now >= next_stage {
+            // A match can appear on the same tick as demolition or after the
+            // replacement house submits its first applications.
+            let changed = stage_teardown_hires(live)?;
+            staged += usize::from(changed);
+            next_stage =
+                elapsed(&live.sim) + if changed { TICKS_PER_HOUR } else { TICKS_PER_HOUR / 12 };
+            if changed {
+                continue;
+            }
+        }
+        live.run_ticks(1);
+    };
     let (endpoints, parcels) = {
         let map = live.sim.map();
         let endpoints: Vec<_> = roads
@@ -988,37 +1075,197 @@ fn clear_decline_ruins(
     Ok(())
 }
 
-fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
+fn frontage_closures(sim: &Simulation) -> Vec<WorldCommand> {
+    let map = sim.map();
+    let frontage = map
+        .buildings()
+        .values()
+        .filter(|building| building.is_mixed_use())
+        .filter_map(|building| building.connected_road);
+    let adjacent = frontage_and_adjacent(&map, frontage);
+    map.buildings()
+        .keys()
+        .filter(|&id| {
+            sim.building_parking(id).is_some_and(|parking| {
+                parking.open && adjacent.contains(&parking.entrance.road)
+            })
+        })
+        .map(|building| WorldCommand::SetBuildingParkingOpen {
+            building,
+            open: false,
+        })
+        .collect()
+}
+
+fn frontage_and_adjacent(map: &Map, frontage: impl Iterator<Item = RoadID>) -> BTreeSet<RoadID> {
+    frontage
+        .filter_map(|road| map.get(road))
+        .flat_map(|road| [road.src, road.dst])
+        .flat_map(|joint| map.intersections()[joint].roads.iter().copied())
+        .collect()
+}
+
+fn prepare_draining_parking(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    use simulation::map::building_parking::{parking_entrance_near, GarageKind};
+
+    let (connection, start, direction) = {
+        let map = ctx.sim.map();
+        [
+            (vec2(2.0, 5.0), Vec2::Y),
+            (vec2(3.0, 5.0), Vec2::Y),
+            (vec2(5.0, 3.0), Vec2::X),
+            (vec2(5.0, 4.0), Vec2::X),
+        ]
+        .into_iter()
+        .find_map(|(corner, direction)| {
+            let start = ORIGIN + corner * BLOCK;
+            let from = map.project(start.z(0.0), 0.0, ProjectFilter::INTER);
+            if !matches!(from.kind, ProjectKind::Intersection(_)) {
+                return None;
+            }
+            let to = map.project((start + direction * 480.0).z(0.0), 0.0, ProjectFilter::ALL);
+            let command = WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: LanePatternBuilder::default().build(),
+            };
+            command.validate_and_price(&ctx.sim).ok()?;
+            Some((command, start, direction))
+        })
+        .ok_or("staffed teardown needs a receiving street")?
+    };
+    run_teardown_batch(ctx, &[connection], 1)?;
+    let side = vec2(-direction.y, direction.x);
+    for (kind, side) in [
+        (GarageKind::MultiStorey, side),
+        (GarageKind::Underground, -side),
+    ] {
+        let command = {
+            let map = ctx.sim.map();
+            [70.0, 110.0, 150.0]
+                .into_iter()
+                .filter_map(|distance| {
+                    parking_entrance_near(
+                        &map,
+                        (start + direction * distance + side * 19.0).z(0.0),
+                    )
+                })
+                .map(|entrance| WorldCommand::MapPlaceParkingGarage { kind, entrance })
+                .find(|command| command.validate_and_price(&ctx.sim).is_ok())
+                .ok_or("staffed teardown needs receiving garage capacity")?
+        };
+        run_teardown_batch(ctx, &[command], 1)?;
+    }
+    Ok(())
+}
+
+fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
     // The district's housing is full. Record a demolition that frees storefront
     // jobs while baskets and deliveries are in flight. The next market pass can
     // then match replacement workers before the frontage cut.
     let home = {
         let infos = ctx.sim.read::<BuildingInfos>();
         let map = ctx.sim.map();
-        let mut workers_by_home = BTreeMap::<_, usize>::new();
+        let mut workers_by_home = BTreeMap::<_, (usize, usize, BTreeSet<CompanyID>)>::new();
+        let mut removable = BTreeMap::new();
         for seller in mixed_sellers(&ctx.sim) {
             let SoulID::GoodsCompany(company) = seller else {
                 continue;
             };
-            for &worker in &ctx.sim.world().companies[company].workers.0 {
+            let employer = &ctx.sim.world().companies[company];
+            let Some(road) = map
+                .get(employer.comp.building)
+                .and_then(|site| site.connected_road)
+            else {
+                continue;
+            };
+            let removable_frontage = *removable.entry(road).or_insert_with(|| {
+                WorldCommand::MapRemoveRoad(road)
+                    .validate_and_price(&ctx.sim)
+                    .is_ok()
+            });
+            for &worker in &employer.workers.0 {
                 let home = infos
                     .residence_of(SoulID::Human(worker))
                     .filter(|&home| map.get(home).is_some_and(|site| !site.is_mixed_use()));
                 if let Some(home) = home {
-                    *workers_by_home.entry(home).or_default() += 1;
+                    let (frontage, total, employers) = workers_by_home.entry(home).or_default();
+                    if removable_frontage {
+                        *frontage += 1;
+                        employers.insert(company);
+                    }
+                    *total += 1;
                 }
             }
         }
         workers_by_home
             .into_iter()
-            .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
-            .map(|(home, _)| home)
-            .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
+            .filter(|(home, (frontage, _, _))| {
+                *frontage != 0
+                    && map.lot_origin(*home).is_some()
+                    && simulation::souls::demolition::demolition_quote(&ctx.sim, *home)
+                        .is_ok_and(|preview| WorldCommand::MapStartDemolition {
+                            site: *home,
+                            quote: preview.quote,
+                        }
+                        .validate_and_price(&ctx.sim)
+                        .is_ok())
+            })
+            .min_by_key(|&(home, (frontage, workers, _))| {
+                (std::cmp::Reverse((frontage, workers)), home)
+            })
     };
+    let Some((home, (frontage, workers, employers))) = home else {
+        return Ok(false);
+    };
+    let parcel = *ctx
+        .sim
+        .map()
+        .lot_origin(home)
+        .ok_or("hire staging house has no parcel")?;
     let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, home)
         .map_err(|error| format!("worker housing demolition quote failed: {error:?}"))?
         .quote;
-    run_teardown_batch(ctx, &[WorldCommand::MapStartDemolition { site: home, quote }], 1)
+    run_teardown_batch(ctx, &[WorldCommand::MapStartDemolition { site: home, quote }], 1)?;
+    if staffed_teardown_frontage(&ctx.sim).is_ok() {
+        return Ok(true);
+    }
+
+    // Build a legal house near a vacancy so its residents can apply through
+    // the ordinary employment market.
+    let lot = {
+        let map = ctx.sim.map();
+        let near = employers
+            .iter()
+            .filter_map(|&employer| {
+                let company = ctx.sim.world().companies.get(employer)?;
+                let vacancies =
+                    (company.comp.max_workers as usize).saturating_sub(company.workers.0.len());
+                (vacancies != 0).then_some((std::cmp::Reverse(vacancies), company.comp.building))
+            })
+            .min()
+            .and_then(|(_, id)| map.get(id))
+            .map_or(parcel.shape.center(), |site| site.door_pos.xy());
+        let mut lots: Vec<_> = map.lots().values().collect();
+        lots.sort_unstable_by(|a, b| {
+            let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(near);
+            distance(a).total_cmp(&distance(b)).then(a.id.cmp(&b.id))
+        });
+        lots.into_iter()
+            .find(|lot| {
+                WorldCommand::MapBuildHouse(lot.id)
+                    .validate_and_price(&ctx.sim)
+                    .is_ok()
+            })
+            .ok_or("no legal replacement lot near the demolished worker home")?
+            .id
+    };
+    println!(
+        "staged replacement home from {workers} Mixed Use workers ({frontage} on removable frontage)"
+    );
+    run_teardown_batch(ctx, &[WorldCommand::MapBuildHouse(lot)], 1)?;
+    Ok(true)
 }
 
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {
@@ -1104,6 +1351,9 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
                 .map(|trade| trade.seller.0)
         })
         .collect();
+    if hires.is_empty() {
+        return Err(failure("a pending Mixed Use hire"));
+    }
     let map = sim.map();
     let sites: Vec<_> = mixed_sellers(sim)
         .filter_map(|seller| {
@@ -1114,18 +1364,22 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
             Some((id, company, map.get(id)?.connected_road?))
         })
         .collect();
+    let legal_roads: BTreeSet<_> = sites.iter().map(|&(_, _, road)| road)
+        .collect::<BTreeSet<_>>().into_iter()
+        .filter(|&road| WorldCommand::MapRemoveRoad(road).validate_and_price(sim).is_ok())
+        .collect();
     let job_road = sites
         .iter()
         .find_map(|&(_, company, road)| {
-            hires
-                .contains(&SoulID::GoodsCompany(company))
+            (legal_roads.contains(&road) && hires.contains(&SoulID::GoodsCompany(company)))
                 .then_some(road)
         })
         .ok_or_else(|| failure("a pending Mixed Use hire"))?;
     let cargo = sim.read::<CargoBook>();
     let freight_road = sites
         .iter()
-        .filter(|&&(id, _, _)| cargo.stock_for(id).values().any(|stock| stock.incoming > 0))
+        .filter(|&&(id, _, road)| legal_roads.contains(&road)
+            && cargo.stock_for(id).values().any(|stock| stock.incoming > 0))
         .min_by_key(|&&(_, _, road)| (road != job_road, road))
         .map(|&(_, _, road)| road)
         .ok_or_else(|| failure("an incoming Mixed Use freight claim"))?;
@@ -1137,7 +1391,8 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
         .collect();
     let basket_road = sites
         .iter()
-        .filter(|&&(_, company, _)| baskets.contains(&SoulID::GoodsCompany(company)))
+        .filter(|&&(_, company, road)| legal_roads.contains(&road)
+            && baskets.contains(&SoulID::GoodsCompany(company)))
         .min_by_key(|&&(_, _, road)| (road != job_road && road != freight_road, road))
         .map(|&(_, _, road)| road)
         .ok_or_else(|| failure("a pending Mixed Use basket"))?;
@@ -1889,6 +2144,25 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
         return Err("seller closure changed the controlled housing role".into());
     }
     ctx.reload()?;
+    if ctx.sim.building_parking(storefront).is_some() {
+        run_teardown_batch(
+            ctx,
+            &[WorldCommand::SetBuildingParkingOpen {
+                building: storefront,
+                open: false,
+            }],
+            1,
+        )?;
+        let until = elapsed(&ctx.sim) + 2 * TICKS_PER_HOUR;
+        while ctx.sim.building_parking(storefront).is_some_and(|parking| {
+            parking.occupied != 0 || parking.held != 0
+        }) {
+            if elapsed(&ctx.sim) >= until {
+                return Err("controlled storefront parking did not drain before demolition".into());
+            }
+            ctx.run_ticks(32);
+        }
+    }
     if let Some(root) = &shots_root {
         publish(
             &ctx.sim,

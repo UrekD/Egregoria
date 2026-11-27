@@ -97,10 +97,13 @@ fn register_ui_resources() {
     register_resource_noserialize::<TestFieldProperties>();
     register_world_resource::<ReceivedCommands>();
     register_world_resource::<RoadBuildResource>();
+    register_world_resource::<crate::gui::footpath::FootpathTool>();
+    register_world_resource::<crate::gui::surface_lot::SurfaceLotTool>();
     register_world_resource::<RoadEditorResource>();
     register_resource_noserialize::<crate::gui::traffic_repair::TrafficRepairUi>();
     register_world_reset(crate::gui::traffic_repair::reset);
     register_world_resource::<SpecialBuildingResource>();
+    register_world_resource::<crate::gui::parkinglot::ParkingGarageTool>();
     register_world_resource::<TrainSpawnResource>();
     register_resource_noserialize::<Timings>();
     register_world_resource::<Tool>();

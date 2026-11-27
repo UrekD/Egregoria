@@ -473,8 +473,11 @@ enum LanePlacement {
 
 impl DirectionEdits {
     fn commit(self, map: &mut Map, road: RoadID) {
-        for lane in self.remove {
-            map.lanes.remove(lane);
+        for id in self.remove {
+            if map.lanes[id].kind == LaneKind::Parking {
+                map.parking.remove_spots(id);
+            }
+            map.lanes.remove(id);
         }
         let lanes = self.lanes.into_iter().map(|(direction, placement)| {
             let (id, kind) = match placement {
@@ -485,6 +488,9 @@ impl DirectionEdits {
                         lane.id = id;
                         lane
                     });
+                    if kind == LaneKind::Parking {
+                        map.parking.generate_spots(&map.lanes[id]);
+                    }
                     (id, kind)
                 }
             };
@@ -563,6 +569,13 @@ pub(crate) fn prepare_upgrade(
     if current != expected {
         return Err(Rejection::StaleRoadEdit);
     }
+    let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+    if traffic.properties.protects_surface_road(id) {
+        return Err(Rejection::ParkingLotAccess);
+    }
+    if road.is_walking_path() {
+        return Err(Rejection::InvalidRoadPattern);
+    }
     let mut existing = road.pattern(map.lanes());
     validate_pattern_layout(&existing)?;
     if map.land_ownership().is_tiled() {
@@ -596,8 +609,21 @@ pub(crate) fn prepare_upgrade(
         && pattern_matches(backward, &pattern.lanes_backward);
     if !same_geometry && map.active_service_road(id) {
         return Err(Rejection::BusyConflict);
+        }
+    if !same_geometry
+        && [road.src, road.dst].into_iter().any(|id| {
+            map.get(id).is_some_and(|joint| {
+                joint
+                    .roads
+                    .iter()
+                    .any(|&arm| map.get(arm).is_some_and(Road::is_walking_path))
+            })
+        })
+    {
+        return Err(Rejection::StaleRoadEdit);
     }
     let mut direction_edits = None;
+    let local_reversal = matches!(change, RoadUpgrade::ReverseOneWay) && road.is_local_one_way();
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
         let edits = forward
@@ -610,7 +636,7 @@ pub(crate) fn prepare_upgrade(
             .collect::<Vec<_>>();
         (road.interfaced_points().clone(), None, 0, retained, edits)
     } else if let Some((plan, retained, edits)) =
-        prepare_same_width_directions(sim, &map, road, pattern, budget)?
+        prepare_same_width_directions(sim, &map, road, pattern, local_reversal, budget)?
     {
         let material = common::hash_iter(
             pattern
@@ -626,6 +652,9 @@ pub(crate) fn prepare_upgrade(
             edits,
         )
     } else {
+        if local_reversal {
+            return Err(Rejection::RoadTopologyUnavailable);
+        }
         let projection =
             super::prepare_road_replacement(&map, id, pattern, budget.road_work_remaining())
                 .map_err(|error| match error {
@@ -633,6 +662,13 @@ pub(crate) fn prepare_upgrade(
                     ConnectionError::LandDenied(reason) => Rejection::LandDenied(reason),
                     error => Rejection::WaterConnection(error),
                 })?;
+        if projection
+            .reclipped_roads
+            .iter()
+            .any(|&road| traffic.properties.protects_surface_road(road))
+        {
+            return Err(Rejection::ParkingLotAccess);
+        }
         let topology = RoadTopologyPreview {
             junctions: projection.preview.junctions,
             crosses_water: projection.preview.crosses_water,
@@ -703,22 +739,26 @@ fn prepare_same_width_directions(
     map: &Map,
     road: &Road,
     pattern: &LanePattern,
+    local_reversal: bool,
     budget: &mut PrepareBudget,
 ) -> Result<Option<(DirectionEdits, Vec<LaneID>, Vec<(LaneID, f32)>)>, Rejection> {
-    // The deck, sidewalk geometry, and curb claims must already remain compatible.
-    // Parking and attached access require their own staged handoff.
+    // Local reversing keeps the deck and sidewalk lanes. Its curb lane can
+    // move to the opposite side once all bays are clear.
     if road.width != pattern.width()
-        || !road.connected_buildings.is_empty()
-        || road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
-        || pattern
-            .lanes()
-            .any(|(kind, _, _)| kind == LaneKind::Parking)
-        || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
-        || !sim.world().companies.is_empty()
-        || !sim.world().freight_stations.is_empty()
+        || (!local_reversal
+            && (!road.connected_buildings.is_empty()
+                || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
+                || road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+                || pattern
+                    .lanes()
+                    .any(|(kind, _, _)| kind == LaneKind::Parking)
+                || !sim.world().companies.is_empty()
+                || !sim.world().freight_stations.is_empty()))
     {
         return Ok(None);
     }
+    let replaceable =
+        |kind| kind == LaneKind::Driving || (local_reversal && kind == LaneKind::Parking);
     for id in [road.src, road.dst] {
         if map.junction_rules(id).is_some() {
             return Ok(None);
@@ -768,7 +808,7 @@ fn prepare_same_width_directions(
                 kind,
             }
         } else {
-            if kind != LaneKind::Driving {
+            if !replaceable(kind) {
                 return Ok(None);
             }
             budget.spend_road_work(road.interfaced_points().len() * 2)?;
@@ -784,6 +824,11 @@ fn prepare_same_width_directions(
                 dist_from_bottom: offset,
             };
             lane.gen_pos(road);
+            if kind == LaneKind::Parking {
+                budget.spend_road_work(
+                    (lane.points.length() / super::PARKING_SPOT_LENGTH).ceil() as usize,
+                )?;
+            }
             LanePlacement::Add(lane)
         };
         offset += kind.width();
@@ -791,8 +836,17 @@ fn prepare_same_width_directions(
     }
     let mut remove = Vec::new();
     for (id, kind) in road.lanes_iter().filter(|(id, _)| !retained.contains(id)) {
-        if kind != LaneKind::Driving {
+        if !replaceable(kind) {
             return Ok(None);
+        }
+        if kind == LaneKind::Parking {
+            let parking = sim.read::<crate::map_dynamic::ParkingManagement>();
+            if let Some(spots) = map.parking.lane_spots.get(id) {
+                budget.spend_road_work(spots.len())?;
+                if spots.iter().any(|&spot| !parking.is_spot_free(spot)) {
+                    return Err(Rejection::BusyConflict);
+                }
+            }
         }
         remove.push(id);
     }
@@ -802,6 +856,47 @@ fn prepare_same_width_directions(
         retained,
         speed_edits,
     )))
+}
+
+fn service_path_survives(
+    map: &Map,
+    from: (LaneID, f32),
+    to: (LaneID, f32),
+    removed: &[LaneID],
+    budget: &mut PrepareBudget,
+) -> Result<bool, Rejection> {
+    use std::collections::{BTreeSet, VecDeque};
+
+    if removed.contains(&from.0) || removed.contains(&to.0) {
+        return Ok(false);
+    }
+    if from.0 == to.0 && from.1 <= to.1 {
+        return Ok(true);
+    }
+    let mut visited = BTreeSet::from([from.0]);
+    let mut frontier = VecDeque::from([from.0]);
+    while let Some(lane) = frontier.pop_front() {
+        budget.spend_road_work(1)?;
+        let joint = map.get(map.get(lane).ok_or(Rejection::MissingReference)?.dst)
+            .ok_or(Rejection::MissingReference)?;
+        for turn in joint.raw_turns() {
+            budget.spend_road_work(1)?;
+            if turn.id.src != lane
+                || turn.kind != super::TurnKind::Driving
+                || removed.contains(&turn.id.dst)
+                || !map.allows_turn(turn.id)
+            {
+                continue;
+            }
+            if turn.id.dst == to.0 {
+                return Ok(true);
+            }
+            if visited.insert(turn.id.dst) {
+                frontier.push_back(turn.id.dst);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn verify_direction_handoff(
@@ -821,13 +916,26 @@ fn verify_direction_handoff(
             return Err(Rejection::BusyConflict);
         }
     }
+    let map = sim.map();
+    for line in transit.lines.values().filter(|line| !line.suspended) {
+        budget.spend_road_work(line.stops.len())?;
+        for (&from, &to) in line.stops.iter().zip(line.stops.iter().cycle().skip(1)) {
+            let Some((from, to)) = transit.stored_stop_lane(from).zip(transit.stored_stop_lane(to)) else {
+                continue;
+            };
+            if !service_path_survives(&map, from, to, removed, budget)?
+                && service_path_survives(&map, from, to, &[], budget)?
+            {
+                return Err(Rejection::BusyConflict);
+            }
+        }
+    }
     let vehicles = &sim.world().vehicles;
     budget.spend_road_work(vehicles.len())?;
     let affected = |kind| match kind {
         TraverseKind::Lane(id) => removed.contains(&id),
         TraverseKind::Turn(turn) => turn.parent == road.src || turn.parent == road.dst,
     };
-    let map = sim.map();
     for (_, vehicle) in vehicles.iter() {
         if matches!(
             vehicle.it.target(),
@@ -960,7 +1068,11 @@ fn reserve_target(road: &Road, budget: &mut PrepareBudget) -> Result<(), Rejecti
     budget.spend_road_work(points * 5 + road.n_lanes() * 5 + 1)
 }
 
-fn stamp(map: &Map, road: &Road, edit: &[(LaneID, f32)]) -> Result<RoadEditStamp, Rejection> {
+pub(super) fn stamp(
+    map: &Map,
+    road: &Road,
+    edit: &[(LaneID, f32)],
+) -> Result<RoadEditStamp, Rejection> {
     let geometry = |points: &PolyLine3| {
         common::hash_iter(
             points
@@ -996,6 +1108,9 @@ fn stamp(map: &Map, road: &Road, edit: &[(LaneID, f32)]) -> Result<RoadEditStamp
 }
 
 fn validate_pattern(pattern: &LanePattern) -> Result<(), Rejection> {
+    if pattern.is_walking_only() {
+        return Err(Rejection::InvalidConnection);
+    }
     let count = pattern
         .lanes_forward
         .len()

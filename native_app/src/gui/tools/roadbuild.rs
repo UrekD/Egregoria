@@ -63,6 +63,11 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         (_, build_state) => build_state,
     };
 
+    let builder = if tool == Tool::LocalOneWay {
+        LanePatternBuilder::local_one_way(state.local_curb_parking)
+    } else {
+        state.pattern_builder
+    };
     let grid_size = 20.0;
     let nosnapping = inp.act.contains(&InputAction::NoSnapping);
     let precision = !nosnapping
@@ -91,7 +96,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         Snapping::SnapToGrid => state.grid_mouse_height(map, unproj, grid_size),
         Snapping::SnapToAngle => {
             interpolation_points = state
-                .possible_interpolations(map, unproj)
+                .possible_interpolations_for(map, unproj, builder.rail)
                 .unwrap_or_default();
             state.mouse_height(
                 map,
@@ -151,7 +156,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         MapProject::ground(mousepos)
     };
 
-    let patwidth = state.pattern_builder.width();
+    let patwidth = builder.width();
 
     if let Road(r_id) = cur_proj.kind {
         let r = &map.roads()[r_id];
@@ -195,7 +200,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         measurement = Some((anchor, snap));
     }
 
-    let is_rail = state.pattern_builder.rail;
+    let is_rail = builder.rail;
 
     let mut is_valid = match (state.build_state, cur_proj.kind) {
         (Hover, Building(_)) => false,
@@ -233,7 +238,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
             compatible(map, dst, src)
                 && check_angle(map, src, cur_proj.pos.xy(), is_rail)
                 && check_angle(map, dst, cur_proj.pos.xy(), is_rail)
-                && !sp.is_steep(state.pattern_builder.width())
+                && !sp.is_steep(builder.width())
                 && !check_intersect(
                     map,
                     &ShapeEnum::BoldSpline(BoldSpline::new(sp, patwidth * 0.5)),
@@ -254,7 +259,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
             compatible(map, cur_proj, selected_proj)
                 && check_angle(map, selected_proj, interpoint, is_rail)
                 && check_angle(map, cur_proj, interpoint, is_rail)
-                && !sp.is_steep(state.pattern_builder.width())
+                && !sp.is_steep(builder.width())
                 && !check_intersect(
                     map,
                     &ShapeEnum::BoldSpline(BoldSpline::new(sp, patwidth * 0.5)),
@@ -266,28 +271,26 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         _ => true,
     };
 
+    let build_pattern = || {
+        if tool == Tool::LocalOneWay {
+            simulation::map::SmallRoadPreset::LocalOneWay {
+                curb_parking: state.local_curb_parking,
+            }
+            .lane_pattern()
+        } else {
+            builder.build()
+        }
+    };
     let build_args = match state.build_state {
         StartCurved(selected_proj) if !cur_proj.is_ground() => {
-            Some((selected_proj, cur_proj, None, state.pattern_builder.build()))
+            Some((selected_proj, cur_proj, None, build_pattern()))
         }
-        Start(selected_proj) => {
-            Some((selected_proj, cur_proj, None, state.pattern_builder.build()))
-        }
-        CurvedConnection(src, dst) => Some((
-            src,
-            dst,
-            Some(cur_proj.pos.xy()),
-            state.pattern_builder.build(),
-        )),
+        Start(selected_proj) => Some((selected_proj, cur_proj, None, build_pattern())),
+        CurvedConnection(src, dst) => Some((src, dst, Some(cur_proj.pos.xy()), build_pattern())),
 
         Curved(interpoint, selected_proj) => {
             let inter = Some(interpoint);
-            Some((
-                selected_proj,
-                cur_proj,
-                inter,
-                state.pattern_builder.build(),
-            ))
+            Some((selected_proj, cur_proj, inter, build_pattern()))
         }
         _ => None,
     };
@@ -438,13 +441,13 @@ const PRECISION_ANGLE: f32 = std::f32::consts::PI / 12.0;
 const ALIGNMENT_ANGLE: f32 = std::f32::consts::PI / 36.0;
 const ALIGNMENT_DISTANCE: f32 = 24.0;
 
-struct PrecisionSnap {
-    point: Vec2,
+pub(crate) struct PrecisionSnap {
+    pub(crate) point: Vec2,
     alignment: Option<Vec2>,
 }
 
 impl PrecisionSnap {
-    fn at(map: &Map, start: MapProject, anchor: Vec3, pointer: Vec3) -> Self {
+    pub(crate) fn at(map: &Map, start: MapProject, anchor: Vec3, pointer: Vec3) -> Self {
         let delta = pointer.xy() - anchor.xy();
         let angle = delta.angle_cossin().0;
         let preferred = |a: Vec2, b: Vec2| {
@@ -499,7 +502,7 @@ impl PrecisionSnap {
         Self { point, alignment }
     }
 
-    fn draw(&self, draw: &mut ImmediateDraw, from: Vec3, to: Vec3, width: f32) {
+    pub(crate) fn draw(&self, draw: &mut ImmediateDraw, from: Vec3, to: Vec3, width: f32) {
         let from = from.up(0.85);
         let to = to.up(0.85);
         let guide = LinearColor::new(0.87, 0.97, 1.0, 1.0);
@@ -574,6 +577,7 @@ fn precision_readout(
 pub struct RoadBuildResource {
     pub build_state: BuildState,
     pub pattern_builder: LanePatternBuilder,
+    pub local_curb_parking: bool,
     pub snapping: Snapping,
     pub height_offset: f32,
     pub height_reference: HeightReference,
@@ -883,7 +887,17 @@ impl RoadBuildResource {
             .color(col);
     }
 
+    #[cfg(test)]
     pub fn possible_interpolations(&self, map: &Map, mousepos: Vec3) -> Option<Vec<Vec3>> {
+        self.possible_interpolations_for(map, mousepos, self.pattern_builder.rail)
+    }
+
+    fn possible_interpolations_for(
+        &self,
+        map: &Map,
+        mousepos: Vec3,
+        is_rail: bool,
+    ) -> Option<Vec<Vec3>> {
         let (start, end) = match self.build_state {
             Hover | Curved(_, _) => {
                 return None;
@@ -939,7 +953,7 @@ impl RoadBuildResource {
             }
 
             (Intersection(inter_id), Road(road_id)) | (Road(road_id), Intersection(inter_id))
-                if self.pattern_builder.rail =>
+                if is_rail =>
             {
                 let inter = map.intersections().get(inter_id)?;
                 let road = map.roads().get(road_id)?;
@@ -969,7 +983,7 @@ impl RoadBuildResource {
                 )
             }
 
-            (Road(id), Ground) | (Ground, Road(id)) if self.pattern_builder.rail => {
+            (Road(id), Ground) | (Ground, Road(id)) if is_rail => {
                 let road = map.roads().get(id)?;
 
                 let pos = if start.kind == Road(id) {
@@ -985,7 +999,7 @@ impl RoadBuildResource {
                 let h = map.environment().height(p)?;
                 Some(vec![p.z(h)])
             }
-            (Road(id0), Road(id1)) if self.pattern_builder.rail => {
+            (Road(id0), Road(id1)) if is_rail => {
                 let road0 = map.roads().get(id0)?;
                 let road1 = map.roads().get(id1)?;
 

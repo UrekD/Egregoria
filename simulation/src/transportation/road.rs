@@ -280,6 +280,7 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
 
 pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::vehicle_state_update_system");
+    super::DrivewayTraffic::update(world, resources);
     let buffer = &*resources.read::<ParCommandBuffer<VehicleEnt>>();
     let map = &*resources.read::<Map>();
     let fleet = resources.read::<FireFleet>();

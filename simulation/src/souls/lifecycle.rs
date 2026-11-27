@@ -137,11 +137,17 @@ pub(crate) fn close_site(
     id: BuildingID,
     cause: super::demolition::SiteRemnantCause,
 ) -> bool {
+    if sim.read::<crate::transportation::DrivewayTraffic>().properties.busy(id) {
+        return false;
+    }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let original = sim.map_mut().close_building(id);
     let Some(original) = original else {
         return false;
     };
+    sim.write::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .remove_empty(id, &mut sim.write::<ParkingManagement>());
     residence::on_building_removed(sim, id);
     let home = (original.kind == BuildingKind::House).then_some((id, original.door_pos));
     let departed = remove_building(sim, original, was_external_target, Some(cause));
@@ -171,6 +177,16 @@ fn remove_site_inner(sim: &mut Simulation, id: BuildingID) -> bool {
     if super::service_dispatch::clearance_blocked(sim, id) {
         return false;
     }
+    if sim
+        .read::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .busy(id)
+    {
+        sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .set_open(id, false);
+        return false;
+    }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let removed = sim.map_mut().remove_building(id);
     let Some(building) = removed else {
@@ -179,6 +195,9 @@ fn remove_site_inner(sim: &mut Simulation, id: BuildingID) -> bool {
     super::service_dispatch::release_station(sim, id);
     super::events::remove_incident(sim, id);
     super::demolition::forget_site(sim, id);
+    sim.write::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .remove_empty(id, &mut sim.write::<ParkingManagement>());
     residence::on_building_removed(sim, id);
     remove_building(sim, building, was_external_target, None);
     true
@@ -296,7 +315,12 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
             market.forget_human_buyer(trade.seller.0, id);
         }
     }
-    if let Some(car) = human.router.personal_car {
+    let removed_car = human.router.personal_car.filter(|&car| {
+        !sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .owner_dropped(car)
+    });
+    if let Some(car) = removed_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
     }
     human
@@ -315,11 +339,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
     }
     let employers = clear_soul_references(sim, SoulID::Human(id));
-    if let (Some(_), Some(car), Some(batch)) = (
-        &employers,
-        human.router.personal_car,
-        &mut sim.world.departing,
-    ) {
+    if let (Some(_), Some(car), Some(batch)) = (&employers, removed_car, &mut sim.world.departing) {
         batch.removed_cars.insert(car);
     }
 

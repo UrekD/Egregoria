@@ -761,6 +761,9 @@ fn apply_router_error(view: &mut TripView, error: Option<RouterError>) {
                 RouterError::ReservingParkingSpot(_) => "Parking unavailable",
                 RouterError::TranslatingParkingSpotToDrivePos => "Parking access unavailable",
                 RouterError::LocatingVehicle => "Vehicle location unavailable",
+                RouterError::PropertyParkingBlocked => "Property parking entrance unavailable",
+                RouterError::PropertyParkingUnavailable(_) => "Property parking claim unavailable",
+                RouterError::PropertyParkingBudgetExhausted => "Parking search limit reached",
             };
             view.state = format!("Stuck · {reason}");
         }
@@ -804,6 +807,8 @@ fn building_label(map: &Map, id: BuildingID) -> Option<String> {
             BuildingKind::TrainStation => "Train station",
             BuildingKind::ExternalTrading => "External trading",
             BuildingKind::SiteRemnant => "Closed site",
+            BuildingKind::ParkingGarage(kind) => kind.label(),
+            BuildingKind::ParkingLot { .. } => "Surface parking lot",
         }
         .into(),
     )

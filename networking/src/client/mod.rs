@@ -402,18 +402,31 @@ impl<W: DeserializeOwned, I: Serialize + DeserializeOwned + Default> Client<W, I
 #[cfg(test)]
 #[test]
 fn p7_ingress_rejects_released_p6_handshake() {
-    rejects_incompatible_handshake("0.11.1", false);
+    assert_legacy_handshake_rejected("0.11.1");
 }
 
 #[cfg(test)]
 #[test]
-fn hotfix_release_rejects_v0130_handshake() {
-    rejects_incompatible_handshake("0.12.0", true);
-    rejects_incompatible_handshake("0.13.0", true);
+fn pathpark_w3_rejects_commands_4_handshake() {
+    assert_legacy_handshake_rejected("0.12.0+commands.4");
 }
 
 #[cfg(test)]
-fn rejects_incompatible_handshake(floor: &str, versioned: bool) {
+#[test]
+fn pathpark_w3_rejects_commands_5_handshake() {
+    assert_legacy_handshake_rejected("0.12.0+commands.5");
+}
+
+#[cfg(test)]
+#[test]
+fn release_rejects_legacy_handshakes() {
+    for identity in ["0.12.0+commands.2", "0.13.0+commands.2", "0.13.1+commands.2"] {
+        assert_legacy_handshake_rejected(identity);
+    }
+}
+
+#[cfg(test)]
+fn assert_legacy_handshake_rejected(floor: &str) {
     use crate::{Server, ServerConfiguration, ServerPollResult};
     use std::net::{Ipv4Addr, TcpListener};
     use std::time::{Duration, Instant};
@@ -441,10 +454,8 @@ fn rejects_incompatible_handshake(floor: &str, versioned: bool) {
         version: floor.into(),
     })
     .unwrap();
-    // P6 sends its release string verbatim in the unchanged Connect packet.
-    if !versioned {
-        peer.version = floor.into();
-    }
+    // Reproduce the older value sent verbatim in the Connect packet.
+    peer.version = floor.into();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

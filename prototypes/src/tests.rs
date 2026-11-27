@@ -787,3 +787,31 @@ fn zones2_paint_kind_lua_accepts_all_five_kinds() {
     assert_eq!(ZoneKind::MixedUse.abbreviation(), "MX");
     assert!(!ZoneKind::MixedUse.is_taxable());
 }
+
+#[test]
+fn pathpark_rejects_invalid_growable_parking() {
+    for (name, parking) in [
+        ("residence-low-l1", "{kind='surface', spaces=9}"),
+        ("residence-low-l1", "{kind='surface', spaces=0}"),
+        ("residence-low-l1", "{kind='surface', spaces=1.5}"),
+        ("residence-low-l1", "{kind='surface', spaces='2'}"),
+        ("residence-high-l1", "{kind='garage', spaces=257}"),
+        (
+            "residence-high-l1",
+            "{kind='garage', spaces=8, fallback_surface_spaces=9}",
+        ),
+        (
+            "residence-low-l1",
+            "{kind='surface', spaces=1, fallback_surface_spaces=1}",
+        ),
+        ("residence-low-l1", "{kind='road', spaces=1}"),
+        ("mixed-medium-l1", "{kind='garage', spaces=8}"),
+    ] {
+        let error = zones2_validation_result(&format!(
+            "for _, p in ipairs(data) do if p.name == '{name}' then p.parking = {parking} end end"
+        ))
+        .expect_err(parking);
+        assert!(error.contains(name) && error.contains("parking"), "{error}");
+    }
+    zones2_validation_result("").unwrap();
+}

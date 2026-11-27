@@ -3,7 +3,7 @@
 use prototypes::{Power, Tick};
 
 use crate::economy::cargo::CargoBook;
-use crate::economy::Market;
+use crate::economy::{Market, TripPurpose};
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{
     active_business, effective_load, site_power_status, transit,
@@ -25,6 +25,65 @@ pub use crate::souls::residence::PowerStatus;
 pub use crate::transportation::queue_diagnostics::{
     explain_queue, parking_pressure, QueueExplanation, QueueLimits, QueueRevision,
 };
+
+#[derive(Clone, Copy, Default)]
+pub struct BenchmarkWork {
+    pub person_offers: u64,
+    pub freight_offers: u64,
+    pub rail_completions: u64,
+    pub service_offers: u64,
+    pub service_completions: u64,
+}
+
+thread_local! {
+    static BENCHMARK_WORK: std::cell::Cell<Option<BenchmarkWork>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Measure one window on the thread running the sequential simulation schedule.
+pub fn begin_benchmark_work() {
+    BENCHMARK_WORK.set(Some(BenchmarkWork::default()));
+}
+
+pub fn end_benchmark_work() -> BenchmarkWork {
+    BENCHMARK_WORK
+        .take()
+        .expect("benchmark work recording was not started")
+}
+
+fn record_benchmark_work(record: impl FnOnce(&mut BenchmarkWork)) {
+    BENCHMARK_WORK.with(|state| {
+        if let Some(mut work) = state.get() {
+            record(&mut work);
+            state.set(Some(work));
+        }
+    });
+}
+
+pub(crate) fn record_trip_offer(purpose: TripPurpose) {
+    record_benchmark_work(|work| match purpose {
+        TripPurpose::FreightOutbound => work.freight_offers += 1,
+        TripPurpose::FreightReturn => {}
+        _ => work.person_offers += 1,
+    });
+}
+
+pub(crate) fn record_service_offer() {
+    record_benchmark_work(|work| work.service_offers += 1);
+}
+
+pub(crate) fn record_rail_offer() {
+    record_benchmark_work(|work| work.freight_offers += 1);
+}
+
+pub(crate) fn record_rail_completion() {
+    record_benchmark_work(|work| work.rail_completions += 1);
+}
+
+pub(crate) fn record_service_completion() {
+    record_benchmark_work(|work| work.service_completions += 1);
+}
 
 #[derive(Debug)]
 pub struct BuildingDiagnostics {

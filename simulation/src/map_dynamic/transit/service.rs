@@ -168,8 +168,10 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
             }
             let next = (run.next_stop_idx + 1) % line.stops.len();
             transit.runs.get_mut(&bus).unwrap().next_stop_idx = next;
+            crate::diagnostics::record_service_offer();
             begin_leg(&mut transit, &map, bus, vehicle, now, Some(stop_id));
         } else if arrived(vehicle, stop) {
+            crate::diagnostics::record_service_completion();
             let previous = (run.next_stop_idx + line.stops.len() - 1) % line.stops.len();
             let line_id = run.line;
             let actual = now.0.saturating_sub(run.leg_started.0);

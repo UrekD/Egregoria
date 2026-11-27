@@ -414,9 +414,19 @@ fn zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments() {
 
 #[test]
 fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
-    if !load_staged_prototypes("zones2_acceptance_replay_reconstructs_growth_and_bulldozing") {
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_acceptance_replay_reconstructs_growth_and_bulldozing",
+    ) {
         return;
     }
+    // Use curb-served towers to exercise frontage loss, collapse and regrowth.
+    prototypes::test_prototypes(concat!(
+        "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = true\n",
+        include_str!("../../../base_mod/data.lua"),
+        "\nfor _, prototype in ipairs(data) do prototype.parking = nil end\n"
+    ));
+    crate::init::register_simulation();
     let mut sim = flat_city();
     let mut sched = Simulation::schedule();
     let root = SlotRoot::new();

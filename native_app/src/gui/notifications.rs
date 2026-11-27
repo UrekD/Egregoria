@@ -721,6 +721,8 @@ fn command_label(command: &str) -> &'static str {
         "SetWarehouseRestock" => "Set warehouse restock levels",
         "SetFreightTerminalPolicy" => "Set freight terminal policy",
         "SetLotLayout" => "Change plot layout",
+        "MapMakeWalkingPath" => "Build footpath",
+        "MapPlaceParkingLot" => "Build parking lot",
         _ => "City action",
     }
 }
@@ -733,6 +735,24 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
     let message = match (command, reason) {
         (_, Rejection::InvalidCommandEncoding) => {
             "This action contains invalid or oversized input."
+        }
+        ("MapPlaceParkingLot", InvalidBuilding) => {
+            "The lot needs flat ground and at least one legal entrance and exit"
+        }
+        ("MapPlaceParkingLot", BusyConflict) => {
+            "A vehicle or another parking entrance blocks this lot"
+        }
+        ("MapPlaceParkingLot", StaleRoadQuote | StaleRoadEdit) => {
+            "The lot or its curb changed. Check the layout again."
+        }
+        ("MapPlaceParkingGarage", InvalidBuilding) => {
+            "The selected curb needs a clear driveway and a dry, level footprint"
+        }
+        ("MapPlaceParkingGarage", BusyConflict) => {
+            "A driveway or occupied curb bay blocks the entrance"
+        }
+        ("MapRemoveBuilding", BusyConflict) => {
+            "Close parking and wait for the remaining cars to leave"
         }
         (_, Rejection::BuildingOverlap) => "Another building already occupies this site.",
         ("TransitAddStop", MissingReference | InvalidConnection) => {
@@ -749,6 +769,7 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
             "The road or its quote changed. Preview the edit again."
         }
         (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
+        (_, ParkingLotAccess) => "This edit would alter a surface parking lot's access",
         (_, BusyConflict) => "Traffic or a service route still needs this movement",
         (_, LegacyBuildingRemoval) => "Get a demolition quote for this site",
         (_, StaleDemolitionQuote) => "The demolition quote changed. Review the site again.",
