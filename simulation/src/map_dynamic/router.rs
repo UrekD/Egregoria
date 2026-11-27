@@ -2103,14 +2103,12 @@ mod tests {
         let ctx = TestCtx::new();
         ctx.build_roads(&[vec3(100., 100., 0.), vec3(400., 100., 0.)]);
         let map = ctx.g.map();
-        let (lane, _) = map
-            .roads()
+        let lane = map
+            .lanes()
             .values()
-            .next()
-            .unwrap()
-            .lanes_iter()
-            .find(|&(_, kind)| kind == LaneKind::Driving)
-            .unwrap();
+            .find(|lane| lane.kind == LaneKind::Driving && lane.points.length() >= 100.0)
+            .expect("test road has a driving lane at least 100 m long")
+            .id;
         let from = DirectedEndpoint {
             lane,
             offset_cm: 1_000,
@@ -2129,8 +2127,13 @@ mod tests {
         budget.check(candidate).unwrap();
         assert!(budget.drive(&map, from, to, candidate).is_none());
         let pending = budget.suspend(target, Some(car)).unwrap();
-        let bytes = Bincode::encode(&pending).unwrap();
-        let pending: PendingPropertySearch = Bincode::decode(&bytes).unwrap();
+        let driver = HumanID::default();
+        let mut properties = BuildingParking::default();
+        properties.suspend_search(driver, pending);
+        let mut bytes = Vec::new();
+        properties.save(&mut bytes).unwrap();
+        let load_search = || BuildingParking::load(&bytes).unwrap().take_search(driver).unwrap();
+        let pending = load_search();
         assert!(pending.validate(&map));
         assert_eq!(pending.work_left, PROPERTY_WORK_PER_SLICE);
 
@@ -2139,7 +2142,7 @@ mod tests {
         assert!(resumed.drive(&map, from, to, candidate).is_some());
         assert_eq!(resumed.checked.len(), 1);
 
-        let mut expired = PropertyBudget::new(Tick(84), Some(Bincode::decode(&bytes).unwrap()));
+        let mut expired = PropertyBudget::new(Tick(84), Some(load_search()));
         assert!(expired.check(candidate).is_none());
         assert!(matches!(
             expired.error(),
