@@ -540,7 +540,7 @@ fn classify(
             RoutingStep::Unpark(..) => "Unpark",
             RoutingStep::GetInVehicle(..) => "GetInVehicle",
             RoutingStep::GetOutVehicle(..) => "GetOutVehicle",
-            RoutingStep::WalkTo(..) => "WalkTo",
+            RoutingStep::WalkTo(..) | RoutingStep::WalkProperty(..) => "WalkTo",
             RoutingStep::GetInBuilding(..) => "GetInBuilding",
             RoutingStep::GetOutBuilding(..) => "GetOutBuilding",
             RoutingStep::WaitAtStop { .. } => "WaitAtStop",

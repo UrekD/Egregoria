@@ -360,26 +360,51 @@ fn pathpark_oversized_garage_batch_has_no_side_effects() {
 #[test]
 fn pathpark_imports_only_suppress_parking_for_the_benchmark_profile() {
     use crate::map::BuildingKind;
+    use prototypes::{GrowableChainKey, GrowableZoneKind};
 
     for curb_only in [false, true] {
         let mut ctx = TestCtx::new();
         if curb_only {
             ctx.g.use_curb_only_benchmark_parking();
         }
+        let company = prototypes::prototypes()
+            .growable_company_for_chain(GrowableChainKey {
+                zone_kind: GrowableZoneKind::Pure(ZoneKind::Commercial),
+                density: Density::Low,
+                level: 1,
+            })
+            .unwrap()
+            .base
+            .id;
         ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
-        let lot = ctx
-            .g
-            .map()
+        let map = ctx.g.map();
+        let lot = map
             .lots()
             .values()
-            .filter(|lot| !Lot::footprint_obstructed(&ctx.g.map(), lot.shape, false))
-            .min_by_key(|lot| lot.shape.center().distance2(vec2(250., 135.)) as i32)
+            .filter(|lot| {
+                let center = lot.shape.center();
+                lot.shape.axis().iter().all(|axis| axis.mag() >= 29.5)
+                    && center.y < 100.0
+                    && (175.0..310.0).contains(&center.x)
+                    && !Lot::footprint_obstructed(&map, lot.shape, false)
+            })
+            .max_by(|a, b| {
+                let area = |lot: &Lot| {
+                    lot.shape
+                        .axis()
+                        .iter()
+                        .map(|axis| axis.mag())
+                        .product::<f32>()
+                };
+                area(a).total_cmp(&area(b))
+            })
             .unwrap()
             .id;
-        let home = ctx
+        drop(map);
+        let shop = ctx
             .g
-            .seed_imported_growable(lot, BuildingKind::House, Density::Low)
+            .seed_imported_growable(lot, BuildingKind::GoodsCompany(company), Density::Low)
             .unwrap();
-        assert_eq!(ctx.g.building_parking(home).is_some(), !curb_only);
+        assert_eq!(ctx.g.building_parking(shop).is_some(), !curb_only);
     }
 }

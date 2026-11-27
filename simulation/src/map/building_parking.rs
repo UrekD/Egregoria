@@ -1119,6 +1119,7 @@ impl BuildingParking {
             }
         }
 
+        let mut closed_holds = Vec::new();
         for (&id, site) in &self.sites {
             let layout = &site.layout;
             let building = map.get(id).ok_or("missing property parking building")?;
@@ -1239,13 +1240,15 @@ impl BuildingParking {
                         .get(car)
                         .is_none_or(|vehicle| !matches!(vehicle.vehicle.kind, VehicleKind::Car))
                     || (!entering
-                        && (site.closing
-                            || world.humans.get(arrival.driver).is_none_or(|human| {
-                                human.router.personal_car != Some(car)
-                                    || !human.router.has_property_arrival(car, id)
-                            })))
+                        && world.humans.get(arrival.driver).is_none_or(|human| {
+                            human.router.personal_car != Some(car)
+                                || !human.router.has_property_arrival(car, id)
+                        }))
                 {
                     return Err("invalid property parking hold");
+                }
+                if site.closing && !entering {
+                    closed_holds.push(car);
                 }
             }
         }
@@ -1308,6 +1311,10 @@ impl BuildingParking {
                 .is_none_or(|site| !site.held.contains_key(car))
         }) {
             return Err("orphaned property parking claim");
+        }
+        // Older Wave 2 saves could keep an uncommitted hold after closure.
+        for car in closed_holds {
+            self.release_arrival(car);
         }
         Ok(())
     }
