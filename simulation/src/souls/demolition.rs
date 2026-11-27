@@ -380,7 +380,7 @@ pub(crate) fn ruin_site(
         return Ok(());
     }
     let original_kind = sim.map().get(site).ok_or(Rejection::MissingReference)?.kind;
-    if !super::lifecycle::close_site(sim, site) {
+    if !super::lifecycle::close_site(sim, site, cause) {
         return Err(Rejection::InvalidBuilding);
     }
     sim.write::<SiteRemnants>().sites.insert(

@@ -120,18 +120,31 @@ fn finish_company_departures(sim: &mut Simulation) {
 
 /// Remove a site and settle all uses using the captured building record.
 pub(crate) fn remove_site(sim: &mut Simulation, id: BuildingID) -> bool {
-    remove_site_inner(sim, id, false)
+    remove_site_inner(sim, id)
 }
 
 /// Close ordinary uses while retaining the site's physical map record.
-pub(crate) fn close_site(sim: &mut Simulation, id: BuildingID) -> bool {
+pub(crate) fn close_site(
+    sim: &mut Simulation,
+    id: BuildingID,
+    cause: super::demolition::SiteRemnantCause,
+) -> bool {
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let original = sim.map_mut().close_building(id);
     let Some(original) = original else {
         return false;
     };
     residence::on_building_removed(sim, id);
-    remove_building(sim, original, was_external_target, true);
+    let departed = remove_building(sim, original, was_external_target, Some(cause));
+    if cause == super::demolition::SiteRemnantCause::Fire
+        && departed.len() > 1
+        && sim.world.departing.is_none()
+    {
+        prepare_human_departures(
+            sim,
+            departed.into_iter().map(|id| (id, Departure::default())).collect(),
+        );
+    }
     true
 }
 
@@ -144,7 +157,7 @@ pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>)
     }
 }
 
-fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: bool) -> bool {
+fn remove_site_inner(sim: &mut Simulation, id: BuildingID) -> bool {
     if super::service_dispatch::clearance_blocked(sim, id) {
         return false;
     }
@@ -157,7 +170,7 @@ fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: boo
     super::events::remove_incident(sim, id);
     super::demolition::forget_site(sim, id);
     residence::on_building_removed(sim, id);
-    remove_building(sim, building, was_external_target, defer_references);
+    remove_building(sim, building, was_external_target, None);
     true
 }
 
@@ -165,11 +178,11 @@ fn remove_building(
     sim: &mut Simulation,
     building: Building,
     was_external_target: bool,
-    defer_references: bool,
-) {
+    cause: Option<super::demolition::SiteRemnantCause>,
+) -> Vec<HumanID> {
     let id = building.id;
     cancel_removed(sim, CargoRemoval::Building(id));
-    if building.has_residential_use() {
+    let departing = if building.has_residential_use() {
         let (world, resources) = sim.world_res();
         let infos = resources.read::<BuildingInfos>();
         if let Some(info) = infos.get(id) {
@@ -184,18 +197,25 @@ fn remove_building(
             }
         }
         drop(infos);
-        residence::evict_residents(sim, id, building.door_pos);
-    }
+        residence::evict_residents(
+            sim,
+            id,
+            building.door_pos,
+            cause == Some(super::demolition::SiteRemnantCause::Fire),
+        )
+    } else {
+        Vec::new()
+    };
     sim.write::<BuildingInfos>().remove(id);
     if matches!(building.kind, BuildingKind::GoodsCompany(_))
-        || (defer_references && building.has_residential_use())
+        || (cause.is_some() && building.has_residential_use())
     {
         sim.world
             .company_departures
             .removed_sites
             .insert(id, building.door_pos);
         schedule_company_cleanup(sim);
-        return;
+        return departing;
     }
     match building.kind {
         BuildingKind::RailFreightStation(_) => {
@@ -244,6 +264,7 @@ fn remove_building(
         _ => {}
     }
     clear_building_references(sim, id, Some(building.door_pos));
+    departing
 }
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
@@ -547,6 +568,12 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
 
     let mut parking = resources.write::<ParkingManagement>();
     let mut former_drivers = BTreeSet::new();
+    let affected = |human: &HumanEnt| {
+        human.location == Location::Vehicle(id)
+            || driver_truck(human) == Some(id)
+            || human.router.references_vehicle(id)
+            || human.decision.kind.references_vehicle(id)
+    };
     let mut clear_human = |human_id, human: &mut HumanEnt| {
         let riding = human.location == Location::Vehicle(id);
         if riding {
@@ -576,17 +603,13 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
             .iter()
             .merge_by(active_routes.iter(), |a, b| a.0 < b.0)
         {
-            world
-                .humans
-                .edit(human_id, |human| clear_human(human_id, human));
+            if world.humans.get(human_id).is_some_and(affected) {
+                world.humans.edit(human_id, |human| clear_human(human_id, human));
+            }
         }
     } else {
         world.humans.edit_each_split(|human_id, human| {
-            if human.location == Location::Vehicle(id)
-                || driver_truck(human) == Some(id)
-                || human.router.references_vehicle(id)
-                || human.decision.kind.references_vehicle(id)
-            {
+            if affected(human) {
                 clear_human(human_id, human);
             }
         });
@@ -692,19 +715,23 @@ impl VehicleDepartureReferences {
                 active_routes.push((order, id));
                 continue;
             }
-            let mut mentioned = BTreeSet::new();
-            mentioned.extend(human.router.personal_car);
-            mentioned.extend(human.router.selected_vehicle());
-            if let Location::Vehicle(vehicle) = human.location {
-                mentioned.insert(vehicle);
-            }
-            mentioned.extend(driver_truck(human));
-            decision_vehicles(&human.decision.kind, &mut mentioned);
-            for vehicle in mentioned {
+            let mut record_vehicle = |vehicle| {
                 if let Some(refs) = references.get_mut(&vehicle) {
-                    refs.humans.push((order, id));
+                    if refs.humans.last() != Some(&(order, id)) {
+                        refs.humans.push((order, id));
+                    }
                 }
+            };
+            for vehicle in human.router.personal_car.into_iter()
+                .chain(human.router.selected_vehicle())
+                .chain(driver_truck(human))
+            {
+                record_vehicle(vehicle);
             }
+            if let Location::Vehicle(vehicle) = human.location {
+                record_vehicle(vehicle);
+            }
+            decision_vehicles(&human.decision.kind, &mut record_vehicle);
         }
         for (id, company) in companies.iter() {
             let mut mentioned: BTreeSet<_> = company.comp.trucks.iter().copied().collect();
@@ -731,14 +758,14 @@ fn driver_truck(human: &HumanEnt) -> Option<VehicleID> {
     }
 }
 
-fn decision_vehicles(decision: &HumanDecisionKind, vehicles: &mut BTreeSet<VehicleID>) {
+fn decision_vehicles(decision: &HumanDecisionKind, record: &mut impl FnMut(VehicleID)) {
     match decision {
         HumanDecisionKind::SetVehicle(Some(id)) => {
-            vehicles.insert(*id);
+            record(*id);
         }
         HumanDecisionKind::MultiStack(steps) => {
             for step in steps {
-                decision_vehicles(step, vehicles);
+                decision_vehicles(step, record);
             }
         }
         _ => {}
@@ -869,7 +896,7 @@ pub(crate) fn clear_abandoned_home_references(sim: &mut Simulation, homes: &[(Bu
     let infos = resources.read::<BuildingInfos>();
     // Eviction has already removed or reassigned residence memberships. Only
     // actual command-buffer deletions will consume entries from this index.
-    let mut departing: BTreeMap<_, Departure> = world
+    let departing: BTreeMap<_, Departure> = world
         .humans
         .iter()
         .filter(|(id, human)| {
@@ -881,6 +908,12 @@ pub(crate) fn clear_abandoned_home_references(sim: &mut Simulation, homes: &[(Bu
     if departing.len() < 2 {
         return;
     }
+    drop(infos);
+    prepare_human_departures(sim, departing);
+}
+
+fn prepare_human_departures(sim: &mut Simulation, mut departing: BTreeMap<HumanID, Departure>) {
+    let (world, resources) = sim.world_res();
     for (buyer, human) in world.humans.iter() {
         for id in human_trade_participants(human.bought.0.values().flatten()) {
             if let Some(entry) = departing.get_mut(&id) {
