@@ -1264,20 +1264,38 @@ impl RouteCache {
     fn rail_gates(&mut self, map: &Map, station: BuildingID, stop: geom::Vec3) -> &[RailGate] {
         self.refresh(map);
         self.rail.entry(station).or_insert_with(|| {
-            let Some(berth) = RailAnchor::near(map, stop) else {
+            let Some(station) = map.get(station) else {
                 return Vec::new();
             };
-            map.external_train_stations
+            let berths = RailAnchor::for_platform(map, station, stop);
+            if berths.is_empty() {
+                return Vec::new();
+            }
+            let markets: Vec<_> = map.external_train_stations
                 .iter()
                 .filter_map(|&outside| {
                     let market = map.get(outside)?;
-                    let gate = RailAnchor::near(map, market.obb.center().z(market.height))?;
-                    let departure = gate.departure_point(map, gate)?;
-                    berth.route(Tick(0), map, departure.position, gate.lane)?;
-                    gate.route(Tick(0), map, berth.position, berth.lane)?;
-                    Some(RailGate { outside, gate, berth })
+                    Some((outside, RailAnchor::for_market(map, market)))
                 })
-                .collect()
+                .collect();
+            for berth in berths {
+                let gates: Vec<_> = markets
+                    .iter()
+                    .filter_map(|&(outside, ref anchors)| {
+                        anchors.iter().find_map(|&gate| {
+                            // Both legs must use the same directed rail network.
+                            let departure = gate.departure_point(map, gate)?;
+                            berth.route(Tick(0), map, departure.position, gate.lane)?;
+                            gate.route(Tick(0), map, berth.position, berth.lane)?;
+                            Some(RailGate { outside, gate, berth })
+                        })
+                    })
+                    .collect();
+                if !gates.is_empty() {
+                    return gates;
+                }
+            }
+            Vec::new()
         })
     }
 
@@ -7105,7 +7123,7 @@ mod lifecycle_tests {
         book.routes.refresh(&map);
         let outside = map.external_train_stations[0];
         let market = map.get(outside).unwrap();
-        let gate = RailAnchor::near(&map, market.obb.center().z(market.height)).unwrap();
+        let gate = RailAnchor::for_market(&map, market)[0];
         book.routes.rail.insert(
             terminal.building,
             vec![RailGate {
@@ -7271,6 +7289,114 @@ mod lifecycle_tests {
                 .unwrap();
         }
         assert!(served(&f), "a spur to the outside track");
+    }
+
+    fn platform_with_competing_track(parallel: bool) {
+        use crate::map::{LanePatternBuilder, MapProject, ProjectKind};
+
+        drop(TestCtx::new_fast());
+        let sim = Simulation::new_authored_town(crate::AuthoredTownOptions::default()).unwrap();
+        let mut map = sim.map_mut();
+        let rail = LanePatternBuilder::new().rail(true).build();
+        let (platform_end, platform) = map
+            .make_connection(
+                MapProject::ground(vec3(220.0, 800.0, 56.0)),
+                MapProject::ground(vec3(1350.0, 800.0, 56.0)),
+                None,
+                &rail,
+            )
+            .unwrap();
+        let (start, end) = if parallel {
+            (vec3(500.0, 754.0, 10.0), vec3(1350.0, 754.0, 10.0))
+        } else {
+            (vec3(960.0, 570.0, 30.0), vec3(960.0, 1070.0, 30.0))
+        };
+        let (other_end, other) = map
+            .make_connection(
+                MapProject::ground(start),
+                MapProject::ground(end),
+                None,
+                &rail,
+            )
+            .unwrap();
+        let junction = |id| crate::map::MapProject {
+            kind: ProjectKind::Intersection(id),
+            pos: map.intersections()[id].pos,
+        };
+        let from = junction(platform_end);
+        let to = junction(other_end);
+        map.make_connection(from, to, Some(vec2(1570.0, 950.0)), &rail)
+            .unwrap();
+
+        let east = map.roads()[platform]
+            .lanes_iter()
+            .find_map(|(id, _)| {
+                let lane = &map.lanes()[id];
+                (lane.points.first().x < lane.points.last().x).then_some(id)
+            })
+            .unwrap();
+        let market = map.lanes()[east].points.point_along(150.0);
+        let gen = BuildingGen::CenteredDoor {
+            vertical_factor: 1.0,
+        };
+        let outside = map
+            .build_special_building(
+                &OBB::new(market.xy(), Vec2::X, 30.0, 10.0),
+                BuildingKind::ExternalTrading,
+                gen,
+                None,
+                None,
+            )
+            .unwrap();
+        let center = vec2(885.0, 760.0);
+        let terminal = map
+            .build_special_building(
+                &OBB::new(center, Vec2::X, 30.0, 12.0),
+                BuildingKind::RailFreightStation(prototypes::FreightStationPrototypeID::new(
+                    "freight-station",
+                )),
+                gen,
+                None,
+                None,
+            )
+            .unwrap();
+        let stop = train_stop(&geom::Transform::new_dir(
+            center.z(map.buildings()[terminal].height),
+            geom::Vec3::X,
+        ));
+        let decoy = RailAnchor::near(&map, stop).unwrap();
+        assert_eq!(
+            map.lanes()[decoy.lane].parent,
+            other,
+            "fixture needs a closer track"
+        );
+        let gate = RailAnchor::near(&map, market).unwrap();
+        let departure = gate.departure_point(&map, gate).unwrap();
+        assert!(decoy
+            .route(Tick(0), &map, departure.position, gate.lane)
+            .is_some());
+        assert!(gate
+            .route(Tick(0), &map, decoy.position, decoy.lane)
+            .is_some());
+
+        let mut cache = RouteCache::default();
+        let gates = cache.rail_gates(&map, terminal, stop);
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].outside, outside);
+        assert_eq!(
+            gates[0].berth.lane, east,
+            "dispatch must use the platform track"
+        );
+    }
+
+    #[test]
+    fn rail_dispatch_ignores_connected_crossing_track() {
+        platform_with_competing_track(false);
+    }
+
+    #[test]
+    fn rail_dispatch_ignores_connected_parallel_track_on_the_wrong_side() {
+        platform_with_competing_track(true);
     }
 
     #[test]

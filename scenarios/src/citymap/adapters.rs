@@ -236,10 +236,8 @@ pub(super) fn place_special(
 mod tests {
     use super::*;
     use crate::citymap::{
-        build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
-        DEFAULT_LESCE, DEFAULT_SAVA,
+        build_dry_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
     };
-    use std::path::Path;
 
     #[test]
     fn cm2_adapter_reserves_edge_only_bank_and_park_overlaps() {
@@ -247,11 +245,7 @@ mod tests {
         use crate::citymap::SourceKey;
         use geom::vec2;
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         let footprint = OBB::new(Vec2::ZERO, vec2(1.0, 0.0), 200.0, 20.0);
         plan.river = vec![RiverReach {
@@ -277,11 +271,7 @@ mod tests {
 
     #[test]
     fn cm2_adapter_places_coal_on_truck_frontage() {
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         let (mut sim, built) = build_dry_town(&plan).unwrap();
         let roads = frontage_roads(&plan, &built);
@@ -311,11 +301,7 @@ mod tests {
 
     #[test]
     fn cm2_adapter_places_a_cereal_farm_with_a_field() {
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         let (mut sim, built) = build_dry_town(&plan).unwrap();
         let roads = frontage_roads(&plan, &built);

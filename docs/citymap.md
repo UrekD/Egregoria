@@ -16,6 +16,8 @@ Pass `--dry` for a layout-only diagnostic. It writes the dry road network as a l
 
 ## Release checks
 
+Run `make citymap-gate` before tagging a release. It stages and loads all four release saves using the pinned extracts. A cold cache runs full slot generation and commissioning. `make scenarios` runs the focused wet Lesce freight regression alongside the regular scenarios.
+
 Run `cargo run --locked --release -p scenarios -- citymap-build --verify DIR` to load the wet slot and check its report, version, revision, tick and population. Run `EGR_CITYMAP_PUBLISHED=DIR make build` to bundle that publication in the Windows archive. Run `make citymap-shots EGR_CITYMAP_OUT=DIR` to capture the opening camera, Sava bridges and Land Tiles panel. The captures' `captures.json` records the opening tick, revision and PNG hashes.
 
 Release CI runs `scripts/build-windows-with-slots.sh --release-slots WORLD_DIR CARGO_TARGET_DIR` once on Linux. Use a new output directory for `WORLD_DIR`. The script decompresses the archived Overpass responses in `scripts/osm/release/`. Their exact bytes match the Lesce and Sava SHA-256 pins checked by `citymap-build`. OpenStreetMap contributors provide the archived data under the Open Database License. [OpenStreetMap attribution and license](https://www.openstreetmap.org/copyright)

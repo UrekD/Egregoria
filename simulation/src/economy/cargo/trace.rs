@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::Vec3;
+use ordered_float::OrderedFloat;
 use prototypes::{ItemID, Money, Tick};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,7 +13,9 @@ use super::{
     bounded_transfer, CargoBook, Endpoint, ImportDesk, ImportOrderKey, LoadId, ShipmentId,
     TRAIN_CAPACITY,
 };
-use crate::map::{BuildingID, LaneID, LaneKind, Map, TraverseKind};
+use crate::map::{
+    Building, BuildingID, Lane, LaneID, LaneKind, Map, ProjectFilter, ProjectKind, TraverseKind,
+};
 use crate::map_dynamic::Itinerary;
 use crate::{CompanyID, TrainID, VehicleID};
 
@@ -170,20 +173,132 @@ pub(crate) struct RailAnchor {
 }
 
 impl RailAnchor {
-    pub fn near(map: &Map, hint: Vec3) -> Option<Self> {
-        const SNAP_RADIUS: f32 = 50.0;
-        let lane = map.nearest_lane(hint, LaneKind::Rail, Some(SNAP_RADIUS))?;
-        let track = &map.get(lane)?.points;
-        let offset = track.length_at_proj(track.project(hint));
+    const SNAP_RADIUS: f32 = 50.0;
+    const MIN_HEADING_DOT: f32 = 0.8;
+    const DECK_TOLERANCE: f32 = 4.0;
+
+    fn project(lane: &Lane, hint: Vec3) -> Option<Self> {
+        let track = &lane.points;
+        let (position, segment) = track.project_segment_2d(hint.xy());
+        if segment == 0 || position.distance2(hint) > Self::SNAP_RADIUS.powi(2) {
+            return None;
+        }
+        let offset = track[0..segment]
+            .windows(2)
+            .map(|pair| pair[0].distance(pair[1]))
+            .sum::<f32>()
+            + track[segment - 1].distance(position);
         let (position, dir) = track.point_dir_along(offset);
-        // Terminals and outside markets are sited on the ground beside or
-        // below the rails. Measure reach to the actual track in three dimensions.
-        (position.distance2(hint) <= SNAP_RADIUS * SNAP_RADIUS).then_some(Self {
-            lane,
+        Some(Self {
+            lane: lane.id,
             offset,
             position,
             dir,
         })
+    }
+
+    fn nearby(map: &Map, hint: Vec3) -> impl Iterator<Item = (&Lane, Self)> {
+        map.spatial_map()
+            .query_around(hint.xy(), Self::SNAP_RADIUS, ProjectFilter::ROAD)
+            .filter_map(move |object| match object {
+                ProjectKind::Road(id) => map.get(id),
+                _ => None,
+            })
+            .flat_map(|road| road.lanes_iter())
+            .filter(|&(_, kind)| kind == LaneKind::Rail)
+            .filter_map(move |(id, _)| {
+                let lane = map.get(id)?;
+                Some((lane, Self::project(lane, hint)?))
+            })
+    }
+
+    fn serving_tracks(anchors: Vec<Self>, hint: Vec3) -> Vec<Self> {
+        // A ground-level footprint cannot identify which of two vertically
+        // stacked tracks serves it. Use the ground deck when it is present.
+        let mut unambiguous: Vec<_> = anchors
+            .iter()
+            .copied()
+            .filter(|anchor| {
+                (anchor.position.z - hint.z).abs() <= Self::DECK_TOLERANCE
+                    || !anchors.iter().any(|other| {
+                        (anchor.position.z - other.position.z).abs() > Self::DECK_TOLERANCE
+                            && anchor.position.xy().distance2(other.position.xy())
+                                <= LaneKind::Rail.width().powi(2)
+                    })
+            })
+            .collect();
+        unambiguous.sort_unstable_by_key(|anchor| {
+            (OrderedFloat(anchor.position.distance2(hint)), anchor.lane)
+        });
+        unambiguous
+    }
+
+    pub(super) fn for_platform(map: &Map, station: &Building, stop: Vec3) -> Vec<Self> {
+        let Some(heading) = station.obb.axis()[1].try_normalize() else {
+            return Vec::new();
+        };
+        let side = -heading.perpendicular();
+        let protected = map.land_ownership().is_protected(station.id.into());
+        let mut aligned = Vec::new();
+        let mut spurs = Vec::new();
+        for (lane, anchor) in Self::nearby(map, stop) {
+            let Some(tangent) = anchor.dir.xy().try_normalize() else {
+                continue;
+            };
+            let dot = heading.dot(tangent);
+            let reaches_platform = (anchor.position.xy() - station.obb.center()).dot(side) > 0.0;
+            let reserved_corridor =
+                protected && map.land_ownership().is_protected(lane.parent.into());
+            if (reaches_platform && dot >= Self::MIN_HEADING_DOT)
+                || (reserved_corridor && dot.abs() >= Self::MIN_HEADING_DOT)
+            {
+                aligned.push(anchor);
+            } else if reaches_platform && anchor.is_platform_spur_end(map, lane, stop) {
+                spurs.push(anchor);
+            }
+        }
+        // Some stations use a stub that ends at their stop across the platform.
+        Self::serving_tracks(if aligned.is_empty() { spurs } else { aligned }, stop)
+    }
+
+    fn is_platform_spur_end(self, map: &Map, lane: &Lane, stop: Vec3) -> bool {
+        let end = if self.offset <= POSITION_TOLERANCE {
+            lane.src
+        } else if lane.points.length() - self.offset <= POSITION_TOLERANCE {
+            lane.dst
+        } else {
+            return false;
+        };
+        let Some(junction) = map.get(end).filter(|junction| junction.roads.len() == 1) else {
+            return false;
+        };
+        (self.position.z - stop.z).abs() <= Self::DECK_TOLERANCE
+            && junction.pos.xy().distance2(stop.xy()) <= LaneKind::Rail.width().powi(2)
+    }
+
+    pub(super) fn for_market(map: &Map, market: &Building) -> Vec<Self> {
+        let [across, forward] = market.obb.axis();
+        // The legacy outside market straddles a two-way line along its second dimension.
+        let legacy = across.mag2() > forward.mag2();
+        let Some(heading) = (if legacy { across } else { forward }).try_normalize() else {
+            return Vec::new();
+        };
+        let hint = market.obb.center().z(market.height);
+        let anchors = Self::nearby(map, hint)
+            .filter_map(|(_, anchor)| {
+                let dot = heading.dot(anchor.dir.xy().try_normalize()?);
+                let alignment = if legacy { dot.abs() } else { dot };
+                (alignment >= Self::MIN_HEADING_DOT && market.obb.contains(anchor.position.xy()))
+                    .then_some(anchor)
+            })
+            .collect();
+        Self::serving_tracks(anchors, hint)
+    }
+
+    #[cfg(test)]
+    pub(super) fn near(map: &Map, hint: Vec3) -> Option<Self> {
+        let lane = map.nearest_lane(hint, LaneKind::Rail, Some(Self::SNAP_RADIUS))?;
+        Self::project(map.get(lane)?, hint)
     }
 
     fn well_formed(self) -> bool {

@@ -118,6 +118,20 @@ pub struct SourcePaths<'a> {
     pub sava: Option<&'a Path>,
 }
 
+#[cfg(test)]
+pub(crate) fn pinned_test_paths() -> SourcePaths<'static> {
+    SourcePaths {
+        lesce: Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/osm/release/lesce.json.gz"
+        )),
+        sava: Some(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/osm/release/sava.json.gz"
+        ))),
+    }
+}
+
 pub struct PinnedInputs {
     pub lesce: Extract,
     pub sava: Option<Extract>,
@@ -227,14 +241,7 @@ fn read_pin(
     query: &'static str,
 ) -> Result<Extract, String> {
     let read = || -> Result<Extract, String> {
-        const LIMIT: u64 = 16 * 1024 * 1024;
-        let mut bytes = Vec::new();
-        File::open(path)
-            .and_then(|file| file.take(LIMIT + 1).read_to_end(&mut bytes))
-            .map_err(|err| err.to_string())?;
-        if bytes.len() as u64 > LIMIT {
-            return Err("Overpass response exceeds 16 MiB".into());
-        }
+        let bytes = extract_bytes(path)?;
         let digest = digest(&bytes)?;
         if digest != sha256 {
             return Err(format!("SHA-256 mismatch: expected {sha256}, got {digest}"));
@@ -258,6 +265,38 @@ fn read_pin(
         })
     };
     read().map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn extract_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let read = |reader: &mut dyn Read| {
+        let mut bytes = Vec::new();
+        reader
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| err.to_string())?;
+        if bytes.len() as u64 > LIMIT {
+            return Err("Overpass response exceeds 16 MiB".into());
+        }
+        Ok(bytes)
+    };
+    let mut file = File::open(path).map_err(|err| err.to_string())?;
+    if path.extension().is_none_or(|ext| ext != "gz") {
+        return read(&mut file);
+    }
+    let mut gzip = Command::new("gzip")
+        .arg("-dc")
+        .stdin(file)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("start gzip: {err}"))?;
+    let bytes = read(&mut gzip.stdout.take().unwrap());
+    let status = gzip.wait().map_err(|err| err.to_string())?;
+    let bytes = bytes?;
+    if !status.success() {
+        return Err(format!("gzip failed: {status}"));
+    }
+    Ok(bytes)
 }
 
 fn digest(bytes: &[u8]) -> Result<String, String> {

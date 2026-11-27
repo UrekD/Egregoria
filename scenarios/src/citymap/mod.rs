@@ -1845,14 +1845,7 @@ mod tests {
     }
 
     fn pinned_inputs() -> PinnedInputs {
-        read_inputs(pinned_paths()).unwrap()
-    }
-
-    fn pinned_paths() -> SourcePaths<'static> {
-        SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        }
+        read_inputs(pinned_test_paths()).unwrap()
     }
 
     #[test]
@@ -1983,7 +1976,7 @@ mod tests {
             fs::create_dir(&out).unwrap();
             fs::write(out.join("Lesce_Town.zip"), b"existing ZIP").unwrap();
             fs::write(out.join("Lesce_Town.replay"), b"existing replay").unwrap();
-            let result = export_dry_slot(pinned_paths(), &out);
+            let result = export_dry_slot(pinned_test_paths(), &out);
             assert!(fs::read(out.join("Lesce_Town.zip")).unwrap() == b"existing ZIP");
             assert!(fs::read(out.join("Lesce_Town.replay")).unwrap() == b"existing replay");
             assert!(result.is_err());
@@ -1996,7 +1989,7 @@ mod tests {
         publication_fixture("report-dir", |scratch| {
             let out = scratch.join("town");
             fs::create_dir_all(out.join("lesce_town.build.json")).unwrap();
-            assert!(export_dry_slot(pinned_paths(), &out).is_err());
+            assert!(export_dry_slot(pinned_test_paths(), &out).is_err());
             assert!(!out.join("lesce_town.zip").exists());
             assert!(!out.join("lesce_town.meta.json").exists());
         });
@@ -2011,7 +2004,7 @@ mod tests {
             let out = scratch.join("town");
             fs::create_dir(&out).unwrap();
             std::os::unix::fs::symlink(&outside, out.join("lesce_town.build.json")).unwrap();
-            let result = export_dry_slot(pinned_paths(), &out);
+            let result = export_dry_slot(pinned_test_paths(), &out);
             assert!(fs::read(outside).unwrap() == b"outside data");
             assert!(result.is_err());
             assert!(!out.join("lesce_town.zip").exists());
@@ -2023,7 +2016,7 @@ mod tests {
         publication_fixture("case-root", |scratch| {
             let out = scratch.join("town");
             fs::create_dir(scratch.join("Town")).unwrap();
-            assert!(export_dry_slot(pinned_paths(), &out).is_err());
+            assert!(export_dry_slot(pinned_test_paths(), &out).is_err());
             assert_eq!(fs::read_dir(scratch).unwrap().count(), 1);
         });
     }
@@ -2049,16 +2042,21 @@ mod tests {
         publication_fixture("complete", |scratch| {
             let out = scratch.join("town");
             let duplicate = scratch.join("other town");
+            let paths = pinned_test_paths();
             build_cli(
                 [
                     OsString::from("--dry"),
                     OsString::from("--out"),
                     OsString::from(&out),
+                    OsString::from("--input"),
+                    OsString::from(paths.lesce),
+                    OsString::from("--sava-input"),
+                    OsString::from(paths.sava.unwrap()),
                 ]
                 .into_iter(),
             )
             .unwrap();
-            export_dry_slot(pinned_paths(), &duplicate).unwrap();
+            export_dry_slot(paths, &duplicate).unwrap();
             assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
             assert_eq!(fs::read_dir(scratch).unwrap().count(), 2);
             for name in ["lesce_town.zip", "lesce_town.build.json"] {

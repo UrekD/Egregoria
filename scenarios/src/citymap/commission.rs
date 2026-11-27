@@ -4591,16 +4591,11 @@ mod tests {
     #[test]
     fn citymap_wet_freight_dispatches_from_its_authored_market() {
         use crate::citymap::{
-            build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
-            DEFAULT_LESCE, DEFAULT_SAVA,
+            build_wet_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
         };
         use simulation::economy::cargo::{FreightStage, FreightTrace};
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let (mut sim, _, freight) = build_wet_town(&mut plan).unwrap();
@@ -4642,16 +4637,10 @@ mod tests {
     #[test]
     fn citymap_wet_frontage_serves_homes_and_leaves_infill() {
         use crate::citymap::{
-            build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
-            DEFAULT_LESCE, DEFAULT_SAVA,
+            build_wet_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
         };
-        use std::path::Path;
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
@@ -4838,15 +4827,12 @@ mod tests {
 
     #[test]
     fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
-        use crate::citymap::{build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA};
+        use crate::citymap::{
+            build_dry_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
+        };
         use simulation::map::LaneKind;
-        use std::path::Path;
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let shortcut = SourceKey::Infill { number: 7, part: 4 };
@@ -4860,16 +4846,11 @@ mod tests {
     #[test]
     fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
         use crate::citymap::{
-            build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA,
+            build_dry_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
         };
         use simulation::map::LaneKind;
-        use std::path::Path;
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let (sim, built) = build_dry_town(&plan).unwrap();
@@ -4884,17 +4865,12 @@ mod tests {
     #[test]
     fn cm2_layout_restores_alpska_crosswalk() {
         use crate::citymap::{
-            build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA,
+            build_dry_town, pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
         };
         use simulation::map::{LaneKind, PathKind, TurnKind};
         use simulation::map_dynamic::Itinerary;
-        use std::path::Path;
 
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let (sim, built) = build_dry_town(&plan).unwrap();

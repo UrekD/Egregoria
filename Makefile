@@ -19,9 +19,10 @@ test-sim:
 
 scenarios:
 	cargo run --locked -p scenarios --release -- all
-	$(MAKE) citymap-gate
+	cargo test --locked --release -p scenarios --lib citymap_wet_freight_dispatches_from_its_authored_market
 
 .PHONY: citymap-gate
+# Required before releasing a build. Generates and loads the release slots.
 citymap-gate:
 	@set -eu; \
 	root=$$(mktemp -d "$${TMPDIR:-/tmp}/egr-citymap-gate.XXXXXX"); \
