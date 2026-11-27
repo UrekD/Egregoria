@@ -14,7 +14,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use common::{ChunkID_256, FastMap};
 use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
-use simulation::souls::events::{fire_incident, ServiceIncidents};
+use simulation::souls::events::{fire_incident, FireEventKind, Fires, ServiceIncidents};
 use simulation::souls::service_dispatch::{service_station, FireFleet, FireResponseEventKind};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -393,13 +393,21 @@ fn draw_fire_response(
     let fleet = sim.read::<FireFleet>();
     let selected = uiworld.read::<InspectedBuilding>().e;
     let colors = simulation::colors();
-    let mut arrived = 0;
+    let now = simulation::diagnostics::elapsed_tick(sim);
+    let since = now.0.saturating_sub(24 * TICKS_PER_HOUR);
+    let mut on_scene = 0;
+    let mut unresolved = 0;
+    let mut oldest_pending = 0;
     let mut active = 0;
     for incident in incidents.active() {
         active += 1;
         let response = fleet.response(incident.site, incident.id);
         let working = response.is_some_and(|response| response.arrived);
-        arrived += usize::from(working);
+        on_scene += usize::from(working);
+        unresolved += usize::from(!working);
+        if !working {
+            oldest_pending = oldest_pending.max(now.0.saturating_sub(incident.alarm_tick.0));
+        }
         if bounds.contains(incident.position.xy()) {
             let color = if working { colors.gui_success } else { colors.gui_danger };
             draw.stroke_circle(incident.position.up(0.4), 4.0, 1.0).color(color);
@@ -440,25 +448,43 @@ fn draw_fire_response(
             }
         }
     }
-    let mut assigned = std::collections::BTreeMap::new();
-    let mut durations = Vec::new();
-    for event in fleet.events() {
+    let fires = sim.read::<Fires>();
+    let mut alarms = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut failed = 0;
+    for event in fires.events_since(0) {
         match event.kind {
-            FireResponseEventKind::Assigned => { assigned.insert(event.incident, event.tick); }
-            FireResponseEventKind::Arrived => {
-                if let Some(start) = assigned.remove(&event.incident) {
-                    durations.push(event.tick.0.saturating_sub(start.0));
-                }
-            }
+            FireEventKind::Ignited => alarms.entry(event.building).or_default().push(event.tick),
+            FireEventKind::Collapsed if event.tick.0 >= since => failed += 1,
             _ => {}
         }
     }
+    let mut durations = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for event in fleet.events() {
+        if event.tick.0 < since || event.kind != FireResponseEventKind::Arrived
+            || !seen.insert(event.incident)
+        {
+            continue;
+        }
+        let Some(alarms) = alarms.get(&event.site) else { continue };
+        let after = alarms.partition_point(|&tick| tick <= event.tick);
+        if let Some(start) = after.checked_sub(1).and_then(|index| alarms.get(index)) {
+            durations.push(event.tick.0.saturating_sub(start.0));
+        }
+    }
     durations.sort_unstable();
-    let mut summary = format!("{active} active fires · {arrived} crews on scene");
+    let minutes = |ticks| ticks as f64 / prototypes::TICKS_PER_MINUTE as f64;
+    let mut summary = format!("{active} active fires · {on_scene} crews on scene · {unresolved} awaiting arrival");
+    if unresolved != 0 {
+        summary.push_str(&format!(" · Oldest wait {:.1} min", minutes(oldest_pending)));
+    }
+    summary.push_str(&format!("\nLast 24 game hours in history · {failed} fire losses"));
     if !durations.is_empty() {
-        let p95 = durations[(durations.len() * 95).div_ceil(100) - 1];
-        let minutes = p95 as f64 / prototypes::TICKS_PER_MINUTE as f64;
-        summary.push_str(&format!(" · Dispatch to arrival p95 {minutes:.1} min"));
+        let percentile = |percent: usize| minutes(durations[(durations.len() * percent).div_ceil(100) - 1]);
+        summary.push_str(&format!(
+            " · First arrival p50 {:.1} / p95 {:.1} min ({} arrivals)",
+            percentile(50), percentile(95), durations.len()
+        ));
     }
     summary
 }
@@ -655,7 +681,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         (Sewage, "Sewage"),
         (WaterBodies, "Water Bodies"),
         (Coverage(ServiceKind::Health), "Health coverage"),
-        (Coverage(ServiceKind::Fire), "Fire prevention and response"),
+        (Coverage(ServiceKind::Fire), "Fire prevention reach"),
         (Coverage(ServiceKind::Police), "Police coverage"),
         (Coverage(ServiceKind::School), "School coverage"),
         (Coverage(ServiceKind::Garbage), "Garbage coverage"),
