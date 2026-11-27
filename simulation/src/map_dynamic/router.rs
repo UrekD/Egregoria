@@ -619,14 +619,24 @@ fn routing_changed(
                 );
                 if !truck {
                     if h.location == Location::Vehicle(car) {
-                        let exit_pos = world
-                            .vehicles
-                            .get(car)
-                            .map_or(h.trans.pos, |v| exit_beside(map, v));
+                        let recover_in_place =
+                            checked_property || driveways.properties.has_public_garages();
+                        let exit_pos = world.vehicles.get(car).map_or(h.trans.pos, |v| {
+                            if recover_in_place {
+                                exit_beside(map, v)
+                            } else {
+                                v.trans.pos
+                            }
+                        });
                         walk_outside(id, exit_pos, &cbuf_human, &mut h.location);
                         h.it = Itinerary::NONE;
-                        let home = map.get(h.home.house).map(|home| home.door_pos);
-                        cbuf_vehicle.exec_ent(car, move |sim| recover_car_later(sim, car, home));
+                        if recover_in_place {
+                            let home = map.get(h.home.house).map(|home| home.door_pos);
+                            cbuf_vehicle.exec_ent(car, move |sim| recover_car_later(sim, car, home));
+                        } else {
+                            router.forget_vehicle(car);
+                            cbuf_vehicle.kill(car);
+                        }
                     }
                     let vehicle = router.vehicle.take();
                     route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
