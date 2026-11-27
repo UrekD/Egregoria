@@ -205,6 +205,9 @@ impl HumanWork {
         (1 << Self::Pedestrian as usize) | (1 << Self::Itinerary as usize);
 
     fn movement_membership(human: &HumanEnt) -> u8 {
+        if human.it.get_point().is_some() {
+            return Self::ITINERARY_MEMBERSHIP;
+        }
         let needs_itinerary_update = !human.it.is_inert()
             || (human.location == Location::Outside && human.collider.is_some());
         (u8::from(!human.pedestrian.is_still(human)) << Self::Pedestrian as usize)
@@ -285,7 +288,6 @@ impl ActivitySet {
 struct HumanActivity {
     slots: Vec<(HumanID, u8)>,
     sets: [ActivitySet; HumanWork::COUNT],
-    scratch: [Vec<HumanID>; HumanWork::COUNT],
     dirty: bool,
     #[cfg(test)]
     full_scan: bool,
@@ -329,6 +331,11 @@ impl HumanActivity {
         if !self.dirty {
             let slot = Self::slot(id);
             let previous = self.slots[slot].1;
+            if previous & HumanWork::ITINERARY_MEMBERSHIP == HumanWork::ITINERARY_MEMBERSHIP
+                && human.it.get_point().is_some()
+            {
+                return;
+            }
             self.set(
                 slot,
                 (previous & !HumanWork::ITINERARY_MEMBERSHIP)
@@ -523,14 +530,26 @@ impl HumanStorage {
         kind: HumanWork,
         mut edit: impl FnMut(HumanID, &mut HumanEdit<'_>),
     ) {
-        // These passes only change the current human. Cross-entity callbacks
-        // drain after the pass, before the next phase collects its own IDs.
-        let mut ids = std::mem::take(&mut self.activity.scratch[kind as usize]);
-        self.collect_active(kind, &mut ids);
-        for &id in &ids {
-            self.edit_guarded(id, |human| edit(id, human));
+        #[cfg(test)]
+        if self.activity.full_scan {
+            self.edit_each_split(edit);
+            return;
         }
-        self.activity.scratch[kind as usize] = ids;
+        self.activity.rebuild(&self.entities);
+        let kind = kind as usize;
+        // A callback can only change its current slot. Copying each word
+        // keeps the phase's order while allowing the callback to refresh it.
+        for group in 0..self.activity.sets[kind].nonempty.len() {
+            let blocks = self.activity.sets[kind].nonempty.get(group).copied().unwrap_or(0);
+            for bit in set_bits(blocks) {
+                let block = group * 64 + bit;
+                let slots = self.activity.sets[kind].words[block];
+                for offset in set_bits(slots) {
+                    let id = self.activity.slots[block * 64 + offset].0;
+                    self.edit_guarded(id, |human| edit(id, human));
+                }
+            }
+        }
     }
 
     fn insert_indexed(&mut self, human: HumanEnt) -> HumanID {
