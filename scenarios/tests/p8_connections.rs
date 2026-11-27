@@ -368,6 +368,17 @@ fn rail_fixture(schedule: RailSchedule) -> (ScenarioCtx, LineID) {
     passenger_rail_fixture(schedule, false).unwrap()
 }
 
+fn rail_project(
+    sim: &Simulation,
+    point: Vec2,
+    radius: f32,
+    filter: simulation::map::ProjectFilter,
+) -> simulation::map::MapProject {
+    let map = sim.map();
+    let elevation = map.environment().height(point).unwrap();
+    map.project(point.z(elevation), radius, filter)
+}
+
 fn passenger_rail_fixture(
     schedule: RailSchedule,
     across_road: bool,
@@ -384,7 +395,7 @@ fn passenger_rail_fixture(
     let road_pattern = LanePatternBuilder::new().build();
     let rail_pattern = LanePatternBuilder::new().rail(true).one_way(true).build();
     let mut connect = |from: Vec2, to: Vec2, rail: bool| {
-        let endpoint = |pos: Vec2| ctx.sim.map().project(pos.z0(), 1.0, ProjectFilter::INTER);
+        let endpoint = |pos| rail_project(&ctx.sim, pos, 1.0, ProjectFilter::INTER);
         let (from, to) = (endpoint(from), endpoint(to));
         let command = WorldCommand::MapMakeConnection {
             from,
@@ -401,20 +412,20 @@ fn passenger_rail_fixture(
     for y in [south, north] {
         connect(vec2(west + 25.0, y), vec2(east - 25.0, y), false);
     }
+    let platform_setback = 50.0;
     let corners = [
-        vec2(west, south + 30.0),
-        vec2(east, south + 30.0),
-        vec2(east, north - 30.0),
-        vec2(west, north - 30.0),
+        vec2(west, south + platform_setback),
+        vec2(east, south + platform_setback),
+        vec2(east, north - platform_setback),
+        vec2(west, north - platform_setback),
     ];
     for (&from, &to) in corners.iter().zip(corners.iter().cycle().skip(1)) {
         connect(from, to, true);
     }
-    // The rail right of way leaves residential lots on the far sidewalk.
-    // Add junction crosswalks before placing the stations and issuing offers.
+    // Provide crosswalks before placing stations and issuing offers.
     for (x, y, end_y) in [(800.0, south, 520.0), (900.0, north, 1080.0)] {
-        let from = ctx.sim.map().project(vec2(x, y).z0(), 5.0, ProjectFilter::ROAD);
-        let to = ctx.sim.map().project(vec2(x, end_y).z0(), 1.0, ProjectFilter::INTER);
+        let from = rail_project(&ctx.sim, vec2(x, y), 5.0, ProjectFilter::ROAD);
+        let to = rail_project(&ctx.sim, vec2(x, end_y), 1.0, ProjectFilter::INTER);
         apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
             from,
             to,
@@ -424,7 +435,10 @@ fn passenger_rail_fixture(
     }
 
     let mut platforms = Vec::new();
-    for (road_y, track_y, side) in [(south, south + 30.0, 1.0), (north, north - 30.0, -1.0)] {
+    for (road_y, track_y, side) in [
+        (south, south + platform_setback, 1.0),
+        (north, north - platform_setback, -1.0),
+    ] {
         let side = if across_road { -side } else { side };
         let x = 850.0;
         let road = ctx
@@ -544,9 +558,20 @@ fn p8_rail_recurring_zero_lateness_departures() {
 fn p8_rail_bus_connections_in_both_directions() {
     use simulation::map::{LanePatternBuilder, ProjectFilter};
 
+    // The feeder buses can bunch at the first stop. Allow another circuit
+    // for riders whose access walk misses the opening departure.
+    const COHORT_CUTOFF: u64 = 50_000;
     let (mut ctx, _) = rail_fixture(RailSchedule::default());
-    let from = ctx.sim.map().project(vec2(800.0, 520.0).z0(), 1.0, ProjectFilter::INTER);
-    let to = ctx.sim.map().project(vec2(800.0, 120.0).z0(), 1.0, ProjectFilter::INTER);
+    let from = rail_project(&ctx.sim, vec2(800.0, 520.0), 1.0, ProjectFilter::INTER);
+    let to = rail_project(&ctx.sim, vec2(800.0, 120.0), 1.0, ProjectFilter::INTER);
+    apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
+        from,
+        to,
+        inter: None,
+        pat: LanePatternBuilder::new().build(),
+    }]);
+    let from = rail_project(&ctx.sim, vec2(100.0, 230.0), 1.0, ProjectFilter::INTER);
+    let to = rail_project(&ctx.sim, vec2(800.0, 230.0), 5.0, ProjectFilter::ROAD);
     apply(&mut ctx.sim, &[WorldCommand::MapMakeConnection {
         from,
         to,
@@ -554,16 +579,21 @@ fn p8_rail_bus_connections_in_both_directions() {
         pat: LanePatternBuilder::new().build(),
     }]);
     let mut stops = Vec::new();
-    for (point, direction) in [(vec2(800.0, 230.0), Vec2::Y), (vec2(865.0, 600.0), -Vec2::X)] {
+    for (point, direction) in [
+        (vec2(250.0, 230.0), Vec2::X),
+        (vec2(865.0, 600.0), -Vec2::X),
+        (vec2(250.0, 230.0), -Vec2::X),
+    ] {
         let add = {
             let map = ctx.sim.map();
+            let point = point.z(map.environment().height(point).unwrap());
             let lane = map.lanes().values()
                 .filter(|lane| lane.kind == LaneKind::Driving)
-                .filter(|lane| lane.points.first_dir().is_some_and(|dir| dir.xy().dot(direction) > 0.9))
-                .min_by(|a, b| a.points.project_dist(point.z0()).total_cmp(&b.points.project_dist(point.z0())))
+                .filter(|lane| lane.points.project_segment_dir(point).2.xy().dot(direction) > 0.9)
+                .min_by(|a, b| a.points.project_dist(point).total_cmp(&b.points.project_dist(point)))
                 .unwrap();
             WorldCommand::TransitAddStop {
-                pos: lane.points.project(point.z0()),
+                pos: lane.points.project(point),
                 dir: direction,
             }
         };
@@ -572,12 +602,12 @@ fn p8_rail_bus_connections_in_both_directions() {
     }
     apply(&mut ctx.sim, &[WorldCommand::TransitCreateLine { stops }]);
     let bus = ctx.sim.read::<Transit>().lines.keys().last().unwrap();
-    apply(&mut ctx.sim, &[WorldCommand::TransitSetVehicles { line: bus, n: 3 }]);
+    apply(&mut ctx.sim, &[WorldCommand::TransitSetVehicles { line: bus, n: 4 }]);
 
-    let destination = house(&mut ctx.sim, vec2(900.0, 1020.0));
+    let destination = house(&mut ctx.sim, vec2(930.0, 980.0));
     let mut cohort = Vec::new();
     for _ in 0..20 {
-        let home = house(&mut ctx.sim, vec2(780.0, 260.0));
+        let home = house(&mut ctx.sim, vec2(250.0, 230.0));
         cohort.push((spawn_human(&mut ctx.sim, home).unwrap(), home));
     }
     ctx.run_ticks(950);
@@ -593,7 +623,7 @@ fn p8_rail_bus_connections_in_both_directions() {
             h.decision.kind = HumanDecisionKind::GoTo(dest);
             trips.push((id, building, Vec::new(), 0, false));
         }
-        for _ in 0..CUTOFF {
+        for _ in 0..COHORT_CUTOFF {
             ctx.run_ticks(1);
             for (id, dest, modes, previous, arrived) in trips.iter_mut().filter(|trip| !trip.4) {
                 let h = ctx.sim.get(*id).unwrap();
@@ -633,8 +663,8 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
             fare: Money::new_bucks(2),
         }],
     );
-    let from = house(&mut ctx.sim, vec2(800.0, 620.0));
-    let to = house(&mut ctx.sim, vec2(900.0, 980.0));
+    let from = house(&mut ctx.sim, vec2(750.0, 625.0));
+    let to = house(&mut ctx.sim, vec2(930.0, 980.0));
     let human = spawn_human(&mut ctx.sim, from).unwrap();
     let offer = |sim: &mut Simulation, to| {
         let h = sim.world_mut_unchecked().humans.get_mut(human).unwrap();
@@ -777,8 +807,8 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
 #[test]
 fn p8_rail_removal_drains_a_rider_at_the_next_platform() {
     let (mut ctx, line) = rail_fixture(RailSchedule::default());
-    let from = house(&mut ctx.sim, vec2(800.0, 620.0));
-    let to = house(&mut ctx.sim, vec2(900.0, 980.0));
+    let from = house(&mut ctx.sim, vec2(750.0, 625.0));
+    let to = house(&mut ctx.sim, vec2(930.0, 980.0));
     let rider = spawn_human(&mut ctx.sim, from).unwrap();
     ctx.run_ticks(950);
     let human = ctx.sim.world_mut_unchecked().humans.get_mut(rider).unwrap();
