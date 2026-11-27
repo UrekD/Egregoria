@@ -1995,7 +1995,7 @@ impl WorldCommand {
             return Ok(());
         }
         let map = sim.map();
-        let protected = traffic.protected_roads(&map);
+        let protected = traffic.protected_roads(&map, matches!(self, MapRemoveRoad(_)));
         let touches_junction = |id| {
             map.get(id).is_some_and(|joint: &crate::map::Intersection| {
                 joint.roads.iter().any(|&road| protected.contains(&road))
@@ -2585,9 +2585,30 @@ impl WorldCommand {
                 .try_remove_intersection(id)
                 .map_err(Rejection::water_connection_error)?,
             MapRemoveRoad(id) => {
-                sim.map_mut()
-                    .try_remove_road(id)
+                use crate::map_dynamic::ParkingManagement;
+                use crate::transportation::DrivewayTraffic;
+
+                let mut traffic = sim.write::<DrivewayTraffic>();
+                let mut map = sim.map_mut();
+                let affected = if traffic.properties.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    let road = map.get(id).ok_or(Rejection::MissingReference)?;
+                    [road.src, road.dst]
+                        .into_iter()
+                        .filter_map(|joint| map.get(joint))
+                        .flat_map(|joint| joint.roads.iter().copied())
+                        .collect()
+                };
+                map.try_remove_road(id)
                     .map_err(Rejection::water_connection_error)?;
+                if !affected.is_empty() {
+                    traffic.properties.retire_invalidated_vacant(
+                        &mut map,
+                        &affected,
+                        &mut sim.write::<ParkingManagement>(),
+                    );
+                }
             }
             MapRemoveBuilding(id) => {
                 if !crate::souls::lifecycle::remove_site(sim, id) {

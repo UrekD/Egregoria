@@ -397,12 +397,15 @@ mod pathpark_driveway {
 
     impl Sweep {
         pub(crate) fn between(from: Transform, to: Transform) -> Self {
-            let radius = from.pos.distance(to.pos) * 0.9;
+            Self::with_tangent(from, to, from.pos.distance(to.pos) * 0.9)
+        }
+
+        pub(crate) fn with_tangent(from: Transform, to: Transform, tangent_m: f32) -> Self {
             let curve = Spline3 {
                 from: from.pos,
                 to: to.pos,
-                from_derivative: from.dir * radius,
-                to_derivative: to.dir * radius,
+                from_derivative: from.dir * tangent_m,
+                to_derivative: to.dir * tangent_m,
             };
             Self {
                 points: std::array::from_fn(|i| curve.get(i as f32 / SWEEP_STEPS as f32)),
@@ -1072,7 +1075,7 @@ mod pathpark_driveway {
                 .any(|f| f.claim.as_ref().is_some_and(|c| c.vehicle == vehicle))
         }
 
-        pub(crate) fn protected_roads(&self, map: &Map) -> BTreeSet<RoadID> {
+        pub(crate) fn protected_roads(&self, map: &Map, retire_vacant: bool) -> BTreeSet<RoadID> {
             let mut roads = BTreeSet::new();
             for facility in &self.facilities {
                 roads.insert(facility.anchor.road);
@@ -1084,7 +1087,7 @@ mod pathpark_driveway {
                     roads.extend(route.roads(map));
                 }
             }
-            self.properties.protected_roads(map, &mut roads);
+            self.properties.protected_roads(map, &mut roads, retire_vacant);
             roads
         }
 

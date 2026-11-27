@@ -905,7 +905,7 @@ fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
             parking.entrance.side
         ));
         if parking.daily_upkeep != prototypes::Money::ZERO {
-            label(format!("Upkeep · ${} per day", parking.daily_upkeep));
+            label(format!("Upkeep · {} per day", parking.daily_upkeep));
         }
         if !parking.open {
             label("Closed to arrivals");

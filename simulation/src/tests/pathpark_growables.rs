@@ -27,6 +27,16 @@ fn pathpark_home_car_uses_its_own_parcel() {
         )
         .unwrap()
         .building;
+    use crate::world_command::WorldCommand;
+    use common::saveload::{Bincode, Encoder};
+    let checkpoint = Bincode::encode(&ctx.g).unwrap();
+    let mut vacant: crate::Simulation = Bincode::decode(&checkpoint).unwrap();
+    assert_eq!(vacant.building_parking(house).unwrap().occupied, 0);
+    vacant.apply_commands([&WorldCommand::MapRemoveRoad(lot.parent)]);
+    assert!(vacant.map().get(lot.parent).is_none());
+    assert!(vacant.building_parking(house).is_none());
+    assert!(Bincode::decode::<crate::Simulation>(&Bincode::encode(&vacant).unwrap()).is_ok());
+
     crate::souls::human::spawn_human(&mut ctx.g, house).unwrap();
     let car = ctx
         .g
@@ -41,6 +51,10 @@ fn pathpark_home_car_uses_its_own_parcel() {
         car.vehicle.state
     );
     assert!(lot.shape.contains(car.trans.pos.xy()));
+    ctx.g
+        .apply_commands([&WorldCommand::MapRemoveRoad(lot.parent)]);
+    assert!(ctx.g.map().get(lot.parent).is_some());
+    assert_eq!(ctx.g.building_parking(house).unwrap().occupied, 1);
 }
 
 #[test]

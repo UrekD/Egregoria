@@ -34,7 +34,7 @@ pub(crate) fn properties(uiw: &UiWorld) {
         mincolumn(5.0, || {
             minrow(6.0, || {
                 for kind in [GarageKind::MultiStorey, GarageKind::Underground] {
-                    let label = format!("{} · ${}", kind.label(), kind.cost());
+                    let label = format!("{} · {}", kind.label(), kind.cost());
                     if selectable_label_primary(state.kind == kind, &label).clicked {
                         state.kind = kind;
                         state.clear();

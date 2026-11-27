@@ -8,7 +8,7 @@
   {"WaitFrames": 6},
   {"Screenshot": "p7-pathpark-garage-inspector"},
   "ClearBuildingInspector",
-  {"Camera": {"x": 280, "y": 105, "z": 0, "yaw": 0.16, "pitch": 1.05, "dist": 325}},
+  {"Camera": {"x": 257, "y": 108, "z": 0, "yaw": 1.45, "pitch": 0.9, "dist": 242}},
   {"WaitFrames": 8},
   {"Screenshot": "p7-pathpark-public-garages"},
   {"Camera": {"x": 400, "y": 118, "z": 0, "yaw": 0.16, "pitch": 1.05, "dist": 120}},
@@ -16,5 +16,8 @@
   {"Pointer": {"action": "Click", "world_pos": [398, 113, 0]}},
   {"WaitFrames": 6},
   {"Screenshot": "p7-pathpark-garage-entrance"},
+  {"Pointer": {"action": "Click", "world_pos": [398, 113, 0]}},
+  {"WaitFrames": 8},
+  {"Assert": "NoRejections"},
   "Exit"
 ]

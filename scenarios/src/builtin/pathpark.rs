@@ -45,11 +45,33 @@ fn setup(sim: &mut Simulation) -> Result<Vec<BuildingID>, String> {
             .map()
             .lots()
             .values()
+            .filter(|lot| {
+                kind != ZoneKind::Commercial || {
+                    let axes = lot.shape.axis().map(|axis| axis.mag());
+                    let center = lot.shape.center();
+                    axes[0] >= 29.5
+                        && axes[1] >= 29.5
+                        && center.y < 100.0
+                        && (175.0..310.0).contains(&center.x)
+                }
+            })
             .min_by(|a, b| {
-                a.shape
-                    .center()
-                    .distance2(point)
-                    .total_cmp(&b.shape.center().distance2(point))
+                let area_order = if kind == ZoneKind::Commercial {
+                    let area = |lot: &simulation::map::Lot| {
+                        let [width, depth] = lot.shape.axis().map(|axis| axis.mag());
+                        width * depth
+                    };
+                    area(b).total_cmp(&area(a))
+                } else {
+                    std::cmp::Ordering::Equal
+                };
+                area_order
+                    .then_with(|| {
+                        a.shape
+                            .center()
+                            .distance2(point)
+                            .total_cmp(&b.shape.center().distance2(point))
+                    })
                     .then(a.id.cmp(&b.id))
             })
             .ok_or("no parcel")?
@@ -96,6 +118,12 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         .any(|parking| parking.kind == BuildingParkingKind::IntegratedGarage)
     {
         return Err("no integrated garage was commissioned".into());
+    }
+    if !summaries
+        .iter()
+        .any(|parking| parking.kind == BuildingParkingKind::RearLot)
+    {
+        return Err("no shop rear lot was commissioned".into());
     }
     let capacity: u64 = summaries
         .iter()

@@ -494,6 +494,10 @@ fn remove_pure_site(sim: &mut Simulation, kind: ZoneKind, surplus: f64) -> Resul
                 if site.zone.kind != kind || site.site != GrowableSiteState::Active {
                     return None;
                 }
+                // A matched control can retire a different site of the same capacity.
+                if sim.building_parking(id).is_some_and(|parking| parking.occupied != 0 || parking.held != 0) {
+                    return None;
+                }
                 let (slots, users) = if kind == Residential {
                     (site.housing_slots, site.occupants)
                 } else {
@@ -692,6 +696,15 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 }
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
+    // Give property users time to drive out before the staffed frontage cut.
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
+    let close: Vec<_> = live.sim.map().buildings().keys()
+        .filter(|&id| live.sim.building_parking(id).is_some_and(|parking| parking.open))
+        .map(|building| WorldCommand::SetBuildingParkingOpen { building, open: false })
+        .collect();
+    if !close.is_empty() {
+        run_teardown_batch(live, &close, 1)?;
+    }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
     stage_teardown_hires(live)?;
     let (roads, affected) = staffed_teardown_frontage(&live.sim)?;
@@ -957,6 +970,8 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
         }
         workers_by_home
             .into_iter()
+            .filter(|&(home, _)| ctx.sim.building_parking(home)
+                .is_none_or(|parking| parking.occupied == 0 && parking.held == 0))
             .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
@@ -1057,18 +1072,22 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
             Some((id, company, map.get(id)?.connected_road?))
         })
         .collect();
+    let legal_roads: BTreeSet<_> = sites.iter().map(|&(_, _, road)| road)
+        .collect::<BTreeSet<_>>().into_iter()
+        .filter(|&road| WorldCommand::MapRemoveRoad(road).validate_and_price(sim).is_ok())
+        .collect();
     let job_road = sites
         .iter()
         .find_map(|&(_, company, road)| {
-            hires
-                .contains(&SoulID::GoodsCompany(company))
+            (legal_roads.contains(&road) && hires.contains(&SoulID::GoodsCompany(company)))
                 .then_some(road)
         })
         .ok_or_else(|| failure("a pending Mixed Use hire"))?;
     let cargo = sim.read::<CargoBook>();
     let freight_road = sites
         .iter()
-        .filter(|&&(id, _, _)| cargo.stock_for(id).values().any(|stock| stock.incoming > 0))
+        .filter(|&&(id, _, road)| legal_roads.contains(&road)
+            && cargo.stock_for(id).values().any(|stock| stock.incoming > 0))
         .min_by_key(|&&(_, _, road)| (road != job_road, road))
         .map(|&(_, _, road)| road)
         .ok_or_else(|| failure("an incoming Mixed Use freight claim"))?;
@@ -1080,7 +1099,8 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
         .collect();
     let basket_road = sites
         .iter()
-        .filter(|&&(_, company, _)| baskets.contains(&SoulID::GoodsCompany(company)))
+        .filter(|&&(_, company, road)| legal_roads.contains(&road)
+            && baskets.contains(&SoulID::GoodsCompany(company)))
         .min_by_key(|&&(_, _, road)| (road != job_road && road != freight_road, road))
         .map(|&(_, _, road)| road)
         .ok_or_else(|| failure("a pending Mixed Use basket"))?;
@@ -1794,6 +1814,25 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
         return Err("seller closure changed the controlled housing role".into());
     }
     ctx.reload()?;
+    if ctx.sim.building_parking(storefront).is_some() {
+        run_teardown_batch(
+            ctx,
+            &[WorldCommand::SetBuildingParkingOpen {
+                building: storefront,
+                open: false,
+            }],
+            1,
+        )?;
+        let until = elapsed(&ctx.sim) + 2 * TICKS_PER_HOUR;
+        while ctx.sim.building_parking(storefront).is_some_and(|parking| {
+            parking.occupied != 0 || parking.held != 0
+        }) {
+            if elapsed(&ctx.sim) >= until {
+                return Err("controlled storefront parking did not drain before demolition".into());
+            }
+            ctx.run_ticks(32);
+        }
+    }
     if let Some(root) = &shots_root {
         publish(
             &ctx.sim,

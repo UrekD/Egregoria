@@ -232,7 +232,12 @@ pub(crate) fn prepare_property_parking(
         } else {
             BuildingParkingKind::RearLot
         };
-        for offset in [width * 0.3, -width * 0.3, width * 0.22, -width * 0.22] {
+        let offsets = if residential {
+            [0.30, -0.30, 0.22, -0.22]
+        } else {
+            [0.36, -0.36, 0.40, -0.40]
+        };
+        for offset in offsets.map(|fraction| width * fraction) {
             let target = front + across * offset;
             let Some(anchor) = anchor_near(map, road, target + (parcel.center() - front) * 0.15)
             else {
@@ -357,8 +362,16 @@ impl LayoutDraft {
                 return None;
             }
             let parked = Transform::new_dir(pos, direction.z0());
-            let into = Sweep::between(from, parked);
-            let out = Sweep::between(parked, to);
+            let sweep = |a: Transform, b: Transform| {
+                if self.kind == BuildingParkingKind::RearLot {
+                    // Keep long approaches centered in the narrow side aisle.
+                    Sweep::with_tangent(a, b, 9.0)
+                } else {
+                    Sweep::between(a, b)
+                }
+            };
+            let into = sweep(from, parked);
+            let out = sweep(parked, to);
             if paths.iter().any(|other| {
                 let other_stall = other.into.pose(MOTION_TICKS).pos;
                 let reaches = |sweep: &Sweep, stall: Vec3| {
@@ -924,14 +937,55 @@ impl BuildingParking {
         });
     }
 
-    pub(crate) fn protected_roads(&self, map: &Map, roads: &mut BTreeSet<RoadID>) {
-        roads.extend(self.mouths.keys().copied());
+    pub(crate) fn protected_roads(
+        &self,
+        map: &Map,
+        roads: &mut BTreeSet<RoadID>,
+        retire_vacant: bool,
+    ) {
+        for (&id, site) in &self.sites {
+            if !retire_vacant
+                || self.busy(id)
+                || matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_))
+            {
+                roads.insert(site.layout.anchor.road);
+            }
+        }
         for route in self
             .motions
             .values()
             .filter_map(|motion| motion.departure.as_ref())
         {
             roads.extend(route.roads(map));
+        }
+    }
+
+    pub(crate) fn retire_invalidated_vacant(
+        &mut self,
+        map: &mut Map,
+        affected: &BTreeSet<RoadID>,
+        parking: &mut ParkingManagement,
+    ) {
+        let vacant: Vec<_> = affected
+            .iter()
+            .filter_map(|road| self.mouths.get(road))
+            .flatten()
+            .map(|&(_, id)| id)
+            .filter(|&id| {
+                let layout = &self.sites[&id].layout;
+                !self.busy(id) && !matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) && {
+                    let anchor = layout.anchor;
+                    map.pick_curb(anchor.road, anchor.side, anchor.station_cm) != Some(anchor)
+                        || layout.masks.iter().any(|&mask| !map.parking.contains(mask))
+                }
+            })
+            .collect();
+        for id in vacant {
+            self.remove_empty(id, parking);
+            if let Some(building) = map.buildings.get(id) {
+                map.subscribers
+                    .dispatch(crate::map::UpdateType::Building, building);
+            }
         }
     }
 
@@ -1292,7 +1346,11 @@ pub(crate) fn refresh_property(
             current.capacity = layout.capacity;
         }
     } else if let Some(layout) = layout {
+        let was_closed = properties.sites.get(&id).is_some_and(|site| site.closing);
         properties.install(id, layout, parking);
+        if was_closed {
+            properties.set_open(id, false);
+        }
     } else {
         properties.remove_empty(id, parking);
     }
