@@ -2,7 +2,8 @@ use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, vec3};
 use simulation::map::building_parking::{parking_entrance_near, BuildingParkingKind, GarageKind};
 use simulation::map::{
-    BuildingID, Density, LanePatternBuilder, MapProject, ProjectKind, ZoneCell, ZoneKind,
+    BuildingID, Density, LanePatternBuilder, MapProject, ProjectFilter, ProjectKind, ZoneCell,
+    ZoneKind,
 };
 use simulation::map_dynamic::Destination;
 use simulation::souls::human::spawn_human;
@@ -37,25 +38,30 @@ fn setup(sim: &mut Simulation, round_trip: bool) -> Result<Vec<BuildingID>, Stri
         pat: LanePatternBuilder::default().build(),
     }]);
     if round_trip {
-        let (start, end) = {
-            let map = sim.map();
-            let road = map.roads().values().next().ok_or("no fixture road")?;
-            let joint = |id| MapProject {
-                pos: map.intersections()[id].pos,
-                kind: ProjectKind::Intersection(id),
+        let path = [
+            vec3(450.0, 100.0, 0.0),
+            vec3(450.0, 280.0, 0.0),
+            vec3(75.0, 280.0, 0.0),
+            vec3(75.0, 100.0, 0.0),
+        ];
+        for pair in path.windows(2) {
+            let [from, to] = {
+                let map = sim.map();
+                std::array::from_fn(|index| map.project(pair[index], 0.0, ProjectFilter::ALL))
             };
-            (joint(road.src), joint(road.dst))
-        };
-        let links = [(1, 2), (2, 3), (3, 0)]
-            .into_iter()
-            .map(|(from, to)| (from, to, None, LanePatternBuilder::default().build()))
-            .collect();
-        sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(
-            vec![start, end, ground(450.0, 280.0), ground(75.0, 280.0)],
-            links,
-        )]);
-        if sim.map().roads().len() != 4 {
-            return Err("could not close the tagged driver's return loop".into());
+            sim.apply_commands([&WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: LanePatternBuilder::default().build(),
+            }]);
+            let outcomes = sim.read::<CommandOutcomes>();
+            if outcomes.accepted.len() != 1 {
+                return Err(format!(
+                    "tagged return loop at {pair:?}: {:?}",
+                    outcomes.last
+                ));
+            }
         }
     }
     let mut sites = Vec::new();
@@ -216,7 +222,10 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         ctx.run_ticks(1);
         let person = &ctx.sim.world().humans[driver];
         if person.location == Location::Building(home)
-            && ctx.sim.building_parking(home).is_some_and(|parking| parking.occupied == 1)
+            && ctx
+                .sim
+                .building_parking(home)
+                .is_some_and(|parking| parking.occupied == 1)
             && ctx
                 .sim
                 .building_parking(garage)
