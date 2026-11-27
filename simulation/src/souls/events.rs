@@ -20,7 +20,7 @@ const LEGACY_LIMIT: usize = 4096;
 const PENDING_LIMIT: usize = 512;
 const PENDING_TTL: u64 = TICKS_PER_HOUR;
 const RISK_BUDGET: usize = 256;
-const EVENT_BUDGET: usize = 128;
+const EVENT_BUDGET: usize = 32;
 const EVENT_HISTORY_LIMIT: usize = 256;
 #[cfg(test)]
 pub(crate) const UPDATE_OFFSET: u64 = 4;
@@ -279,11 +279,13 @@ pub fn events_update(sim: &mut Simulation) {
     let mut loss = None;
     {
         let mut incidents = sim.write::<ServiceIncidents>();
-        if incidents.next_risk_minute > tick.0 / TICKS_PER_MINUTE
-            && incidents
-                .scheduled
-                .first()
-                .is_none_or(|(due, _)| *due > tick)
+        let risk_due = incidents.next_risk_minute <= tick.0 / TICKS_PER_MINUTE;
+        let incident_due = incidents
+            .scheduled
+            .first()
+            .is_some_and(|(due, _)| *due <= tick);
+        if !risk_due
+            && !incident_due
             && incidents.offers.first().is_none_or(|offer| {
                 incidents.active.len() >= ACTIVE_LIMIT
                     && tick.0.saturating_sub(offer.due.0) < PENDING_TTL
@@ -295,7 +297,9 @@ pub fn events_update(sim: &mut Simulation) {
         let map = sim.map();
         let mut history = sim.write::<Fires>();
 
-        if incidents.next_risk_minute <= tick.0 / TICKS_PER_MINUTE {
+        // Advance the risk cursor on ticks without due incidents. Incident work
+        // can include a site closure and its command-buffer cleanup.
+        if risk_due && !incident_due {
             sample_risk(sim, &map, &mut incidents);
         }
         for _ in 0..EVENT_BUDGET {
@@ -340,30 +344,41 @@ pub fn events_update(sim: &mut Simulation) {
             let next_update = incident.next_update;
             incidents.scheduled.insert((next_update, id));
         }
-        for _ in 0..EVENT_BUDGET {
-            let Some(offer) = incidents.offers.first().copied() else {
-                break;
-            };
-            if tick.0.saturating_sub(offer.due.0) >= PENDING_TTL {
-                incidents.remove_offer(offer);
-                incidents.counters.expired += 1;
-                continue;
-            }
-            if incidents.active.len() >= ACTIVE_LIMIT {
-                break;
-            }
-            incidents.remove_offer(offer);
-            let Some(site) = map.get(offer.site).filter(|building| eligible(building)) else {
-                incidents.counters.ineligible += 1;
-                continue;
-            };
-            incidents.start(offer, tick, site.obb.center().z(site.height));
-            history.record(tick, offer.site, FireEventKind::Ignited);
+        if loss.is_none() {
+            process_offers(&map, &mut incidents, &mut history, tick);
         }
     }
     if let Some(id) = loss {
         super::demolition::ruin_site(sim, id, super::demolition::SiteRemnantCause::Fire)
             .expect("an incident loss retains its occupied site");
+    }
+}
+
+fn process_offers(
+    map: &crate::map::Map,
+    incidents: &mut ServiceIncidents,
+    history: &mut Fires,
+    tick: Tick,
+) {
+    for _ in 0..EVENT_BUDGET {
+        let Some(offer) = incidents.offers.first().copied() else {
+            break;
+        };
+        if tick.0.saturating_sub(offer.due.0) >= PENDING_TTL {
+            incidents.remove_offer(offer);
+            incidents.counters.expired += 1;
+            continue;
+        }
+        if incidents.active.len() >= ACTIVE_LIMIT {
+            break;
+        }
+        incidents.remove_offer(offer);
+        let Some(site) = map.get(offer.site).filter(|building| eligible(building)) else {
+            incidents.counters.ineligible += 1;
+            continue;
+        };
+        incidents.start(offer, tick, site.obb.center().z(site.height));
+        history.record(tick, offer.site, FireEventKind::Ignited);
     }
 }
 
@@ -603,6 +618,55 @@ where
 mod tests {
     use super::*;
     use common::saveload::{Bincode, Encoder};
+
+    #[test]
+    fn p9_round3_expired_offers_are_drained_in_bounded_batches() {
+        let mut test = crate::tests::TestCtx::new_fast();
+        let now = elapsed_tick(&test.g);
+        {
+            let mut incidents = test.g.write::<ServiceIncidents>();
+            for i in 1..=65 {
+                incidents.offer(Offer {
+                    due: now,
+                    site: BuildingID::from(slotmapd::KeyData::from_ffi((1 << 32) | i)),
+                });
+            }
+            incidents.next_risk_minute = u64::MAX;
+        }
+        test.g.write::<prototypes::GameTime>().tick.0 += PENDING_TTL;
+        for expired in [32, 64, 65] {
+            events_update(&mut test.g);
+            let incidents = test.g.read::<ServiceIncidents>();
+            assert_eq!(incidents.counters.expired, expired);
+            assert_eq!(incidents.pending_count(), 65 - expired as usize);
+            drop(incidents);
+            test.g.write::<prototypes::GameTime>().tick.0 += 1;
+        }
+    }
+
+    #[test]
+    fn p9_round3_loss_leaves_other_fire_work_for_the_next_tick() {
+        let (mut test, _) = crate::tests::p9_fire::fire_station_on_parking_loop();
+        let lost = test.build_house_near(geom::vec2(100.0, 435.0));
+        let waiting = test.build_house_near(geom::vec2(135.0, 435.0));
+        assert!(offer_fixture_fire(&test.g, lost));
+        events_update(&mut test.g);
+        test.g.write::<prototypes::GameTime>().tick.0 += LOSS_MINUTES * TICKS_PER_MINUTE;
+        assert!(offer_fixture_fire(&test.g, waiting));
+        let risk_minute = test.g.read::<ServiceIncidents>().next_risk_minute;
+
+        events_update(&mut test.g);
+        crate::utils::scheduler::drain_commands(&mut test.g);
+        assert!(test.g.map().is_ruined(lost));
+        assert!(fire_incident(&test.g, waiting).is_none());
+        assert_eq!(test.g.read::<ServiceIncidents>().pending_count(), 1);
+        assert_eq!(test.g.read::<ServiceIncidents>().next_risk_minute, risk_minute);
+
+        test.g.write::<prototypes::GameTime>().tick.0 += 1;
+        events_update(&mut test.g);
+        assert!(fire_incident(&test.g, waiting).is_some());
+        assert!(test.g.read::<ServiceIncidents>().next_risk_minute > risk_minute);
+    }
 
     #[test]
     fn p9_pending_offers_keep_the_earliest_keys_without_renewing_duplicates() {

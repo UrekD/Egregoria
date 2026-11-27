@@ -698,6 +698,7 @@ struct Departure {
 
 struct VehicleDepartureReferences {
     by_vehicle: BTreeMap<VehicleID, VehicleReferences>,
+    vehicle_range: Option<(VehicleID, VehicleID)>,
     active_routes: Vec<(usize, HumanID)>,
 }
 
@@ -709,11 +710,17 @@ struct VehicleReferences {
 
 impl VehicleDepartureReferences {
     fn for_vehicles(vehicles: impl IntoIterator<Item = VehicleID>) -> Self {
+        let by_vehicle: BTreeMap<_, _> = vehicles
+            .into_iter()
+            .map(|id| (id, VehicleReferences::default()))
+            .collect();
+        let vehicle_range = by_vehicle
+            .first_key_value()
+            .zip(by_vehicle.last_key_value())
+            .map(|((&first, _), (&last, _))| (first, last));
         Self {
-            by_vehicle: vehicles
-                .into_iter()
-                .map(|id| (id, VehicleReferences::default()))
-                .collect(),
+            by_vehicle,
+            vehicle_range,
             active_routes: Vec::new(),
         }
     }
@@ -738,7 +745,13 @@ impl VehicleDepartureReferences {
 
     #[inline]
     fn record_human(&mut self, order: usize, id: HumanID, human: &HumanEnt, include_steps: bool) {
+        let Some((first, last)) = self.vehicle_range else {
+            return;
+        };
         let mut record = |vehicle| {
+            if vehicle < first || vehicle > last {
+                return;
+            }
             if let Some(refs) = self.by_vehicle.get_mut(&vehicle) {
                 if refs.humans.last() != Some(&(order, id)) {
                     refs.humans.push((order, id));
@@ -944,6 +957,8 @@ fn prepare_human_departures(
     mut departing: BTreeMap<HumanID, Departure>,
     closed_home: Option<(BuildingID, Vec3)>,
 ) {
+    let departing_range = *departing.first_key_value().expect("departure batch").0
+        ..=*departing.last_key_value().expect("departure batch").0;
     let (world, resources) = sim.world_res();
     // During a single house closure, all three indexes need the same residents.
     // Build them before the command drain while the routes and cars still exist.
@@ -964,11 +979,13 @@ fn prepare_human_departures(
             references.record_human(order, buyer, human, true);
         }
         for soul in human.bought.0.values().flatten().flat_map(|trade| [trade.buyer.0, trade.seller.0]) {
-            if let SoulID::Human(id) = soul {
-                if let Some(entry) = departing.get_mut(&id) {
-                    if entry.human_buyers.last() != Some(&buyer) {
-                        entry.human_buyers.push(buyer);
-                    }
+            let entry = match soul {
+                SoulID::Human(id) if departing_range.contains(&id) => departing.get_mut(&id),
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                if entry.human_buyers.last() != Some(&buyer) {
+                    entry.human_buyers.push(buyer);
                 }
             }
         }
