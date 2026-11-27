@@ -5,7 +5,8 @@ use crate::builders::{
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, vec3, Vec2, Vec3};
 use prototypes::{
-    try_prototype, ItemID, ResidencePrototypeID, Size2D, Tick, TICKS_PER_DAY, TICKS_PER_HOUR,
+    try_prototype, ItemID, ResidencePrototypeID, Size2D, Tick, HOURS_PER_DAY, TICKS_PER_DAY,
+    TICKS_PER_HOUR,
 };
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::economy::cargo::{CargoBook, RoadDeadlineCounts};
@@ -1274,7 +1275,7 @@ fn check_commissioning(ctx: &ScenarioCtx, mixed: bool) -> Result<(), String> {
 
 #[derive(Default)]
 struct Observation {
-    resident_days: f64,
+    resident_hours: u64,
     external_shops: u64,
     local_pickups: u64,
     baskets_due: u64,
@@ -1288,6 +1289,12 @@ struct Observation {
     mixed_shelf_peak: i32,
     productive_recipients: usize,
     capacity: DistrictCapacity,
+}
+
+impl Observation {
+    fn resident_days(&self) -> f64 {
+        self.resident_hours as f64 / f64::from(HOURS_PER_DAY)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1309,9 +1316,9 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
     let mut utility_samples = 0;
     let mut utility_served = 0.0;
     for day in first_day..first_day + OBSERVATION_DAYS {
-        for _ in 0..24 {
+        for _ in 0..HOURS_PER_DAY {
             let capacity = district_capacity(&ctx.sim);
-            result.resident_days += ctx.sim.world().humans.len() as f64 / 24.0;
+            result.resident_hours += ctx.sim.world().humans.len() as u64;
             result.capacity.housing_slots += capacity.housing_slots;
             result.capacity.available_jobs += capacity.available_jobs;
             result.capacity.filled_jobs += capacity.filled_jobs;
@@ -1409,13 +1416,13 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
     }
     result.road_deadlines = ctx.sim.read::<CargoBook>().road_deadline_counts();
     result.productive_recipients = productive_recipients.len();
-    let hours = (OBSERVATION_DAYS * 24) as f64;
+    let hours = OBSERVATION_DAYS as f64 * f64::from(HOURS_PER_DAY);
     result.capacity.housing_slots /= hours;
     result.capacity.available_jobs /= hours;
     result.capacity.filled_jobs /= hours;
     println!(
         "operating window: {:.2} resident-days, {} filled/{} due baskets, {} external arrivals, {} local pickups, {:.2} food stockout hours, utilities {:.2}/{}",
-        result.resident_days, result.baskets_filled, result.baskets_due, result.external_shops,
+        result.resident_days(), result.baskets_filled, result.baskets_due, result.external_shops,
         result.local_pickups, result.food_stockout_hours, utility_served, utility_samples
     );
     if utility_samples == 0 || utility_served / f64::from(utility_samples) < 0.95 {
@@ -1438,7 +1445,7 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
             "mx_productive_recipients".into(),
             result.productive_recipients as f64,
         ),
-        ("resident_days".into(), result.resident_days),
+        ("resident_days".into(), result.resident_days()),
         ("local_pickups".into(), result.local_pickups as f64),
         (
             "external_shopping_arrivals".into(),
@@ -1506,9 +1513,9 @@ fn check_control_capacity(mixed: DistrictCapacity, pure: DistrictCapacity) -> Re
 }
 
 fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), String> {
-    let trips = |data: &Observation| data.external_shops as f64 / data.resident_days.max(1.0);
+    let trips = |data: &Observation| data.external_shops as f64 / data.resident_days().max(1.0);
     let filled = |data: &Observation| data.baskets_filled as f64 / data.baskets_due.max(1) as f64;
-    let stockout = |data: &Observation| data.food_stockout_hours / data.resident_days.max(1.0);
+    let stockout = |data: &Observation| data.food_stockout_hours / data.resident_days().max(1.0);
     let evidence = format!(
         "MX economy (mixed/pure): local={}, receipt units={}, producing recipients={}, external trips/resident-day={:.3}/{:.3}, fill={:.3}/{:.3}, stockout hours/resident-day={:.3}/{:.3}",
         mixed.local_pickups, mixed.mixed_receipt_units, mixed.productive_recipients, trips(mixed), trips(pure),
@@ -1523,13 +1530,16 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         ));
     }
     check_control_capacity(mixed.capacity, pure.capacity)?;
+    let trip_denominator =
+        |data: &Observation| u128::from(data.resident_hours.max(HOURS_PER_DAY as u64));
+    // Cross-multiply the two rates to accept exactly 90% of the pure rate.
+    let meets_shopping_reduction = 10 * u128::from(mixed.external_shops) * trip_denominator(pure)
+        <= 9 * u128::from(pure.external_shops) * trip_denominator(mixed);
     if mixed.local_pickups < 4
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
         || pure.external_shops == 0
-        // P6 owner decision (2026-11-26): lower the reduction gate from 10% to 8%.
-        // Observed 9.2% (0.808 vs 0.890 trips/resident-day) with all MX baskets filled.
-        || trips(mixed) > 0.92 * trips(pure)
+        || !meets_shopping_reduction
         || filled(mixed) < 0.8
         || filled(mixed) + 0.05 < filled(pure)
         || stockout(mixed) > 1.5
@@ -1570,11 +1580,16 @@ fn zones2_staffed_frontage_teardown_replays() {
     verify_mixed_frontage_replay(&mut ScenarioCtx::from_sim(commissioning), &scratch.0).unwrap();
 }
 
-#[test]
-fn zones2_shopping_gate_accepts_eight_percent_reduction() {
+#[cfg(test)]
+fn assert_shopping_gate_boundary(
+    pure_hours: u64,
+    pure_trips: u64,
+    mixed_hours: u64,
+    mixed_trips: u64,
+) {
     let pure = Observation {
-        resident_days: 100.0,
-        external_shops: 100,
+        resident_hours: pure_hours,
+        external_shops: pure_trips,
         baskets_due: 10,
         baskets_filled: 10,
         capacity: DistrictCapacity {
@@ -1585,22 +1600,46 @@ fn zones2_shopping_gate_accepts_eight_percent_reduction() {
         ..Observation::default()
     };
     let mut mixed = Observation {
-        external_shops: 92,
+        resident_hours: mixed_hours,
+        external_shops: mixed_trips,
         local_pickups: 4,
-        road_deadlines: RoadDeadlineCounts { due: 10, on_time: 10 },
+        road_deadlines: RoadDeadlineCounts {
+            due: 10,
+            on_time: 10,
+        },
         mixed_receipt_units: 10,
         productive_recipients: 1,
         ..pure
     };
     compare_economies(&mixed, &pure).unwrap();
-    mixed.external_shops = 93;
+    mixed.external_shops += 1;
     assert!(compare_economies(&mixed, &pure).is_err());
+}
+
+#[test]
+fn zones2_shopping_gate_requires_ten_percent_reduction() {
+    assert_shopping_gate_boundary(100 * 24, 100, 100 * 24, 90);
+}
+
+#[test]
+fn zones2_shopping_gate_accepts_exact_reduction_at_repeating_rates() {
+    assert_shopping_gate_boundary(11 * 24, 10, 11 * 24, 9);
+}
+
+#[test]
+fn zones2_shopping_gate_accepts_exact_reduction_with_unequal_population() {
+    assert_shopping_gate_boundary(1488 * 24, 1271, 1440 * 24, 1107);
+}
+
+#[test]
+fn zones2_shopping_gate_floors_denominators_at_one_resident_day() {
+    assert_shopping_gate_boundary(23, 10, 0, 9);
 }
 
 #[test]
 fn zones2_freight_gate_counts_cancelled_loads() {
     let pure = Observation {
-        resident_days: 10.0,
+        resident_hours: 10 * 24,
         external_shops: 10,
         baskets_due: 10,
         baskets_filled: 10,
@@ -1628,7 +1667,7 @@ fn zones2_freight_gate_counts_cancelled_loads() {
 #[test]
 fn zones2_freight_gate_counts_an_overdue_final_day_load() {
     let pure = Observation {
-        resident_days: 10.0,
+        resident_hours: 10 * 24,
         external_shops: 10,
         baskets_due: 10,
         baskets_filled: 10,

@@ -1001,6 +1001,232 @@ mod tests {
         );
     }
 
+    fn stock_shop(sim: &Simulation, store: BuildingID, quantities: [i32; 2]) {
+        use crate::economy::Market;
+        use crate::souls::household::household_items;
+
+        let seller = sim.read::<BuildingInfos>().owner(store).unwrap();
+        let door = sim.map().get(store).unwrap().door_pos.xy();
+        let mut market = sim.write::<Market>();
+        for (item, qty) in household_items().into_iter().zip(quantities) {
+            if qty > 0 {
+                market.produce(seller, item, qty);
+                market.sell_all(seller, door, item, 0);
+            }
+        }
+    }
+
+    fn shopping_street(downstairs: [i32; 2], other: [i32; 2]) -> (TestCtx, BuildingID, BuildingID) {
+        let (mut test, _) = street();
+        let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
+        let commercial = place(&mut test.g, ZoneKind::Commercial, 345.0);
+        add_souls_to_empty_buildings(&mut test.g);
+        stock_shop(&test.g, mixed, downstairs);
+        stock_shop(&test.g, commercial, other);
+        (test, mixed, commercial)
+    }
+
+    fn ready_shopper(sim: &mut Simulation, home: BuildingID) -> crate::HumanID {
+        let shopper = spawn_human(sim, home).unwrap();
+        sim.world.edit_human(shopper, |human| {
+            human.household.next_shop = 0;
+            human.decision.wait = 0;
+        });
+        shopper
+    }
+
+    #[test]
+    fn zones2_z2_downstairs_substitution_does_not_displace_a_larger_food_fill() {
+        use crate::souls::household::household_items;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_downstairs_substitution_does_not_displace_a_larger_food_fill"
+            ),
+            || {
+                let (mut test, mixed, commercial) = shopping_street([0, 1], [2, 0]);
+                let [groceries, retail] = household_items();
+                let shopper = ready_shopper(&mut test.g, mixed);
+                test.g.world.edit_human(shopper, |human| {
+                    human.household.on_hand.insert(groceries, 2);
+                    human.household.on_hand.insert(retail, 3);
+                });
+                test.tick_fast();
+
+                let seller = test.g.read::<BuildingInfos>().owner(commercial).unwrap();
+                let household = &test.g.get(shopper).unwrap().household;
+                assert_eq!(household.basket_seller(), Some(seller));
+                assert_eq!(
+                    household.reservation.as_ref().unwrap().lines,
+                    [(groceries, 2)]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_throttled_downstairs_shelf_falls_back_on_the_same_tick() {
+        use crate::economy::DailyEconomyMetrics;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_throttled_downstairs_shelf_falls_back_on_the_same_tick"
+            ),
+            || {
+                let (mut test, mixed, commercial) = shopping_street([2, 10], [4, 2]);
+                let first = ready_shopper(&mut test.g, mixed);
+                let second = ready_shopper(&mut test.g, mixed);
+                test.tick_fast();
+
+                let seller = test.g.read::<BuildingInfos>().owner(commercial).unwrap();
+                assert_eq!(test.g.get(first).unwrap().household.basket_seller(), None);
+                assert_eq!(
+                    test.g.get(second).unwrap().household.basket_seller(),
+                    Some(seller)
+                );
+                let metrics = test.g.read::<DailyEconomyMetrics>();
+                assert_eq!(metrics.days[&0].local_pickups, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_resident_away_from_home_keeps_the_ordinary_basket_ranking() {
+        use crate::economy::DailyEconomyMetrics;
+        use crate::transportation::Location;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_resident_away_from_home_keeps_the_ordinary_basket_ranking"
+            ),
+            || {
+                let (mut test, mixed, commercial) = shopping_street([2, 4], [4, 2]);
+                let shopper = ready_shopper(&mut test.g, mixed);
+                let door = test.g.map().get(commercial).unwrap().door_pos;
+                test.g.world.edit_human(shopper, |human| {
+                    human.location = Location::Building(commercial);
+                    human.trans.pos = door;
+                });
+                {
+                    let mut infos = test.g.write::<BuildingInfos>();
+                    infos.get_out(mixed, SoulID::Human(shopper));
+                    infos.get_in(commercial, SoulID::Human(shopper));
+                }
+                test.tick_fast();
+
+                let household = &test.g.get(shopper).unwrap().household;
+                let [groceries, _] = crate::souls::household::household_items();
+                assert_eq!(household.carried.get(&groceries), Some(&4));
+                assert!(household.on_hand.is_empty());
+                let metrics = test.g.read::<DailyEconomyMetrics>();
+                assert_eq!(metrics.days[&0].local_pickups, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_competing_shelves_operating_window() {
+        use crate::economy::{DailyEconomyMetrics, TripPurpose, TICKS_PER_BUDGET_DAY};
+        use crate::map_dynamic::transit::elapsed_ticks;
+        use prototypes::ItemID;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_competing_shelves_operating_window"
+            ),
+            || {
+                let (mut test, mixed, _) = shopping_street([3, 7], [20, 20]);
+                test.g
+                    .write::<residence::Residences>()
+                    .by_building
+                    .get_mut(&mixed)
+                    .unwrap()
+                    .capacity = 1;
+                // Observe six operating hours through the standard day close.
+                let start = TICKS_PER_BUDGET_DAY - 6 * TICKS_PER_HOUR;
+                let tick = Tick(test.g.get_tick() + start);
+                *test.g.write::<GameTime>() = GameTime::new(tick);
+                ready_shopper(&mut test.g, mixed);
+                for _ in start..=TICKS_PER_BUDGET_DAY {
+                    test.tick_fast();
+                }
+
+                assert_eq!(test.g.world.humans.len(), 1);
+                let (_, resources) = test.g.world_res();
+                let metrics = resources.read::<DailyEconomyMetrics>();
+                let day = metrics.closed_day(0, elapsed_ticks(resources).0).unwrap();
+                let trips = day
+                    .trips_by_purpose
+                    .get(&TripPurpose::Shopping)
+                    .map_or(0, |stats| stats.completed);
+                let stockout_ticks = day
+                    .stockout_ticks_by_sku
+                    .get(&ItemID::new("effective-food"))
+                    .copied()
+                    .unwrap_or_default();
+                let (filled, due) = (day.baskets_filled.unwrap(), day.baskets_due.unwrap());
+                println!(
+                    "Competing shelves recorded {} local pickups, {trips} external arrivals, {filled}/{due} baskets filled, and {stockout_ticks} effective-food stockout ticks",
+                    day.local_pickups
+                );
+                assert!(day.local_pickups > 0);
+                assert_eq!(trips, 0);
+                assert_eq!(filled, due);
+                assert!(stockout_ticks < TICKS_PER_HOUR);
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_full_downstairs_basket_beats_more_groceries_elsewhere() {
+        use crate::economy::{DailyEconomyMetrics, TripPurpose};
+        use crate::souls::household::household_items;
+        use crate::transportation::Location;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_full_downstairs_basket_beats_more_groceries_elsewhere"
+            ),
+            || {
+                let (mut test, mixed, commercial) = shopping_street([2, 4], [4, 2]);
+                let shopper = ready_shopper(&mut test.g, mixed);
+                let [groceries, retail] = household_items();
+
+                test.tick_fast();
+
+                let human = test.g.get(shopper).unwrap();
+                assert_eq!(human.location, Location::Building(mixed));
+                assert_eq!(human.household.units(groceries), 2);
+                assert_eq!(human.household.units(retail), 4);
+
+                let second_shopper = ready_shopper(&mut test.g, mixed);
+                let other_seller = test.g.read::<BuildingInfos>().owner(commercial).unwrap();
+                stock_shop(&test.g, mixed, [2, 0]);
+                test.tick_fast();
+                assert_eq!(
+                    test.g
+                        .get(second_shopper)
+                        .unwrap()
+                        .household
+                        .basket_seller(),
+                    Some(other_seller),
+                    "a shelf with too little stock still competes on the usual ranking"
+                );
+
+                let metrics = test.g.read::<DailyEconomyMetrics>();
+                let day = &metrics.days[&0];
+                assert_eq!(day.local_pickups, 1);
+                assert_eq!(day.baskets_filled, Some(1));
+                assert!(!day.trips_by_purpose.contains_key(&TripPurpose::Shopping));
+            },
+        );
+    }
+
     #[test]
     fn zones2_z2_downstairs_deposit_is_local_and_the_closed_shop_leaves_housing() {
         use crate::economy::{DailyEconomyMetrics, Market, TripPurpose};
