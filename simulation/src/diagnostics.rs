@@ -47,22 +47,24 @@ pub fn begin_benchmark_work() {
 }
 
 pub fn end_benchmark_work() -> BenchmarkWork {
-    BENCHMARK_WORK.take().expect("benchmark work recording was not started")
+    BENCHMARK_WORK
+        .take()
+        .expect("benchmark work recording was not started")
 }
 
 fn record_benchmark_work(record: impl FnOnce(&mut BenchmarkWork)) {
-    BENCHMARK_WORK.update(|mut current| {
-        if let Some(work) = &mut current {
-            record(work);
+    BENCHMARK_WORK.with(|state| {
+        if let Some(mut work) = state.get() {
+            record(&mut work);
+            state.set(Some(work));
         }
-        current
     });
 }
 
 pub(crate) fn record_trip_offer(purpose: TripPurpose) {
     record_benchmark_work(|work| match purpose {
         TripPurpose::FreightOutbound => work.freight_offers += 1,
-        TripPurpose::FreightReturn => {},
+        TripPurpose::FreightReturn => {}
         _ => work.person_offers += 1,
     });
 }

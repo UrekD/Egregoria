@@ -157,7 +157,9 @@ fn blocker_description(blocker: CitizenBlocker) -> &'static str {
         CitizenBlocker::DestinationRemoved => "The route's destination was removed",
         CitizenBlocker::DestinationDisconnected => "The destination has no road connection",
         CitizenBlocker::PickupTimedOut => "The last retail pickup timed out",
-        CitizenBlocker::Route(RouterError::PropertyParkingBlocked) => "The driveway entrance is blocked",
+        CitizenBlocker::Route(RouterError::PropertyParkingBlocked) => {
+            "The driveway entrance is blocked"
+        }
         CitizenBlocker::Route(RouterError::PropertyParkingUnavailable(_)) => {
             "The property parking claim is no longer available"
         }

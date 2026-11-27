@@ -26,7 +26,13 @@ fn usage() -> String {
     let names = SCENARIOS
         .iter()
         .map(|(scenario, _)| scenario.name)
-        .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
+        .chain([
+            PERF_10K.0.name,
+            pathpark::SCALE.0.name,
+            "all",
+            "all_staged",
+            "zones2_staged",
+        ])
         .collect::<Vec<_>>()
         .join("|");
     format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios pathpark-fixture --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios traffic-repair compare --fixtures repair-cohort,repair-no-loss [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair compare --root DIR --fixtures ID --edit QUOTE.json [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair soak --root DIR --fixtures ID --days N [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair perf --agents N --layout compact|growing --warmup W --ticks T --pairs N --modes LIST [--manifest PATH] [--json PATH]\n       scenarios traffic-repair stage --manifest PATH --class release|diagnostic --out DIR [--bundle-root DIR] [--run-source SHA]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
@@ -265,7 +271,7 @@ fn run() -> Result<(), String> {
         "zones2_staged" => zones2_scenarios().collect(),
         _ => SCENARIOS
             .iter()
-            .chain(std::iter::once(&PERF_10K))
+            .chain([&PERF_10K, &pathpark::SCALE])
             .filter(|(scenario, _)| scenario.name == name)
             .collect(),
     };
@@ -343,7 +349,7 @@ fn run() -> Result<(), String> {
             None => None,
         };
         let mut ctx = ScenarioCtx::new(*options);
-        if json.is_some() && (scenario.name == "perf" || scenario.name == PERF_10K.0.name) {
+        if json.is_some() && matches!(scenario.name, "perf" | "perf_10k" | "pathpark_scale") {
             ctx.enable_perf_timings();
         }
         let run = |ctx: &mut ScenarioCtx| {

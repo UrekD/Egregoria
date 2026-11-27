@@ -70,7 +70,11 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
     const WARMUP_TICKS: u64 = 2_000;
     const MEASURED_TICKS: u64 = 10_000;
     let mut opening = crate::runner::ParkingOpening::capture(&ctx.sim);
-    for (label, ticks) in [("setup", 0), ("warmup", WARMUP_TICKS), ("measured", MEASURED_TICKS)] {
+    for (label, ticks) in [
+        ("setup", 0),
+        ("warmup", WARMUP_TICKS),
+        ("measured", MEASURED_TICKS),
+    ] {
         if label == "measured" {
             if let Some(opening) = opening.take() {
                 opening.write(&ctx.sim, None, WARMUP_TICKS, MEASURED_TICKS)?;
@@ -149,7 +153,11 @@ fn setup_bakeries(ctx: &mut ScenarioCtx) -> Result<usize, String> {
     Ok(companies)
 }
 
-fn setup_employers(ctx: &mut ScenarioCtx, houses: usize, percent: usize) -> Result<usize, String> {
+pub(super) fn setup_employers(
+    ctx: &mut ScenarioCtx,
+    houses: usize,
+    percent: usize,
+) -> Result<usize, String> {
     const EMPLOYER: &str = "clothes-store";
     let proto = try_prototype(GoodsCompanyID::new(EMPLOYER))
         .filter(|proto| proto.n_workers > 0)
@@ -183,7 +191,7 @@ fn setup_employers(ctx: &mut ScenarioCtx, houses: usize, percent: usize) -> Resu
     Err(format!("built {companies} of {company_count} employers"))
 }
 
-fn setup_houses(ctx: &mut ScenarioCtx, house_count: usize) -> Result<(), String> {
+pub(super) fn setup_houses(ctx: &mut ScenarioCtx, house_count: usize) -> Result<(), String> {
     // A house costs $100. Cover the default run and the 10,000-house comparison.
     grant_money(ctx, Money::new_bucks(1_000_000));
     let houses = fill_houses(ctx, house_count);

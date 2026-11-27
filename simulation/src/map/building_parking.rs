@@ -461,11 +461,15 @@ pub(crate) struct BuildingParking {
     #[serde(skip)]
     mouths: BTreeMap<RoadID, BTreeSet<(u32, BuildingID)>>,
     #[serde(skip)]
+    swept_bounds: BTreeMap<(i32, i32), BTreeSet<BuildingID>>,
+    #[serde(skip)]
     public_garages: BTreeMap<(i32, i32), BTreeSet<BuildingID>>,
     #[serde(skip)]
     closing_cars: BTreeSet<VehicleID>,
     #[serde(skip)]
     drain_cursor: Option<VehicleID>,
+    #[serde(skip)]
+    searches: BTreeMap<HumanID, crate::map_dynamic::PendingPropertySearch>,
     #[serde(deserialize_with = "bounded_parking_map::<_, _, _, MAX_LIVE_CLAIMS>")]
     parked: BTreeMap<VehicleID, Occupant>,
     #[serde(deserialize_with = "bounded_parking_map::<_, _, _, MAX_LIVE_CLAIMS>")]
@@ -535,12 +539,30 @@ struct Motion {
 }
 
 fn garage_cell(door: Vec3) -> (i32, i32) {
-    ((door.x / 200.0).floor() as i32, (door.y / 200.0).floor() as i32)
+    (
+        (door.x / 200.0).floor() as i32,
+        (door.y / 200.0).floor() as i32,
+    )
+}
+
+fn parking_bounds_cells(bounds: &AABB) -> impl Iterator<Item = (i32, i32)> {
+    let (left, bottom) = garage_cell(bounds.ll.z(0.0));
+    let (right, top) = garage_cell(bounds.ur.z(0.0));
+    (bottom..=top).flat_map(move |y| (left..=right).map(move |x| (x, y)))
+}
+
+#[derive(Deserialize)]
+struct ParkingRuntime {
+    drain_cursor: Option<VehicleID>,
+    #[serde(deserialize_with = "bounded_parking_map::<_, _, _, 32>")]
+    searches: BTreeMap<HumanID, crate::map_dynamic::PendingPropertySearch>,
 }
 
 impl BuildingParking {
     pub(crate) fn save(&self, output: impl std::io::Write) -> std::io::Result<()> {
-        if let Some(cursor) = self.drain_cursor {
+        if !self.searches.is_empty() {
+            Bincode::encode_writer(&(self, (self.drain_cursor, &self.searches)), output)
+        } else if let Some(cursor) = self.drain_cursor {
             Bincode::encode_writer(&(self, cursor), output)
         } else {
             Bincode::encode_writer(self, output)
@@ -551,9 +573,44 @@ impl BuildingParking {
         if let Ok(parking) = Bincode::decode(data) {
             return Ok(parking);
         }
-        let (mut parking, cursor): (Self, VehicleID) = Bincode::decode(data)?;
-        parking.drain_cursor = Some(cursor);
+        if let Ok((mut parking, cursor)) = Bincode::decode::<(Self, VehicleID)>(data) {
+            parking.drain_cursor = Some(cursor);
+            return Ok(parking);
+        }
+        let (mut parking, runtime): (Self, ParkingRuntime) = Bincode::decode(data)?;
+        parking.drain_cursor = runtime.drain_cursor;
+        parking.searches = runtime.searches;
         Ok(parking)
+    }
+
+    pub(crate) fn retain_searches(&mut self, world: &World) -> usize {
+        self.searches.retain(|&driver, search| {
+            world
+                .humans
+                .get(driver)
+                .is_some_and(|human| search.matches(&human.router))
+        });
+        self.searches.len()
+    }
+
+    pub(crate) fn has_search(&self, driver: HumanID) -> bool {
+        self.searches.contains_key(&driver)
+    }
+
+    pub(crate) fn take_search(
+        &mut self,
+        driver: HumanID,
+    ) -> Option<crate::map_dynamic::PendingPropertySearch> {
+        self.searches.remove(&driver)
+    }
+
+    pub(crate) fn suspend_search(
+        &mut self,
+        driver: HumanID,
+        search: crate::map_dynamic::PendingPropertySearch,
+    ) {
+        debug_assert!(self.searches.len() < 32);
+        self.searches.insert(driver, search);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -608,6 +665,9 @@ impl BuildingParking {
             .entry(layout.anchor.road)
             .or_default()
             .insert((layout.anchor.station_cm, id));
+        for cell in parking_bounds_cells(&layout.bounds) {
+            self.swept_bounds.entry(cell).or_default().insert(id);
+        }
         if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
             self.public_garages
                 .entry(garage_cell(layout.door))
@@ -633,6 +693,13 @@ impl BuildingParking {
             mouths.remove(&(anchor.station_cm, id));
             if mouths.is_empty() {
                 self.mouths.remove(&anchor.road);
+            }
+            for cell in parking_bounds_cells(&site.layout.bounds) {
+                let occupants = self.swept_bounds.get_mut(&cell).unwrap();
+                occupants.remove(&id);
+                if occupants.is_empty() {
+                    self.swept_bounds.remove(&cell);
+                }
             }
             if matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_)) {
                 let cell = garage_cell(site.layout.door);
@@ -744,7 +811,17 @@ impl BuildingParking {
         !self.public_garages.is_empty()
     }
 
-    pub(crate) fn nearby_public_garages(&self, destination: Vec3) -> Vec<BuildingID> {
+    pub(crate) fn is_public_garage(&self, id: BuildingID) -> bool {
+        self.sites
+            .get(&id)
+            .is_some_and(|site| matches!(site.layout.kind, BuildingParkingKind::PublicGarage(_)))
+    }
+
+    pub(crate) fn nearby_public_garages(
+        &self,
+        destination: Vec3,
+        inspections: usize,
+    ) -> Vec<BuildingID> {
         if !self.has_public_garages() {
             return Vec::new();
         }
@@ -752,11 +829,17 @@ impl BuildingParking {
         let delta = Vec3::new(radius, radius, 0.0);
         let (left, bottom) = garage_cell(destination - delta);
         let (right, top) = garage_cell(destination + delta);
-        let mut garages: Vec<_> = (bottom..=top)
+        let center = garage_cell(destination);
+        let mut cells: Vec<_> = (bottom..=top)
             .flat_map(|y| (left..=right).map(move |x| (x, y)))
+            .collect();
+        cells
+            .sort_unstable_by_key(|&(x, y)| ((x - center.0).abs().max((y - center.1).abs()), x, y));
+        let mut garages: Vec<_> = cells
+            .into_iter()
             .filter_map(|cell| self.public_garages.get(&cell))
             .flatten()
-            .take(64)
+            .take(inspections)
             .filter_map(|&id| {
                 let site = &self.sites[&id];
                 site.free_slot()?;
@@ -1013,7 +1096,9 @@ impl BuildingParking {
                 let occupant = self.parked.remove(&motion.car).unwrap();
                 site.occupied.remove(&motion.car);
                 self.closing_cars.remove(&motion.car);
-                if world.humans.get(occupant.driver)
+                if world
+                    .humans
+                    .get(occupant.driver)
                     .is_some_and(|human| human.router.personal_car == Some(motion.car))
                 {
                     actor.it = route.into_itinerary();
@@ -1065,12 +1150,13 @@ impl BuildingParking {
     pub(crate) fn protects_road(&self, road: RoadID, retire_vacant: bool) -> bool {
         self.mouths.get(&road).is_some_and(|mouths| {
             !retire_vacant
-                || mouths
-                    .iter()
-                    .any(|&(_, id)| {
-                        self.busy(id)
-                            || matches!(self.sites[&id].layout.kind, BuildingParkingKind::PublicGarage(_))
-                    })
+                || mouths.iter().any(|&(_, id)| {
+                    self.busy(id)
+                        || matches!(
+                            self.sites[&id].layout.kind,
+                            BuildingParkingKind::PublicGarage(_)
+                        )
+                })
         })
     }
 
@@ -1124,10 +1210,23 @@ impl BuildingParking {
     }
 
     pub(crate) fn overlapping_road(&self, bounds: &AABB) -> Option<RoadID> {
-        self.sites
-            .values()
-            .find(|site| site.layout.bounds.intersects(bounds))
-            .map(|site| site.layout.anchor.road)
+        let (left, bottom) = garage_cell(bounds.ll.z(0.0));
+        let (right, top) = garage_cell(bounds.ur.z(0.0));
+        let cells =
+            (left.abs_diff(right) as usize + 1).saturating_mul(bottom.abs_diff(top) as usize + 1);
+        let overlaps = |site: &Site| site.layout.bounds.intersects(bounds);
+        if cells >= self.sites.len() {
+            return self
+                .sites
+                .values()
+                .find(|site| overlaps(site))
+                .map(|site| site.layout.anchor.road);
+        }
+        let site = parking_bounds_cells(bounds)
+            .filter_map(|cell| self.swept_bounds.get(&cell))
+            .filter_map(|ids| ids.iter().find(|id| overlaps(&self.sites[id])))
+            .min()?;
+        Some(self.sites[site].layout.anchor.road)
     }
 
     pub(crate) fn restore(
@@ -1139,6 +1238,9 @@ impl BuildingParking {
     ) -> Result<(), &'static str> {
         if self.parked.len() + self.arrivals.len() > MAX_LIVE_CLAIMS {
             return Err("too many live property parking claims");
+        }
+        if self.searches.values().any(|search| !search.validate(map)) {
+            return Err("invalid property parking search cursor");
         }
         for building in map.buildings().values() {
             if matches!(building.kind, crate::map::BuildingKind::ParkingGarage(_))
@@ -1215,6 +1317,9 @@ impl BuildingParking {
                 .entry(layout.anchor.road)
                 .or_default()
                 .insert((layout.anchor.station_cm, id));
+            for cell in parking_bounds_cells(&layout.bounds) {
+                self.swept_bounds.entry(cell).or_default().insert(id);
+            }
             if matches!(layout.kind, BuildingParkingKind::PublicGarage(_)) {
                 self.public_garages
                     .entry(garage_cell(layout.door))

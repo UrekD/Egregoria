@@ -90,9 +90,12 @@ impl ParkingOpening {
         warmup_ticks: u64,
         measured_ticks: u64,
     ) -> Result<(), String> {
-        let mut jobs: Vec<_> = sim.world().humans.iter().filter_map(|(id, human)| {
-            Some((id, human.work.as_ref()?.workplace))
-        }).collect();
+        let mut jobs: Vec<_> = sim
+            .world()
+            .humans
+            .iter()
+            .filter_map(|(id, human)| Some((id, human.work.as_ref()?.workplace)))
+            .collect();
         jobs.sort_unstable();
         let record = json!({
             "counts": {
@@ -111,7 +114,8 @@ impl ParkingOpening {
         });
         let path = std::env::var_os("EGR_PATHPARK_OPENING").ok_or("missing opening report path")?;
         let file = fs::File::create(&path).map_err(|error| format!("{path:?}: {error}"))?;
-        serde_json::to_writer(std::io::BufWriter::new(file), &record).map_err(|error| error.to_string())
+        serde_json::to_writer(std::io::BufWriter::new(file), &record)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -607,7 +611,7 @@ impl ScenarioCtx {
         Ok(())
     }
 
-    fn round_tripped(&self) -> Result<Simulation, String> {
+    pub(crate) fn round_tripped(&self) -> Result<Simulation, String> {
         // Reserve a private directory so concurrent runs cannot share a midpoint save.
         static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
         let save_dir = simulation::save_dir();

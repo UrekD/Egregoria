@@ -109,11 +109,13 @@ impl ParkingManagement {
         use ordered_float::OrderedFloat;
         let radius = 400.0_f32;
         let mut lanes = Vec::new();
+        let mut inspections = 48;
         for hit in map
             .spatial_map()
             .query_around(near.xy(), radius, ProjectFilter::ROAD)
-            .take(32)
+            .take(16)
         {
+            inspections -= 1;
             let ProjectKind::Road(id) = hit else { continue };
             let Some(road) = map.get(id) else { continue };
             for (lane, kind) in road.lanes_iter() {
@@ -129,13 +131,14 @@ impl ParkingManagement {
         // inspection allowance before a different street is even considered.
         let mut curb = Vec::new();
         let mut street = Vec::new();
-        let mut inspections = 64;
         while inspections > 0 && !lanes.is_empty() {
             lanes.retain_mut(|spots| {
                 if inspections == 0 {
                     return false;
                 }
-                let Some(spot) = spots.next() else { return false };
+                let Some(spot) = spots.next() else {
+                    return false;
+                };
                 inspections -= 1;
                 let point = map.parking.get(spot).unwrap().trans.pos;
                 let distance = point.distance2(near);
@@ -155,7 +158,11 @@ impl ParkingManagement {
         }
         let ranked = |mut candidates: Vec<_>| {
             candidates.sort_unstable();
-            candidates.into_iter().take(8).map(|(_, spot)| spot).collect()
+            candidates
+                .into_iter()
+                .take(8)
+                .map(|(_, spot)| spot)
+                .collect()
         };
         (ranked(curb), ranked(street))
     }

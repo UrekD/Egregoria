@@ -83,18 +83,19 @@ pub fn bench_slot_with_workers(
     let opening = crate::runner::ParkingOpening::capture(&sim);
     let slot_revision = if opening.is_some() {
         let paths = simulation::slot_paths(&root, id).map_err(|error| error.to_string())?;
-        let header = Simulation::read_slot_snapshot_header(&paths.zip, simulation::SnapshotKind::Zip)
-            .map_err(|error| error.to_string())?;
-        Some(header.revision.ok_or("missing benchmark slot revision")?.get())
+        let header =
+            Simulation::read_slot_snapshot_header(&paths.zip, simulation::SnapshotKind::Zip)
+                .map_err(|error| error.to_string())?;
+        Some(
+            header
+                .revision
+                .ok_or("missing benchmark slot revision")?
+                .get(),
+        )
     } else {
         None
     };
     let mut ctx = ScenarioCtx::from_sim(sim);
-    if opening.is_some() && id.as_str() == "lesce_osm" {
-        let world = ctx.sim.world_mut_unchecked();
-        let terminal = world.freight_stations.keys().min().ok_or("missing Lesce freight terminal")?;
-        world.freight_stations[terminal].f.waiting_cargo = 100;
-    }
     let window = measure_windows(
         &mut ctx,
         warmup_ticks,
@@ -262,6 +263,13 @@ fn measure_windows(
     });
     sample_workload(ctx, "warmup", expected_agents)?;
     if let Some((opening, revision)) = opening {
+        let world = ctx.sim.world_mut_unchecked();
+        let terminal = world
+            .freight_stations
+            .keys()
+            .min()
+            .ok_or("missing Lesce freight terminal")?;
+        world.freight_stations[terminal].f.waiting_cargo = 100;
         opening.write(&ctx.sim, Some(revision), warmup_ticks, measured_ticks)?;
     }
     let count_active_vehicles = |sim: &Simulation| {

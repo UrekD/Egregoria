@@ -969,11 +969,16 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 continue;
             };
             let employer = &ctx.sim.world().companies[company];
-            let Some(road) = map.get(employer.comp.building).and_then(|site| site.connected_road) else {
+            let Some(road) = map
+                .get(employer.comp.building)
+                .and_then(|site| site.connected_road)
+            else {
                 continue;
             };
             if !*removable.entry(road).or_insert_with(|| {
-                WorldCommand::MapRemoveRoad(road).validate_and_price(&ctx.sim).is_ok()
+                WorldCommand::MapRemoveRoad(road)
+                    .validate_and_price(&ctx.sim)
+                    .is_ok()
             }) {
                 continue;
             }
@@ -989,30 +994,32 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
         workers_by_home
             .into_iter()
             .filter(|&(home, _)| {
-                WorldCommand::MapRemoveBuilding(home).validate_and_price(&ctx.sim).is_ok()
+                WorldCommand::MapRemoveBuilding(home)
+                    .validate_and_price(&ctx.sim)
+                    .is_ok()
             })
             .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
     };
-    let parcel = *ctx.sim.map().lot_origin(home).ok_or("hire staging house has no parcel")?;
+    let parcel = *ctx
+        .sim
+        .map()
+        .lot_origin(home)
+        .ok_or("hire staging house has no parcel")?;
     run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)?;
 
     // Refill the cleared parcel via the checked housing flow. Its new residents
     // submit ordinary job applications near the vacancy just advertised.
-    let lot = ctx.sim.map().lots().values()
+    let lot = ctx
+        .sim
+        .map()
+        .lots()
+        .values()
         .find(|lot| lot.parent == parcel.parent_road && lot.shape.corners == parcel.shape.corners)
-        .ok_or("hire staging parcel was not restored")?.id;
+        .ok_or("hire staging parcel was not restored")?
+        .id;
     run_teardown_batch(ctx, &[WorldCommand::MapBuildHouse(lot)], 1)?;
-    let home = ctx.sim.map().buildings().values()
-        .find(|building| building.obb.corners == parcel.shape.corners)
-        .map(|building| building.id).ok_or("replacement hire staging home was not built")?;
-    // Existing zoning immigration still runs. Seed one applicant if the new
-    // home has no residents, so the timing of that pass does not decide the cut.
-    if ctx.sim.read::<BuildingInfos>().get(home).is_some_and(|info| info.residents.is_empty()) {
-        simulation::souls::human::spawn_human(&mut ctx.sim, home)
-            .ok_or("could not stage a real job applicant")?;
-    }
     Ok(())
 }
 
@@ -1099,6 +1106,9 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
                 .map(|trade| trade.seller.0)
         })
         .collect();
+    if hires.is_empty() {
+        return Err(failure("a pending Mixed Use hire"));
+    }
     let map = sim.map();
     let sites: Vec<_> = mixed_sellers(sim)
         .filter_map(|seller| {

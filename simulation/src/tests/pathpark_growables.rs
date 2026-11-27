@@ -367,10 +367,13 @@ fn pathpark_owner_despawn_during_egress_recovers_the_car_after_reload() {
     assert_eq!(ctx.g.building_parking(garage).unwrap().held, 0);
     ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
 
-    assert!((0..500).any(|_| {
-        ctx.tick_fast();
-        ctx.g.world.vehicles[car].vehicle.state.is_parked()
-    }), "an ownerless car stayed on the road after rear clearance");
+    assert!(
+        (0..500).any(|_| {
+            ctx.tick_fast();
+            ctx.g.world.vehicles[car].vehicle.state.is_parked()
+        }),
+        "an ownerless car stayed on the road after rear clearance"
+    );
     assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 0);
 }
 
@@ -386,7 +389,12 @@ fn pathpark_closing_in_transit_replans_to_another_public_garage() {
         kind: GarageKind::Underground,
         entrance,
     }]);
-    let alternate = ctx.g.read::<CommandOutcomes>().parking_garage(0).unwrap().unwrap();
+    let alternate = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .parking_garage(0)
+        .unwrap()
+        .unwrap();
     {
         let mut parking = ctx.g.write::<ParkingManagement>();
         for (spot, _) in ctx.g.map().parking.all_spots() {
@@ -403,16 +411,20 @@ fn pathpark_closing_in_transit_replans_to_another_public_garage() {
             && ctx.g.building_parking(garage).unwrap().held == 1
             && ctx.g.world.vehicles[car].it.driveway_phase().is_none()
     }));
-    ctx.g.apply_commands([&WorldCommand::SetBuildingParkingOpen {
-        building: garage,
-        open: false,
-    }]);
+    ctx.g
+        .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: garage,
+            open: false,
+        }]);
 
-    assert!((0..6_000).any(|_| {
-        ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
-        ctx.tick_fast();
-        ctx.g.building_parking(alternate).unwrap().occupied == 1
-    }), "the original car did not reach the alternate garage");
+    assert!(
+        (0..6_000).any(|_| {
+            ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
+            ctx.tick_fast();
+            ctx.g.building_parking(alternate).unwrap().occupied == 1
+        }),
+        "the original car did not reach the alternate garage"
+    );
     assert_eq!(ctx.g.world.humans[human].router.personal_car, Some(car));
     assert_eq!(ctx.g.building_parking(garage).unwrap().occupied, 0);
 }
