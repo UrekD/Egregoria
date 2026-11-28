@@ -74,6 +74,7 @@ mod pathfinding;
 mod reachability;
 pub mod road_edit;
 mod serializing;
+pub(crate) use serializing::CurrentSnapshotMap;
 mod spatial_map;
 pub mod building_parking;
 pub mod special_placement;

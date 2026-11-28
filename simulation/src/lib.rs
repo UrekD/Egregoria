@@ -2277,6 +2277,12 @@ impl SimulationDeser {
                     }
                     return Err(corrupt(format!("Missing resource {}", l.name)));
                 };
+                if schema == SnapshotSchema::Current && l.name == "map" {
+                    let map = Bincode::decode::<map::CurrentSnapshotMap>(data)
+                        .map_err(|error| corrupt(format!("Could not decode resource map: {error}")))?;
+                    sim.insert(map.0);
+                    continue;
+                }
                 if l.name == "property_parking" && !has_property_parking(&self._header.version) {
                     use crate::map::building_parking::BuildingParking;
                     let empty = Bincode::encode(&BuildingParking::default())

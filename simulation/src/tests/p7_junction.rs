@@ -1892,6 +1892,50 @@ fn roadtools_roundabout_recovers_saved_two_arm_junctions() {
 }
 
 #[test]
+fn roadtools_roundabout_preserves_imported_clips_on_reload() {
+    use crate::map::{LanePatternBuilder, MapProject, ProjectFilter};
+
+    let (ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0], 18.0, false);
+    {
+        let mut map = ctx.g.map_mut();
+        let start = map.project(ends[0], 0.0, ProjectFilter::INTER);
+        let short_end = ends[0] + vec3(0.0, 16.0, 0.0);
+        let short = map
+            .make_connection(
+                start,
+                MapProject::ground(short_end),
+                None,
+                &LanePatternBuilder::new().build(),
+            )
+            .unwrap()
+            .1;
+        let next = map.project(short_end, 0.0, ProjectFilter::INTER);
+        map.make_connection(
+            next,
+            MapProject::ground(short_end + vec3(100.0, 0.0, 0.0)),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+        let junctions: Vec<_> = map.intersections().keys().collect();
+        let roads: Vec<_> = map.roads().keys().collect();
+        map.finalize_import(&junctions, &roads);
+        assert!(map.roads()[short].interfaced_points().length() <= 10.001);
+        assert!(map.get(junction).unwrap().roundabout_geometry().is_some());
+    }
+
+    let snapshot = ctx
+        .g
+        .encode_slot(crate::SnapshotRevision::new(1))
+        .unwrap()
+        .into_snapshot_bytes();
+    let loaded =
+        Simulation::load_compressed_snapshot(&snapshot, crate::MAX_SNAPSHOT_BYTES).unwrap();
+    assert_eq!(loaded.hashes()["map"], ctx.g.hashes()["map"]);
+    assert!(loaded.map().get(junction).unwrap().roundabout_geometry().is_some());
+}
+
+#[test]
 fn roadtools_roundabout_resumes_a_full_legacy_snapshot_mid_turn() {
     let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0], 18.0, false);
     let (from, to) = {
@@ -1977,13 +2021,7 @@ fn roadtools_roundabout_resumes_a_full_legacy_snapshot_mid_turn() {
         .turn_policy
         .roundabout = Some(crate::map::RoundaboutPolicy { radius: 18.0 });
 
-    let snapshot = ctx
-        .g
-        .encode_slot(crate::SnapshotRevision::new(1))
-        .unwrap()
-        .into_snapshot_bytes();
-    let mut loaded =
-        Simulation::load_compressed_snapshot(&snapshot, crate::MAX_SNAPSHOT_BYTES).unwrap();
+    let mut loaded = load_legacy_roundabout(&ctx);
     let resumed = &loaded.world.vehicles[id].it;
     assert_eq!(
         resumed.get_travers().unwrap().kind,
@@ -2018,6 +2056,20 @@ fn roadtools_roundabout_resumes_a_full_legacy_snapshot_mid_turn() {
         }
     }
     panic!("resumed vehicle did not clear the junction");
+}
+
+fn load_legacy_roundabout(ctx: &TestCtx) -> Simulation {
+    let legacy = crate::tests::p9_fire::pre_fire_snapshot(
+        ctx,
+        r#"{"version":"0.12.0+commands.2","enabled":false,"commands":[]}"#,
+    );
+    let snapshot = Bincode::encode(&crate::SimulationSer {
+        header: legacy._header,
+        world: &legacy.world,
+        res: legacy.res,
+    })
+    .unwrap();
+    Simulation::decode_snapshot(&snapshot).unwrap()
 }
 
 #[test]
@@ -2072,12 +2124,7 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
         .turn_policy
         .roundabout = Some(crate::map::RoundaboutPolicy { radius: 18.0 });
 
-    let snapshot = ctx.g.encode_slot(crate::SnapshotRevision::new(1)).unwrap();
-    let mut loaded = Simulation::load_compressed_snapshot(
-        &snapshot.into_snapshot_bytes(),
-        crate::MAX_SNAPSHOT_BYTES,
-    )
-    .unwrap();
+    let mut loaded = load_legacy_roundabout(&ctx);
     assert!(loaded.read::<JunctionAdmission>().crossing_turn(turn));
     assert!(!loaded
         .read::<JunctionAdmission>()

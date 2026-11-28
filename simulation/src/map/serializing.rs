@@ -101,31 +101,46 @@ impl Serialize for Map {
 
 impl<'de> Deserialize<'de> for Map {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (mut map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
-            let MapWithLotOrigins { map, lot_origins } =
-                MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
-            let imported = map.import_lane_reserve;
-            (map.into_serialized(), lot_origins, imported)
-        } else {
-            let MapWithLotOrigins {
-                mut map,
-                lot_origins,
-            } = MapWithLotOrigins::<SerializedMap>::deserialize(deserializer)?;
-            let imported = map.external_train_stations.last().is_some_and(Key::is_null);
-            if imported {
-                map.external_train_stations.pop();
-            }
-            (map, lot_origins, imported)
-        };
-        map.validate_references()
-            .map_err(serde::de::Error::custom)?;
-        map.validate_spatial_geometry()
-            .map_err(serde::de::Error::custom)?;
-        map.rebuild_growable_shells()
-            .map_err(serde::de::Error::custom)?;
-        map.into_map(lot_origins, import_lane_reserve)
-            .map_err(serde::de::Error::custom)
+        deserialize_map(deserializer, true)
     }
+}
+
+pub(crate) struct CurrentSnapshotMap(pub(crate) Map);
+
+impl<'de> Deserialize<'de> for CurrentSnapshotMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_map(deserializer, false).map(Self)
+    }
+}
+
+fn deserialize_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    migrate_roundabout_clips: bool,
+) -> Result<Map, D::Error> {
+    let (mut map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
+        let MapWithLotOrigins { map, lot_origins } =
+            MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
+        let imported = map.import_lane_reserve;
+        (map.into_serialized(), lot_origins, imported)
+    } else {
+        let MapWithLotOrigins {
+            mut map,
+            lot_origins,
+        } = MapWithLotOrigins::<SerializedMap>::deserialize(deserializer)?;
+        let imported = map.external_train_stations.last().is_some_and(Key::is_null);
+        if imported {
+            map.external_train_stations.pop();
+        }
+        (map, lot_origins, imported)
+    };
+    map.validate_references()
+        .map_err(serde::de::Error::custom)?;
+    map.validate_spatial_geometry()
+        .map_err(serde::de::Error::custom)?;
+    map.rebuild_growable_shells()
+        .map_err(serde::de::Error::custom)?;
+    map.into_map(lot_origins, import_lane_reserve, migrate_roundabout_clips)
+        .map_err(serde::de::Error::custom)
 }
 
 impl SerializedMap {
@@ -353,6 +368,7 @@ impl SerializedMap {
         mut self,
         lot_origins: BTreeMap<BuildingID, LotOrigin>,
         import_lane_reserve: bool,
+        migrate_roundabout_clips: bool,
     ) -> Result<Map, String> {
         let requested_roundabouts: Vec<_> = self
             .intersections
@@ -395,23 +411,27 @@ impl SerializedMap {
             ..Map::empty()
         };
         let mut previous_paths = BTreeMap::new();
-        for &id in &requested_roundabouts {
-            remember_turns(&m.intersections[id], &mut previous_paths);
-            let changed = super::roundabout_changed_clips(&m, id)
-                .map_err(|error| format!("could not rebuild roundabout {id:?}: {error}"))?;
-            for road in &changed {
-                let road = &m.roads[*road];
-                for (lane, _) in road.lanes_iter() {
-                    previous_paths
-                        .entry(TraverseKind::Lane(lane))
-                        .or_insert_with(|| m.lanes[lane].points.as_slice().to_vec());
+        // Reapplying the import reserve to already clipped roads can shift
+        // their endpoints. Current snapshots already carry the finished clips.
+        if migrate_roundabout_clips {
+            for &id in &requested_roundabouts {
+                remember_turns(&m.intersections[id], &mut previous_paths);
+                let changed = super::roundabout_changed_clips(&m, id)
+                    .map_err(|error| format!("could not rebuild roundabout {id:?}: {error}"))?;
+                for road in &changed {
+                    let road = &m.roads[*road];
+                    for (lane, _) in road.lanes_iter() {
+                        previous_paths
+                            .entry(TraverseKind::Lane(lane))
+                            .or_insert_with(|| m.lanes[lane].points.as_slice().to_vec());
+                    }
+                    for junction in [road.src, road.dst] {
+                        remember_turns(&m.intersections[junction], &mut previous_paths);
+                    }
                 }
-                for junction in [road.src, road.dst] {
-                    remember_turns(&m.intersections[junction], &mut previous_paths);
+                if !changed.is_empty() {
+                    m.invalidate(id);
                 }
-            }
-            if !changed.is_empty() {
-                m.invalidate(id);
             }
         }
         for id in requested_roundabouts {

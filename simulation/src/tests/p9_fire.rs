@@ -9,7 +9,7 @@ use crate::{
     STOCK_PRE_FIRE_REGISTRY,
 };
 
-pub(super) fn pre_fire_snapshot(test: &TestCtx, replay: &str) -> SimulationDeser {
+pub(crate) fn pre_fire_snapshot(test: &TestCtx, replay: &str) -> SimulationDeser {
     let mut snapshot: SimulationDeser =
         Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
     snapshot._header.version = PRE_FIRE_VERSION.to_owned();
@@ -119,12 +119,14 @@ fn p9_reopens_packaged_legacy_cities_and_preserves_original_files() {
     assert_eq!(fs::read(root.join("lesce_osm.zip")).unwrap(), original);
 
     let dest = SlotId::new("lesce_p9").unwrap();
+    let migrated_state = restored.hashes();
     for n in [10, 11] {
         let revision = SnapshotRevision::new(n);
         restored.save_to_slot(&root, &dest, revision).unwrap();
         let saved = Simulation::load_from_slot(&root, &dest).unwrap();
         assert!(saved.read::<Replay>().migrated_city());
         assert!(!saved.read::<Replay>().enabled);
+        assert_eq!(saved.hashes(), migrated_state);
     }
     assert_eq!(fs::read(root.join("lesce_osm.zip")).unwrap(), original);
 }
