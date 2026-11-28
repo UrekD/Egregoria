@@ -31,7 +31,7 @@ fire.fleet = {
     crew_per_trip = 2,
     shift_count = 3,
     max_response_m = 1500,
-    ignition_hourly_denominator = 10000,
+    ignition_hourly_denominator = 20000,
 }
 
 data:extend {

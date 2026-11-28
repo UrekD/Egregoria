@@ -3,7 +3,7 @@ use geom::vec2;
 use prototypes::{Tick, TICKS_PER_MINUTE};
 
 use super::TestCtx;
-use crate::souls::events::{fire_incident, Fires, ServiceIncidents};
+use crate::souls::events::{fire_incident, ignition_threshold, Fires, ServiceIncidents};
 use crate::{
     Replay, SaveLoadError, Simulation, SimulationDeser, SimulationSer, PRE_FIRE_VERSION,
     STOCK_PRE_FIRE_REGISTRY,
@@ -705,4 +705,21 @@ fn p9_snapshot_rejects_an_ordinary_vehicle_on_a_claimed_service_curb() {
     let snapshot = Bincode::encode(&test.g).unwrap();
     let error = Bincode::decode::<Simulation>(&snapshot).err().expect("ambiguous curb ownership");
     assert!(error.to_string().contains("service curb conflicts with ordinary parking"));
+}
+
+#[test]
+fn p9_base_ignition_risk_stays_inside_the_soak_band() {
+    let _test = TestCtx::new_fast();
+    let denominator = prototypes::try_prototype(prototypes::ServiceID::new("fire-station"))
+        .and_then(|service| service.fire)
+        .expect("the stock fire station carries ignition settings")
+        .ignition_hourly_denominator;
+    // An unpolluted, uncovered site is the highest-risk case that pollution cannot raise.
+    // Its rate per 1,000 site-days must sit inside the p9_fire_soak band.
+    let hourly = ignition_threshold(denominator, 0, 0) as f64 / 2f64.powi(64);
+    let per_1000_site_days = hourly * 24_000.0;
+    assert!(
+        (0.5..=2.0).contains(&per_1000_site_days),
+        "base ignition rate {per_1000_site_days:.3} per 1,000 site-days leaves the soak band"
+    );
 }

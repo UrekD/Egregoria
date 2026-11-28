@@ -388,6 +388,14 @@ fn process_offers(
     }
 }
 
+/// Hourly ignition threshold against a 64-bit roll. Quantize both inputs by rounding
+/// down to whole points. Pollution gives up to 3x risk and full prevention removes 35%
+/// of risk. Round the final threshold down.
+pub(crate) fn ignition_threshold(denominator: u32, pollution: u64, prevention: u64) -> u128 {
+    ((1u128 << 64) * u128::from(50 + pollution) * u128::from(10_000 - 35 * prevention))
+        / (u128::from(denominator) * 500_000)
+}
+
 fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceIncidents) {
     let minute = incidents.next_risk_minute;
     let cohort = (minute % 60) as u8;
@@ -406,7 +414,7 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
     let suppress_offers = sim.read::<FireScenarioRules>().suppress_incidental_offers;
     let denominator = prototypes::try_prototype(prototypes::ServiceID::new("fire-station"))
         .and_then(|service| service.fire)
-        .map_or(10_000, |fire| fire.ignition_hourly_denominator);
+        .map_or(20_000, |fire| fire.ignition_hourly_denominator);
     for &(_, site) in candidates.by_ref().take(RISK_BUDGET) {
         incidents.cohort_after = Some(site);
         let Some(building) = map.get(site).filter(|b| eligible(b)) else {
@@ -417,11 +425,7 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
             .pollution_at(building.obb.center())
             .clamp(0.0, 100.0) as u64;
         let prevention = coverage.coverage(site, ServiceKind::Fire).clamp(0.0, 100.0) as u64;
-        // Quantize both inputs by rounding down to whole points. Pollution gives up to 3x
-        // risk and full prevention removes 35% of risk. Round the final threshold down.
-        let threshold =
-            ((1u128 << 64) * u128::from(50 + pollution) * u128::from(10_000 - 35 * prevention))
-                / (u128::from(denominator) * 500_000);
+        let threshold = ignition_threshold(denominator, pollution, prevention);
         let roll = [seed, minute / 60, site.data().as_ffi(), FIRE_IGNITION]
             .into_iter()
             .fold(0, |state, field| splitmix64(state ^ field));

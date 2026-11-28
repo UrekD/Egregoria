@@ -54,7 +54,7 @@ pub struct FireServiceSpec {
 impl FireServiceSpec {
     fn from_lua(table: Option<Table>) -> mlua::Result<Self> {
         let mut spec = Self {
-            ignition_hourly_denominator: 10_000,
+            ignition_hourly_denominator: 20_000,
             bays: 1,
             crew_per_trip: 2,
             shift_count: 3,
