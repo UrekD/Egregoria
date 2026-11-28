@@ -60,7 +60,7 @@ pub fn vehicle_hold_reason(
     let (_, own_state) = grid.get(collider)?;
     let neighbours = grid.query_around(vehicle.trans.pos.xy(), 12.0)
         .filter(|&(handle, _)| handle != collider)
-        .filter_map(|(handle, pos)| Some((Some(handle), pos, grid.get(handle)?.1)));
+        .filter_map(|(handle, pos)| Some(((Some(handle), grid.get(handle)?.1), pos)));
     let (distance, _, reason) = calc_front_dist(
         &vehicle.vehicle,
         map,
@@ -69,6 +69,7 @@ pub fn vehicle_hold_reason(
         &vehicle.it,
         RoundaboutArea::at(map, &vehicle.it, vehicle.trans.pos),
         neighbours,
+        |neighbour| neighbour,
         0.8,
     );
     if distance < STOPPED_BLOCK_DISTANCE && reason != QueueHoldReason::Unknown {
@@ -129,7 +130,7 @@ pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>>
         let neighbours = grid
             .query_around(position, 12.0 + stop_dist)
             .filter(|&(handle, _)| handle != collider)
-            .map(|(handle, pos)| (Some(handle), pos, grid.get(handle).unwrap().1));
+            .map(|(handle, pos)| ((Some(handle), grid.get(handle).unwrap().1), pos));
         let (distance, _, reason) = calc_front_dist(
             &vehicle.vehicle,
             &map,
@@ -138,6 +139,7 @@ pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>>
             &vehicle.it,
             RoundaboutArea::at(&map, &vehicle.it, vehicle.trans.pos),
             neighbours,
+            |neighbour| neighbour,
             (0.8 + stop_dist).min(STOPPED_BLOCK_DISTANCE),
         );
         if distance >= STOPPED_BLOCK_DISTANCE {
@@ -485,14 +487,20 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
     ) {
         let danger_length =
             (own_state.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
-        let neighbours =
-            grid.query_around(trans.pos.xy(), 12.0 + danger_length)
-                .map(|(handle, pos)| {
-                    let state = grid.get(handle).expect("Handle not in transport grid").1;
-                    (OBSERVE.then_some(handle), pos, state)
-                });
         calc_decision_traced(
-            id, vehicle, map, time, trans, own_state, it, area, neighbours,
+            id,
+            vehicle,
+            map,
+            time,
+            trans,
+            own_state,
+            it,
+            area,
+            grid.query_around(trans.pos.xy(), 12.0 + danger_length),
+            |handle| {
+                let state = grid.get(handle).expect("Handle not in transport grid").1;
+                (OBSERVE.then_some(handle), state)
+            },
         )
     } else {
         ((0.0, Vec3::ZERO), None)
@@ -693,12 +701,13 @@ pub fn calc_decision<'a>(
         self_obj,
         it,
         RoundaboutArea::at(map, it, trans.pos),
-        neighs.map(|(pos, state)| (None, pos, state)),
+        neighs.map(|(pos, state)| (state, pos)),
+        |state| (None, state),
     )
     .0
 }
 
-fn calc_decision_traced<'a>(
+fn calc_decision_traced<'a, N>(
     me: VehicleID,
     vehicle: &mut Vehicle,
     map: &Map,
@@ -707,7 +716,8 @@ fn calc_decision_traced<'a>(
     self_obj: &TransportState,
     it: &Itinerary,
     area: RoundaboutArea,
-    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
+    neighs: impl Iterator<Item = (N, Vec2)>,
+    resolve: impl FnMut(N) -> (Option<GridHandle>, &'a TransportState),
 ) -> ((f32, Vec3), Option<QueueHoldReason>) {
     let default_return = ((0.0, trans.dir), Some(QueueHoldReason::Unknown));
     if vehicle.wait_time > 0.0 {
@@ -747,6 +757,7 @@ fn calc_decision_traced<'a>(
         it,
         area,
         neighs,
+        resolve,
         stopping_threshold.min(stopped_gap),
     );
 
@@ -1182,24 +1193,130 @@ fn braking_path_conflicts(
 /// Calculates the distance to the closest problematic object in front of the car.
 /// It can be another car or a pedestrian, or it can be a potential collision point from a
 /// car coming perpendicularly.
-fn calc_front_dist<'a>(
+#[inline]
+fn calc_front_dist<'a, N>(
     vehicle: &Vehicle,
     map: &Map,
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
     area: RoundaboutArea,
-    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
+    neighs: impl Iterator<Item = (N, Vec2)>,
+    mut resolve: impl FnMut(N) -> (Option<GridHandle>, &'a TransportState),
     cutoff: f32,
 ) -> (f32, u64, QueueHoldReason) {
     if matches!(area, RoundaboutArea::Ordinary) {
-        calc_front_dist_in_area::<false>(vehicle, map, trans, self_obj, it, area, neighs, cutoff)
+        calc_front_dist_ordinary(vehicle, trans, self_obj, it, neighs, resolve, cutoff)
     } else {
-        calc_front_dist_in_area::<true>(vehicle, map, trans, self_obj, it, area, neighs, cutoff)
+        calc_front_dist_at_roundabout(
+            vehicle,
+            map,
+            trans,
+            self_obj,
+            it,
+            area,
+            neighs.map(|(neighbour, pos)| {
+                let (handle, state) = resolve(neighbour);
+                (handle, pos, state)
+            }),
+            cutoff,
+        )
     }
 }
 
-fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
+#[inline]
+fn calc_front_dist_ordinary<'a, N>(
+    vehicle: &Vehicle,
+    trans: &Transform,
+    self_obj: &TransportState,
+    it: &Itinerary,
+    neighs: impl Iterator<Item = (N, Vec2)>,
+    mut resolve: impl FnMut(N) -> (Option<GridHandle>, &'a TransportState),
+    cutoff: f32,
+) -> (f32, u64, QueueHoldReason) {
+    let pos = trans.pos.xy();
+    let dir = trans.dir.xy();
+    let ray = Ray::new(pos - dir * vehicle.kind.width() * 0.5, dir);
+    let speed = self_obj.speed;
+    let on_lane = it.get_travers().is_some_and(|step| step.kind.is_lane());
+    let cone_angle = 0.85 - 0.015 * speed.min(10.0);
+    let lateral_limit = 3.0 + speed * 0.3;
+    let radius = self_obj.radius;
+
+    let mut closest = 50.0;
+    let mut flag = 0;
+    let mut blocker = QueueHoldReason::Unknown;
+    for (neighbour, other_pos) in neighs {
+        let towards = other_pos - pos;
+        if towards.is_close(Vec2::ZERO, 1.0) && towards.x > 0.0 {
+            continue;
+        }
+        let (towards_dir, distance) = unwrap_or!(towards.dir_dist(), continue);
+        let angle = towards_dir.dot(dir);
+        if angle < 0.0 {
+            continue;
+        }
+        let (handle, other) = resolve(neighbour);
+        if (other.height - trans.pos.z).abs() > 5.0 {
+            continue;
+        }
+        let is_vehicle = other.group == TransportationGroup::Vehicles;
+        if angle > cone_angle
+            && (!is_vehicle || other.dir.dot(dir) > 0.0)
+            && (!on_lane || towards.perp_dot(dir).abs() < lateral_limit)
+        {
+            let clearance = distance - radius - other.radius - if is_vehicle { 0.0 } else { 1.0 };
+            if clearance < closest {
+                closest = clearance;
+                flag = other.flag;
+                blocker = front_hold_reason(handle, other.group);
+            }
+            if closest < cutoff {
+                break;
+            }
+        } else if is_vehicle && rays_conflict(ray, other_pos, other, speed, radius) {
+            let clearance = distance - radius - other.radius - 5.0;
+            if clearance < closest {
+                closest = clearance;
+                flag = other.flag;
+                blocker = QueueHoldReason::Conflict(handle);
+            }
+        }
+    }
+    (closest, flag, blocker)
+}
+
+#[inline]
+fn front_hold_reason(handle: Option<GridHandle>, group: TransportationGroup) -> QueueHoldReason {
+    match (handle, group) {
+        (Some(handle), TransportationGroup::Vehicles) => QueueHoldReason::Leader(handle),
+        (Some(handle), TransportationGroup::Pedestrians) => QueueHoldReason::Pedestrian(handle),
+        _ => QueueHoldReason::Unknown,
+    }
+}
+
+#[inline]
+fn rays_conflict(
+    ray: Ray,
+    other_pos: Vec2,
+    other: &TransportState,
+    speed: f32,
+    radius: f32,
+) -> bool {
+    if other.speed <= 0.01 {
+        return false;
+    }
+    let other_ray = Ray::new(other_pos - other.radius * other.dir, other.dir);
+    let Some((distance, other_distance)) = ray.both_dist_to_inter(&other_ray) else {
+        return false;
+    };
+    if distance.max(other_distance) > 1000.0 {
+        return false;
+    }
+    !(distance - speed.min(2.5) - radius < other_distance - other.speed.min(2.5) - other.radius)
+}
+
+fn calc_front_dist_at_roundabout<'a>(
     vehicle: &Vehicle,
     map: &Map,
     trans: &Transform,
@@ -1228,11 +1345,11 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
     let mut flag = 0;
     let mut blocker = QueueHoldReason::Unknown;
     let ring = match area {
-        RoundaboutArea::Ring(ring) if ROUNDABOUT => Some(ring),
+        RoundaboutArea::Ring(ring) => Some(ring),
         _ => None,
     };
     let circulating = ring.is_some();
-    let on_arm = ROUNDABOUT && matches!(area, RoundaboutArea::Arm { .. });
+    let on_arm = matches!(area, RoundaboutArea::Arm { .. });
     let braking_distance = speed.powi(2) / (2.0 * vehicle.kind.deceleration());
     let bumper = my_radius - VEHICLE_BODY_RADIUS;
     // Collision avoidance
@@ -1273,8 +1390,7 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
         let in_front_cone = cos_angle > 0.85 - 0.015 * speed.min(10.0)
             && (!is_vehicle || cos_direction_angle > 0.0)
             && (!on_lane || dist_to_side < lateral_limit);
-        let front_distance = if ROUNDABOUT
-            && nei_physics_obj.group == TransportationGroup::Pedestrians
+        let front_distance = if nei_physics_obj.group == TransportationGroup::Pedestrians
             && (circulating || local_arm)
         {
             let time = speed / vehicle.kind.deceleration() + 0.25;
@@ -1332,46 +1448,17 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
             if distance < min_front_dist {
                 min_front_dist = distance;
                 flag = nei_physics_obj.flag;
-                blocker = match (handle, nei_physics_obj.group) {
-                    (Some(handle), TransportationGroup::Vehicles) => {
-                        QueueHoldReason::Leader(handle)
-                    }
-                    (Some(handle), TransportationGroup::Pedestrians) => {
-                        QueueHoldReason::Pedestrian(handle)
-                    }
-                    _ => QueueHoldReason::Unknown,
-                };
+                blocker = front_hold_reason(handle, nei_physics_obj.group);
             }
             if min_front_dist < cutoff {
                 return ControlFlow::Break((min_front_dist, flag, blocker));
             }
             return ControlFlow::Continue(());
         }
-        if !is_vehicle || circulating || local_arm {
-            return ControlFlow::Continue(());
-        }
-
-        // closest win
-        let his_ray = Ray {
-            from: his_pos - nei_physics_obj.radius * nei_physics_obj.dir,
-            dir: nei_physics_obj.dir,
-        };
-
-        let (my_dist, his_dist) = unwrap_or!(
-            my_ray.both_dist_to_inter(&his_ray),
-            return ControlFlow::Continue(())
-        );
-
-        if my_dist.max(his_dist) > 1000.0 {
-            return ControlFlow::Continue(());
-        }
-
-        if nei_physics_obj.speed <= 0.01 {
-            return ControlFlow::Continue(());
-        }
-
-        if my_dist - speed.min(2.5) - my_radius
-            < his_dist - nei_physics_obj.speed.min(2.5) - nei_physics_obj.radius
+        if !is_vehicle
+            || circulating
+            || local_arm
+            || !rays_conflict(my_ray, his_pos, nei_physics_obj, speed, my_radius)
         {
             return ControlFlow::Continue(());
         }
