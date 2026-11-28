@@ -1,5 +1,6 @@
 use crate::map::{
-    Map, RoundaboutGeometry, TrafficBehavior, Traversable, TraverseDirection, TraverseKind,
+    IntersectionID, LaneID, Map, RoundaboutGeometry, TrafficBehavior, Traversable,
+    TraverseDirection, TraverseKind,
 };
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
 use crate::transportation::junction_admission::{self, segments_close, GAP, VEHICLE_BODY_RADIUS};
@@ -13,11 +14,13 @@ use crate::utils::resources::Resources;
 use crate::world::{VehicleEnt, VehicleID};
 use crate::ParCommandBuffer;
 use crate::World;
+use common::FastMap;
 use flat_spatial::grid::GridHandle;
 use geom::{angle_lerpxy, Ray, Segment3, Transform, Vec2, Vec3};
 use prototypes::{GameTime, DELTA, TICKS_PER_REALTIME_SECOND};
 use slotmapd::Key;
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 const STOPPED_SPEED: f32 = 0.2;
 const STOPPED_BLOCK_DISTANCE: f32 = 1.5;
@@ -393,6 +396,7 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
     };
 
     let merge_limits = roundabout_merge_limits(world, map, grid);
+    let roundabouts = RoundaboutAreas::new(map);
     for (id, entity) in world.vehicles.iter_mut() {
         let Some(collider) = entity.collider else {
             continue;
@@ -400,7 +404,8 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
         let traversal = observing
             .then(|| entity.it.get_travers().copied())
             .flatten();
-        let watched = diagnostics.watches(traversal);
+        let area = roundabouts.at(&entity.it, entity.trans.pos);
+        let watched = observing && diagnostics.watches(traversal);
         let mut hold = if watched {
             vehicle_decision_traced::<true>(
                 map,
@@ -412,22 +417,27 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
                 &mut entity.speed,
                 &mut entity.vehicle,
                 &collider,
+                area,
             )
         } else {
-            vehicle_decision(
+            vehicle_decision_traced::<false>(
                 map,
                 time,
                 grid,
                 id,
-                &mut entity.it,
+                &entity.it,
                 &mut entity.trans,
                 &mut entity.speed,
                 &mut entity.vehicle,
                 &collider,
+                area,
             );
             None
         };
-        if let Some(&(distance, blocker)) = merge_limits.get(&id) {
+        if let Some(&(distance, blocker)) = matches!(area, RoundaboutArea::Ring(_))
+            .then(|| merge_limits.get(&id))
+            .flatten()
+        {
             let braking = (2.0 * entity.vehicle.kind.deceleration() * distance).sqrt();
             let cap = braking.min(distance / DELTA);
             if entity.speed.0 > cap {
@@ -452,7 +462,8 @@ pub fn vehicle_decision(
     vehicle: &mut Vehicle,
     collider: &Transporter,
 ) {
-    vehicle_decision_traced::<false>(map, time, cow, me, it, trans, kin, vehicle, collider);
+    let area = RoundaboutArea::at(map, it, trans.pos);
+    vehicle_decision_traced::<false>(map, time, cow, me, it, trans, kin, vehicle, collider, area);
 }
 
 fn vehicle_decision_traced<const OBSERVE: bool>(
@@ -465,6 +476,7 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
     speed: &mut Speed,
     vehicle: &mut Vehicle,
     collider: &Transporter,
+    area: RoundaboutArea,
 ) -> Option<QueueHoldReason> {
     let (_, own_state) = grid.get(collider.0).expect("Handle not in transport grid");
     let ((desired_speed, desired_dir), reason) = if matches!(
@@ -479,7 +491,9 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
                     let state = grid.get(handle).expect("Handle not in transport grid").1;
                     (OBSERVE.then_some(handle), pos, state)
                 });
-        calc_decision_traced(id, vehicle, map, time, trans, own_state, it, neighbours)
+        calc_decision_traced(
+            id, vehicle, map, time, trans, own_state, it, area, neighbours,
+        )
     } else {
         ((0.0, Vec3::ZERO), None)
     };
@@ -678,6 +692,7 @@ pub fn calc_decision<'a>(
         trans,
         self_obj,
         it,
+        RoundaboutArea::at(map, it, trans.pos),
         neighs.map(|(pos, state)| (None, pos, state)),
     )
     .0
@@ -691,6 +706,7 @@ fn calc_decision_traced<'a>(
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
+    area: RoundaboutArea,
     neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
 ) -> ((f32, Vec3), Option<QueueHoldReason>) {
     let default_return = ((0.0, trans.dir), Some(QueueHoldReason::Unknown));
@@ -716,7 +732,6 @@ fn calc_decision_traced<'a>(
         vehicle.state = VehicleState::Driving;
         vehicle.flag = 0;
     }
-    let area = RoundaboutArea::at(map, it, trans.pos);
     let roundabout = area.contains(trans.pos);
     let stopped_gap = if roundabout {
         GAP
@@ -845,6 +860,63 @@ enum RoundaboutArea {
     },
 }
 
+#[derive(Default)]
+struct RoundaboutAreas {
+    arms: FastMap<LaneID, RoundaboutArea>,
+    rings: FastMap<IntersectionID, RoundaboutGeometry>,
+}
+
+impl RoundaboutAreas {
+    fn new(map: &Map) -> Self {
+        let mut areas = Self::default();
+        for junction in map
+            .configured_junctions()
+            .filter(|&junction| map.is_yield_roundabout(junction))
+        {
+            let Some(intersection) = map.get(junction) else {
+                continue;
+            };
+            let Some(ring) = intersection.roundabout_geometry() else {
+                continue;
+            };
+            areas.rings.insert(junction, ring);
+            for &road in &intersection.roads {
+                let Some(road) = map.get(road) else { continue };
+                for (id, _) in road.lanes_iter() {
+                    let Some(lane) = map.get(id) else { continue };
+                    areas.arms.insert(
+                        id,
+                        RoundaboutArea::Arm {
+                            start: lane.points.first(),
+                            end: lane.points.last(),
+                            near_start: map.is_yield_roundabout(lane.src),
+                            near_end: map.is_yield_roundabout(lane.dst),
+                        },
+                    );
+                }
+            }
+        }
+        areas
+    }
+
+    #[inline]
+    fn at(&self, itinerary: &Itinerary, position: Vec3) -> RoundaboutArea {
+        match itinerary.get_travers().map(|step| step.kind) {
+            Some(TraverseKind::Turn(turn)) => self
+                .rings
+                .get(&turn.parent)
+                .copied()
+                .map_or(RoundaboutArea::Ordinary, RoundaboutArea::Ring),
+            Some(TraverseKind::Lane(lane)) => self
+                .arms
+                .get(&lane)
+                .copied()
+                .map_or(RoundaboutArea::Ordinary, |area| area.near(position)),
+            None => RoundaboutArea::Ordinary,
+        }
+    }
+}
+
 impl RoundaboutArea {
     fn at(map: &Map, itinerary: &Itinerary, position: Vec3) -> Self {
         let Some(step) = itinerary.get_travers() else {
@@ -880,6 +952,30 @@ impl RoundaboutArea {
                 }
             }
             _ => Self::Ordinary,
+        }
+    }
+
+    fn near(self, position: Vec3) -> Self {
+        let Self::Arm {
+            start,
+            end,
+            near_start,
+            near_end,
+        } = self
+        else {
+            return self;
+        };
+        let near_start = near_start && start.is_close(position, ROUNDABOUT_ARM_REACH);
+        let near_end = near_end && end.is_close(position, ROUNDABOUT_ARM_REACH);
+        if near_start || near_end {
+            Self::Arm {
+                start,
+                end,
+                near_start,
+                near_end,
+            }
+        } else {
+            Self::Ordinary
         }
     }
 
@@ -1110,7 +1206,7 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
     self_obj: &TransportState,
     it: &Itinerary,
     area: RoundaboutArea,
-    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
+    mut neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
     cutoff: f32,
 ) -> (f32, u64, QueueHoldReason) {
     let position = trans.pos;
@@ -1140,24 +1236,25 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
     let braking_distance = speed.powi(2) / (2.0 * vehicle.kind.deceleration());
     let bumper = my_radius - VEHICLE_BODY_RADIUS;
     // Collision avoidance
-    for (handle, his_pos, nei_physics_obj) in neighs {
+    let early = neighs.try_for_each(|(handle, his_pos, nei_physics_obj)| {
         if (nei_physics_obj.height - position.z).abs() > 5.0 {
-            continue;
+            return ControlFlow::Continue(());
         }
         let towards_vec: Vec2 = his_pos - pos2;
         // Ignore myself and very close cars
         if towards_vec.is_close(Vec2::ZERO, 1.0) && towards_vec.x > 0.0 {
-            continue;
+            return ControlFlow::Continue(());
         }
 
-        let (towards_dir, dist) = unwrap_or!(towards_vec.dir_dist(), continue);
+        let (towards_dir, dist) =
+            unwrap_or!(towards_vec.dir_dist(), return ControlFlow::Continue(()));
 
         // cos of angle from self to obj
         let cos_angle = towards_dir.dot(dir2);
 
         // Ignore things behind
         if cos_angle < 0.0 {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         let dist_to_side = towards_vec.perp_dot(dir2).abs();
@@ -1246,12 +1343,12 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
                 };
             }
             if min_front_dist < cutoff {
-                return (min_front_dist, flag, blocker);
+                return ControlFlow::Break((min_front_dist, flag, blocker));
             }
-            continue;
+            return ControlFlow::Continue(());
         }
         if !is_vehicle || circulating || local_arm {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         // closest win
@@ -1260,20 +1357,23 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
             dir: nei_physics_obj.dir,
         };
 
-        let (my_dist, his_dist) = unwrap_or!(my_ray.both_dist_to_inter(&his_ray), continue);
+        let (my_dist, his_dist) = unwrap_or!(
+            my_ray.both_dist_to_inter(&his_ray),
+            return ControlFlow::Continue(())
+        );
 
         if my_dist.max(his_dist) > 1000.0 {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         if nei_physics_obj.speed <= 0.01 {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         if my_dist - speed.min(2.5) - my_radius
             < his_dist - nei_physics_obj.speed.min(2.5) - nei_physics_obj.radius
         {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         let final_dist = dist - my_radius - nei_physics_obj.radius - 5.0;
@@ -1282,8 +1382,12 @@ fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
             flag = nei_physics_obj.flag;
             blocker = QueueHoldReason::Conflict(handle);
         }
+        ControlFlow::Continue(())
+    });
+    match early {
+        ControlFlow::Break(result) => result,
+        ControlFlow::Continue(()) => (min_front_dist, flag, blocker),
     }
-    (min_front_dist, flag, blocker)
 }
 
 #[cfg(test)]
