@@ -1457,6 +1457,28 @@ fn assigned_driver(
     assigned_drivers(world, source, company).next()
 }
 
+fn can_start_delivery(
+    world: &World,
+    time: &GameTime,
+    source: Endpoint,
+    driver: HumanID,
+    truck: VehicleID,
+) -> bool {
+    let human = &world.humans[driver];
+    let work = human.work.as_ref().unwrap();
+    matches!(
+        work.kind,
+        WorkKind::Driver {
+            load: None,
+            deliver_order: None,
+            ..
+        }
+    ) && work.work_inter.is_active(&time.daytime)
+        && !work.shift_ending(time, DEPARTURE_CUTOFF_MINUTES)
+        && human.location == Location::Building(source.building)
+        && world.vehicles[truck].vehicle.state.is_parked()
+}
+
 fn has_fleet(world: &World, company: CompanyID) -> bool {
     world.companies[company]
         .comp
@@ -2197,7 +2219,7 @@ fn match_shipments(
     now: u64,
     released_sources: &BTreeSet<Endpoint>,
 ) {
-    let sources: Vec<_> = world
+    let mut sources: Vec<_> = world
         .companies
         .iter()
         .filter_map(|(id, company)| {
@@ -2297,6 +2319,11 @@ fn match_shipments(
         .collect();
     drop(trace);
     let time = resources.read::<GameTime>();
+    // Give immediate departures first claim on demand before booking future ones.
+    sources.sort_by_cached_key(|&(id, source, _, _)| {
+        !assigned_drivers(world, source, id)
+            .any(|(driver, truck)| can_start_delivery(world, &time, source, driver, truck))
+    });
     let mut market = resources.write::<Market>();
     let routes = ordered_shipment_routes(book, world, map, infos, &market);
     let departures = departure_queues(
@@ -2560,21 +2587,7 @@ fn dispatch(
             continue;
         };
         let mut drivers: Vec<_> = assigned_drivers(world, source, company_id)
-            .filter(|&(driver, truck)| {
-                let human = &world.humans[driver];
-                let work = human.work.as_ref().unwrap();
-                matches!(
-                    work.kind,
-                    WorkKind::Driver {
-                        load: None,
-                        deliver_order: None,
-                        ..
-                    }
-                ) && work.work_inter.is_active(&time.daytime)
-                    && !work.shift_ending(&time, DEPARTURE_CUTOFF_MINUTES)
-                    && human.location == Location::Building(source.building)
-                    && world.vehicles[truck].vehicle.state.is_parked()
-            })
+            .filter(|&(driver, truck)| can_start_delivery(world, &time, source, driver, truck))
             .collect();
         drivers.sort_unstable_by_key(|&(driver, _)| {
             let work = world.humans[driver].work.as_ref().unwrap();
@@ -5161,6 +5174,36 @@ mod lifecycle_tests {
             .unwrap()
             .destination();
         assert_eq!(second, far.building);
+    }
+
+    #[test]
+    fn freight_prefers_a_supplier_that_can_dispatch_now() {
+        let mut f = Fixture::new();
+        let road = road_along(&f, None, Some(100.0));
+        let backup = place_warehouse_on(
+            &mut f,
+            GoodsCompanyID::new("coal-mine").prototype(),
+            vec2(310.0, 132.0),
+            Some(road),
+        );
+        let (backup_driver, backup_truck) = warehouse_driver(&mut f, backup);
+        let SoulID::GoodsCompany(backup_company) = backup.soul else {
+            unreachable!()
+        };
+        let world = f.ctx.g.world_mut_unchecked();
+        world.companies[backup_company].comp.driver = Some(backup_driver);
+        world.edit_human(f.driver, |human| human.location = Location::Outside);
+
+        f.seed(200, 70);
+        f.ctx.g.write::<Market>().produce(backup.soul, Fixture::coal(), 48);
+        f.update(FREIGHT_MATCH_INTERVAL);
+
+        let cargo = f.ctx.g.read::<CargoBook>();
+        let load = cargo
+            .manifest_for(backup_truck)
+            .expect("the available coal supplier should deliver the reorder");
+        assert_eq!(load.destination(), f.destination.building);
+        assert_eq!(load.units(), mine_policy().capacity);
     }
 
     #[test]
