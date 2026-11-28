@@ -1,6 +1,6 @@
 use crate::map::{Map, TrafficBehavior, Traversable, TraverseDirection, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
-use crate::transportation::junction_admission;
+use crate::transportation::junction_admission::{self, segments_close, GAP, VEHICLE_BODY_RADIUS};
 use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
 use crate::transportation::{
     ColliderOwnerLookup, Speed, TransportGrid, TransportState, TransportationGroup, Transporter,
@@ -166,6 +166,204 @@ pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>>
     cycles
 }
 
+fn staging_clearance(
+    it: &Itinerary,
+    trans: &Transform,
+    half: f32,
+    ahead: &Itinerary,
+    lead: &Transform,
+    lead_to_port: f32,
+    limit: f32,
+) -> f32 {
+    let mut lead_path = Vec::new();
+    let mut from = lead.pos;
+    let mut reach = lead_to_port + half;
+    for &to in ahead.local_path().iter().rev().take(64) {
+        let offset = to - from;
+        lead_path.push(geom::Segment::new(
+            from.xy(),
+            (from + offset.cap_magnitude(reach)).xy(),
+        ));
+        reach -= offset.mag();
+        if reach <= 0.0 {
+            break;
+        }
+        from = to;
+    }
+    let mut distance: f32 = 0.0;
+    let mut from = trans.pos;
+    for &to in it.local_path().iter().rev().take(64) {
+        let offset = to - from;
+        let Some(direction) = offset.try_normalize() else {
+            continue;
+        };
+        let nose = direction * (half - VEHICLE_BODY_RADIUS);
+        let overlaps = |position: Vec3| {
+            let front = (position + nose).xy();
+            lead_path.iter().any(|line| {
+                line.project(front)
+                    .is_close(front, VEHICLE_BODY_RADIUS * 2.0 + GAP)
+            })
+        };
+        if overlaps(to) {
+            if overlaps(from) {
+                return (distance - 0.1).max(0.0);
+            }
+            let mut open = 0.0;
+            let mut closed = 1.0;
+            for _ in 0..7 {
+                let middle = (open + closed) * 0.5;
+                if overlaps(from + offset * middle) {
+                    closed = middle;
+                } else {
+                    open = middle;
+                }
+            }
+            return (distance + offset.mag() * open - 0.1).max(0.0);
+        }
+        distance += offset.mag();
+        if distance >= limit {
+            break;
+        }
+        from = to;
+    }
+    distance
+}
+
+fn roundabout_merge_limits(
+    world: &World,
+    map: &Map,
+    grid: &TransportGrid,
+) -> BTreeMap<VehicleID, (f32, GridHandle)> {
+    if !map
+        .configured_junctions()
+        .any(|junction| map.is_yield_roundabout(junction))
+    {
+        return BTreeMap::new();
+    }
+    let mut limits = BTreeMap::new();
+    for (id, vehicle) in world.vehicles.iter() {
+        let Some(step) = vehicle.it.get_travers() else {
+            continue;
+        };
+        let TraverseKind::Turn(turn) = step.kind else {
+            continue;
+        };
+        if !map.is_yield_roundabout(turn.parent) {
+            continue;
+        }
+        let half = vehicle.vehicle.kind.width() * 0.5;
+        let braking = vehicle.speed.0.powi(2) / (2.0 * vehicle.vehicle.kind.deceleration());
+        let staging_space = 2.0 * half + GAP;
+        let Some(entry) = RingEntry::approaching(
+            map,
+            &vehicle.it,
+            &vehicle.trans,
+            half - VEHICLE_BODY_RADIUS,
+            braking + staging_space + 1.0,
+        ) else {
+            continue;
+        };
+        let port = entry.center.xy() + entry.port;
+        let mut closest = None;
+        for (handle, _) in grid.query_around(port, 35.0) {
+            let ColliderOwnerLookup::Owned(TraversalOwner::Vehicle(other)) =
+                grid.collider_owner(world, handle)
+            else {
+                continue;
+            };
+            if other == id {
+                continue;
+            }
+            let actor = &world.vehicles[other];
+            let Some(other_step) = actor.it.get_travers() else {
+                continue;
+            };
+            if !matches!(other_step.kind, TraverseKind::Turn(other_turn) if other_turn.parent == turn.parent)
+            {
+                continue;
+            }
+            let other_half = actor.vehicle.kind.width() * 0.5;
+            if let Some(other_entry) = RingEntry::approaching(
+                map,
+                &actor.it,
+                &actor.trans,
+                other_half - VEHICLE_BODY_RADIUS,
+                f32::INFINITY,
+            ) {
+                // Only one driver from the converging entry lanes can use the port.
+                if matches!(other_step.kind, TraverseKind::Turn(other_turn) if other_turn.src == turn.src)
+                    || !other_entry.port.is_close(entry.port, 2.8)
+                    || (
+                        ordered_float::OrderedFloat(other_entry.distance_to_port),
+                        other,
+                    ) >= (ordered_float::OrderedFloat(entry.distance_to_port), id)
+                {
+                    continue;
+                }
+                let distance = entry.distance_to_hold.min(staging_clearance(
+                    &vehicle.it,
+                    &vehicle.trans,
+                    half,
+                    &actor.it,
+                    &actor.trans,
+                    other_entry.distance_to_port,
+                    staging_space,
+                ));
+                if closest.is_none_or(|(previous, _)| distance < previous) {
+                    closest = Some((distance, handle));
+                }
+                continue;
+            }
+            let mut from = actor.trans.pos;
+            let outward = from.xy() - entry.center.xy();
+            if actor.speed.0 > 2.0
+                && (outward.mag() - entry.port.mag()).abs() < 0.3
+                && actor.trans.dir.xy().dot(-outward.perpendicular()) > 0.7 * outward.mag()
+            {
+                let signed_distance = outward.angle(entry.port) * entry.port.mag();
+                let accel = vehicle.vehicle.kind.acceleration();
+                let speed = vehicle.speed.0;
+                let arrival = 2.0 * entry.distance_to_port
+                    / (speed + (speed * speed + 2.0 * accel * entry.distance_to_port).sqrt());
+                if signed_distance < 0.0
+                    && -signed_distance + actor.speed.0 * (arrival - 0.35).max(0.0)
+                        > half + other_half + GAP
+                {
+                    continue;
+                }
+            }
+            let mut reach = (actor.speed.0 * 1.05).max(4.0) + other_half;
+            let zone = half + 2.0;
+            let mut occupied = port.is_close(from.xy(), zone);
+            for &to in actor.it.local_path().iter().rev().take(256) {
+                let offset = to - from;
+                let end = from + offset.cap_magnitude(reach);
+                if Segment3::new(from, end)
+                    .flatten()
+                    .project(port)
+                    .is_close(port, zone)
+                {
+                    occupied = true;
+                    break;
+                }
+                reach -= offset.mag();
+                if reach <= 0.0 {
+                    break;
+                }
+                from = to;
+            }
+            if occupied && closest.is_none_or(|(previous, _)| entry.distance_to_hold < previous) {
+                closest = Some((entry.distance_to_hold, handle));
+            }
+        }
+        if let Some(limit) = closest {
+            limits.insert(id, limit);
+        }
+    }
+    limits
+}
+
 pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::vehicle_decision_system");
     let map = &*resources.read::<Map>();
@@ -181,6 +379,7 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
         0
     };
 
+    let merge_limits = roundabout_merge_limits(world, map, grid);
     for (id, entity) in world.vehicles.iter_mut() {
         let Some(collider) = entity.collider else {
             continue;
@@ -188,8 +387,9 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
         let traversal = observing
             .then(|| entity.it.get_travers().copied())
             .flatten();
-        if diagnostics.watches(traversal) {
-            if let Some(reason) = vehicle_decision_traced::<true>(
+        let watched = diagnostics.watches(traversal);
+        let mut hold = if watched {
+            vehicle_decision_traced::<true>(
                 map,
                 time,
                 grid,
@@ -199,9 +399,7 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
                 &mut entity.speed,
                 &mut entity.vehicle,
                 &collider,
-            ) {
-                diagnostics.record_hold(id, traversal, tick, reason);
-            }
+            )
         } else {
             vehicle_decision(
                 map,
@@ -214,6 +412,18 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
                 &mut entity.vehicle,
                 &collider,
             );
+            None
+        };
+        if let Some(&(distance, blocker)) = merge_limits.get(&id) {
+            let braking = (2.0 * entity.vehicle.kind.deceleration() * distance).sqrt();
+            let cap = braking.min(distance / DELTA);
+            if entity.speed.0 > cap {
+                entity.speed.0 = cap;
+                hold = Some(QueueHoldReason::Conflict(Some(blocker)));
+            }
+        }
+        if let Some(reason) = hold.filter(|_| watched) {
+            diagnostics.record_hold(id, traversal, tick, reason);
         }
     }
 }
@@ -250,12 +460,19 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
     ) {
         let danger_length =
             (own_state.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
-        let neighbours =
-            grid.query_around(trans.pos.xy(), 12.0 + danger_length)
-                .map(|(handle, pos)| {
-                    let state = grid.get(handle).expect("Handle not in transport grid").1;
-                    (OBSERVE.then_some(handle), pos, state)
-                });
+        let roundabout_margin = if matches!(it.get_travers().map(|step| step.kind),
+            Some(TraverseKind::Turn(turn)) if map.is_yield_roundabout(turn.parent))
+        {
+            8.0
+        } else {
+            0.0
+        };
+        let neighbours = grid
+            .query_around(trans.pos.xy(), 12.0 + danger_length + roundabout_margin)
+            .map(|(handle, pos)| {
+                let state = grid.get(handle).expect("Handle not in transport grid").1;
+                (OBSERVE.then_some(handle), pos, state)
+            });
         calc_decision_traced(id, vehicle, map, time, trans, own_state, it, neighbours)
     } else {
         ((0.0, Vec3::ZERO), None)
@@ -493,6 +710,12 @@ fn calc_decision_traced<'a>(
         vehicle.state = VehicleState::Driving;
         vehicle.flag = 0;
     }
+    let roundabout = on_roundabout_arm(map, it, trans.pos, trans.pos);
+    let stopped_gap = if roundabout {
+        GAP
+    } else {
+        STOPPED_BLOCK_DISTANCE
+    };
     let stopping_threshold = 0.8 + stop_dist;
     let (front_dist, flag, blocker) = calc_front_dist(
         vehicle,
@@ -501,7 +724,7 @@ fn calc_decision_traced<'a>(
         self_obj,
         it,
         neighs,
-        stopping_threshold.min(STOPPED_BLOCK_DISTANCE),
+        stopping_threshold.min(stopped_gap),
     );
 
     let position = trans.pos;
@@ -515,7 +738,7 @@ fn calc_decision_traced<'a>(
         if since.elapsed(time).0 .0 > 20 * TICKS_PER_REALTIME_SECOND {
             vehicle.state = VehicleState::Driving;
         }
-    } else if speed.abs() < STOPPED_SPEED && front_dist < STOPPED_BLOCK_DISTANCE {
+    } else if speed.abs() < STOPPED_SPEED && front_dist < stopped_gap {
         let me_u64: u64 = me.data().as_ffi();
         if !controlled && me_u64 == flag && matches!(vehicle.state, VehicleState::Driving) {
             vehicle.state = VehicleState::Panicking(time.instant());
@@ -526,7 +749,9 @@ fn calc_decision_traced<'a>(
         } else {
             flag
         };
-        vehicle.wait_time = (position.x * 1000.0).fract().abs() * 0.5;
+        if !roundabout {
+            vehicle.wait_time = (position.x * 1000.0).fract().abs() * 0.5;
+        }
         return ((0.0, trans.dir), Some(blocker));
     } else {
         // Stop at 80 cm of object in front
@@ -598,62 +823,161 @@ fn calc_decision_traced<'a>(
     )
 }
 
-// Keep ordinary junctions at the far end of short roundabout arms on the
-// existing collision-avoidance path.
-fn on_roundabout_arm(map: &Map, it: &Itinerary, position: Vec3) -> bool {
+// Classify the encounter using the pedestrian's end of the arm. A driver's
+// braking distance can reach the ordinary junction on a short outbound lane.
+fn on_roundabout_arm(map: &Map, it: &Itinerary, position: Vec3, pedestrian: Vec3) -> bool {
     const ARM_REACH: f32 = 24.0;
-    const TURN_MOUTH_REACH: f32 = 12.0;
     if !map.needs_junction_entry_checks() {
         return false;
     }
     match it.get_travers().map(|step| step.kind) {
-        Some(TraverseKind::Turn(turn)) => {
-            map.is_yield_roundabout(turn.parent)
-                && map
-                    .get(turn.parent)
-                    .and_then(|junction| junction.raw_turn(turn))
-                    .is_some_and(|turn| {
-                        position.is_close(turn.points.first(), TURN_MOUTH_REACH)
-                            || position.is_close(turn.points.last(), TURN_MOUTH_REACH)
-                    })
-        }
+        Some(TraverseKind::Turn(turn)) => map.is_yield_roundabout(turn.parent),
         Some(TraverseKind::Lane(id)) => map.get(id).is_some_and(|lane| {
-            let from_start = position.distance2(lane.points.first());
-            let from_end = position.distance2(lane.points.last());
-            let (distance, junction) = if from_start < from_end {
-                (from_start, lane.src)
+            let (mouth, junction) = if pedestrian.distance2(lane.points.first())
+                < pedestrian.distance2(lane.points.last())
+            {
+                (lane.points.first(), lane.src)
             } else {
-                (from_end, lane.dst)
+                (lane.points.last(), lane.dst)
             };
-            distance <= ARM_REACH.powi(2) && map.is_yield_roundabout(junction)
+            map.is_yield_roundabout(junction)
+                && mouth.is_close(position, ARM_REACH)
+                && mouth.is_close(pedestrian, ARM_REACH)
         }),
         None => false,
     }
 }
 
-fn pedestrian_in_braking_path(
+struct RingEntry {
+    center: Vec3,
+    port: Vec2,
+    distance_to_hold: f32,
+    distance_to_port: f32,
+}
+
+impl RingEntry {
+    fn approaching(
+        map: &Map,
+        it: &Itinerary,
+        trans: &Transform,
+        bumper: f32,
+        reach: f32,
+    ) -> Option<Self> {
+        let TraverseKind::Turn(id) = it.get_travers()?.kind else {
+            return None;
+        };
+        let intersection = map.get(id.parent)?;
+        let ring = intersection.roundabout_geometry()?;
+        let turn = intersection.raw_turn(id)?;
+        let merge = turn.points.as_slice()[junction_admission::roundabout_merge_index(turn, ring)];
+        let path = it.local_path();
+        // The arc join disappears from the itinerary once the driver has merged.
+        if !path.contains(&merge) {
+            return None;
+        }
+        let keep_clear = ring.radius + 4.6;
+        let nose = trans.pos + trans.dir * bumper;
+        if nose.xy().distance(ring.center.xy()) < keep_clear - 0.03 {
+            return None;
+        }
+        let mut distance = 0.0;
+        let mut from = trans.pos;
+        for &to in path.iter().rev() {
+            let delta = to - from;
+            let length = delta.mag();
+            let Some(direction) = delta.try_normalize() else {
+                continue;
+            };
+            let body = from + direction * bumper;
+            let radial = body.xy() - ring.center.xy();
+            let tangent = direction.xy();
+            // Find where the oriented nose first reaches the circulating
+            // lane's clearance envelope along this straight piece.
+            let along = radial.dot(tangent);
+            let cross = along * along - tangent.mag2() * (radial.mag2() - keep_clear * keep_clear);
+            if cross >= 0.0 {
+                let entry = (-along - cross.sqrt()) / tangent.mag2();
+                if entry <= length && (entry >= 0.0 || radial.mag() <= keep_clear) {
+                    let distance_to_hold = (distance + entry.max(0.0) - 0.08).max(0.0);
+                    return (distance_to_hold <= reach).then_some(Self {
+                        center: ring.center,
+                        port: merge.xy() - ring.center.xy(),
+                        distance_to_hold,
+                        distance_to_port: merge.xy().distance(trans.pos.xy()),
+                    });
+                }
+            }
+            distance += length;
+            if distance > reach || to == merge {
+                break;
+            }
+            from = to;
+        }
+        None
+    }
+}
+
+fn can_clear_merge_contact(
+    ring: crate::map::RoundaboutGeometry,
+    it: &Itinerary,
+    trans: &Transform,
+    bumper: f32,
+    other: &TransportState,
+    footprint: Segment3,
+) -> bool {
+    let outward = footprint.middle().xy() - ring.center.xy();
+    if (trans.pos.xy().distance(ring.center.xy()) - ring.radius).abs() > 0.25
+        || outward.mag() <= ring.radius + 0.8
+        || other.speed > 0.2
+        || other.dir.dot(outward) > -0.35 * ring.radius
+        || (footprint.src.z - trans.pos.z).abs() > 0.65
+    {
+        return false;
+    }
+    let body = trans.dir * bumper;
+    let current = Segment3::new(trans.pos - body, trans.pos + body).flatten();
+    let footprint = footprint.flatten();
+    let gap = current.distance(&footprint);
+    if gap > 2.0 * VEHICLE_BODY_RADIUS + GAP {
+        return false;
+    }
+    let Some(step) = it
+        .get_point()
+        .and_then(|point| (point - trans.pos).try_normalize())
+    else {
+        return false;
+    };
+    let next = geom::Segment {
+        src: current.src + step.xy() * 0.08,
+        dst: current.dst + step.xy() * 0.08,
+    };
+    // A circulating vehicle can move out of a pinched merge while the
+    // entry is stopped, provided the bodies do not move any closer.
+    next.distance(&footprint) + 0.0001 >= gap
+}
+
+fn braking_path_conflicts(
     map: &Map,
     it: &Itinerary,
     trans: &Transform,
-    half_length: f32,
+    bumper: f32,
     braking_distance: f32,
-    pedestrian: Vec3,
-    pedestrian_radius: f32,
+    obstacle: Segment3,
+    clearance: f32,
 ) -> bool {
-    // Use the same oriented vehicle footprint as junction exit checks.
-    const BODY_RADIUS: f32 = 1.0;
-    const GAP: f32 = 0.8;
     const DECK_TOLERANCE: f32 = 0.65;
     const MAX_LOOKAHEAD_POINTS: usize = 256;
-    let bumper = half_length - BODY_RADIUS;
-    let clearance = BODY_RADIUS + pedestrian_radius + GAP;
-    let conflicts = |from, to| {
-        let closest = Segment3::new(from, to).project(pedestrian);
-        (closest.z - pedestrian.z).abs() <= DECK_TOLERANCE
-            && closest.xy().is_close(pedestrian.xy(), clearance)
+    let overlaps = |from: Vec3, to: Vec3| {
+        let height = obstacle.src.z;
+        from.z.min(to.z) <= height + DECK_TOLERANCE
+            && from.z.max(to.z) >= height - DECK_TOLERANCE
+            && segments_close(
+                Segment3::new(from.xy().z0(), to.xy().z0()),
+                Segment3::new(obstacle.src.xy().z0(), obstacle.dst.xy().z0()),
+                clearance.powi(2),
+            )
     };
-    let mut from = trans.pos;
-    if conflicts(from, from + trans.dir * bumper) {
+    if overlaps(trans.pos, trans.pos + trans.dir * bumper) {
         return true;
     }
 
@@ -667,6 +991,7 @@ fn pedestrian_in_braking_path(
             TraverseDirection::Backward => points[points.len() - 1 - i],
         })
     });
+    let mut from = trans.pos;
     let mut reach = braking_distance + bumper + GAP;
     for (i, to) in it
         .local_path()
@@ -680,7 +1005,7 @@ fn pedestrian_in_braking_path(
             return true;
         }
         let offset = to - from;
-        if conflicts(from, from + offset.cap_magnitude(reach)) {
+        if overlaps(from, from + offset.cap_magnitude(reach)) {
             return true;
         }
         reach -= offset.mag();
@@ -722,7 +1047,24 @@ fn calc_front_dist<'a>(
     let on_lane = it.get_travers().map_or(false, |t| t.kind.is_lane());
     let mut flag = 0;
     let mut blocker = QueueHoldReason::Unknown;
-    let mut near_roundabout = None;
+    let configured = map.needs_junction_entry_checks();
+    let ring = configured
+        .then(|| {
+            let TraverseKind::Turn(turn) = it.get_travers()?.kind else {
+                return None;
+            };
+            map.get(turn.parent)?.roundabout_geometry()
+        })
+        .flatten();
+    let circulating = ring.is_some();
+    let on_arm = configured
+        && matches!(it.get_travers().map(|step| step.kind),
+        Some(TraverseKind::Lane(id)) if map.get(id).is_some_and(|lane| {
+            (map.is_yield_roundabout(lane.src) && position.is_close(lane.points.first(), 24.0))
+                || (map.is_yield_roundabout(lane.dst) && position.is_close(lane.points.last(), 24.0))
+        }));
+    let braking_distance = speed.powi(2) / (2.0 * vehicle.kind.deceleration());
+    let bumper = my_radius - VEHICLE_BODY_RADIUS;
     // Collision avoidance
     for (handle, his_pos, nei_physics_obj) in neighs {
         if (nei_physics_obj.height - position.z).abs() > 5.0 {
@@ -750,31 +1092,74 @@ fn calc_front_dist<'a>(
 
         let cos_direction_angle = nei_physics_obj.dir.dot(dir2);
 
-        // front cone
-        if cos_angle > 0.85 - 0.015 * speed.min(10.0)
+        let pedestrian = his_pos.z(nei_physics_obj.height);
+        let local_arm = on_arm && on_roundabout_arm(map, it, position, pedestrian);
+        let lateral_limit = if local_arm && is_vehicle {
+            2.0 * VEHICLE_BODY_RADIUS + GAP
+        } else {
+            3.0 + speed * 0.3
+        };
+        let in_front_cone = cos_angle > 0.85 - 0.015 * speed.min(10.0)
             && (!is_vehicle || cos_direction_angle > 0.0)
-            && (!on_lane || dist_to_side < 3.0 + speed * 0.3)
+            && (!on_lane || dist_to_side < lateral_limit);
+        let front_distance = if nei_physics_obj.group == TransportationGroup::Pedestrians
+            && configured
+            && on_roundabout_arm(map, it, position, pedestrian)
         {
-            let mut dist_to_obj = dist - my_radius - nei_physics_obj.radius;
-            if !is_vehicle {
-                dist_to_obj -= 1.0;
-            }
-            if dist_to_obj < min_front_dist {
-                if nei_physics_obj.group == TransportationGroup::Pedestrians
-                    && *near_roundabout.get_or_insert_with(|| on_roundabout_arm(map, it, position))
-                    && !pedestrian_in_braking_path(
-                        map,
-                        it,
-                        trans,
-                        my_radius,
-                        speed.powi(2) / (2.0 * vehicle.kind.deceleration()),
-                        his_pos.z(nei_physics_obj.height),
-                        nei_physics_obj.radius,
-                    )
-                {
-                    continue;
-                }
-                min_front_dist = dist_to_obj;
+            let time = speed / vehicle.kind.deceleration() + 0.25;
+            let swept = Segment3::new(
+                pedestrian,
+                pedestrian + (nei_physics_obj.dir * nei_physics_obj.speed * time).z0(),
+            );
+            braking_path_conflicts(
+                map,
+                it,
+                trans,
+                bumper,
+                braking_distance,
+                swept,
+                VEHICLE_BODY_RADIUS + nei_physics_obj.radius + GAP * (speed / 3.0).clamp(0.25, 1.0),
+            )
+            .then_some(0.0)
+        } else if circulating && is_vehicle {
+            // An entry's tangent can point across the ring even while the
+            // driver is yielding at the mouth. Follow its physical body
+            // along our route instead of intersecting the two heading rays.
+            let body = (nei_physics_obj.dir * (nei_physics_obj.radius - VEHICLE_BODY_RADIUS)).z0();
+            let footprint = Segment3::new(pedestrian - body, pedestrian + body);
+            (braking_path_conflicts(
+                map,
+                it,
+                trans,
+                bumper,
+                (braking_distance
+                    - nei_physics_obj.speed.powi(2) * cos_direction_angle.max(0.0)
+                        / (2.0 * vehicle.kind.deceleration()))
+                .max(0.0),
+                footprint,
+                2.0 * VEHICLE_BODY_RADIUS,
+            ) && !(speed <= 1.6
+                && ring.is_some_and(|ring| {
+                    can_clear_merge_contact(ring, it, trans, bumper, nei_physics_obj, footprint)
+                })))
+            .then_some(0.0)
+        } else if in_front_cone {
+            let moving_leader = if local_arm && is_vehicle {
+                nei_physics_obj.speed.powi(2) * cos_direction_angle.max(0.0)
+                    / (2.0 * vehicle.kind.deceleration())
+            } else {
+                0.0
+            };
+            Some(
+                dist - my_radius - nei_physics_obj.radius + moving_leader
+                    - if is_vehicle { 0.0 } else { 1.0 },
+            )
+        } else {
+            None
+        };
+        if let Some(distance) = front_distance {
+            if distance < min_front_dist {
+                min_front_dist = distance;
                 flag = nei_physics_obj.flag;
                 blocker = match (handle, nei_physics_obj.group) {
                     (Some(handle), TransportationGroup::Vehicles) => {
@@ -791,9 +1176,7 @@ fn calc_front_dist<'a>(
             }
             continue;
         }
-
-        // don't do ray checks for other things than cars
-        if !is_vehicle {
+        if !is_vehicle || circulating || local_arm {
             continue;
         }
 

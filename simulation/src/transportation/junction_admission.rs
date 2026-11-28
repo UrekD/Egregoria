@@ -23,11 +23,14 @@ const MAX_PATH_POINTS: usize = 256;
 const MAX_TURN_SEGMENT_PAIRS: usize = 16_384;
 const STOP_DWELL: u64 = game_secs_to_ticks(1);
 const AGE_PRIORITY: u64 = game_secs_to_ticks(60);
-const GAP: f32 = 0.8;
+pub(super) const GAP: f32 = 0.8;
+pub(super) const VEHICLE_BODY_RADIUS: f32 = 1.0;
 pub(crate) fn roundabout_exit_storage() -> f32 {
     super::VehicleKind::Bus.width() + GAP
 }
 const HOLD_TOLERANCE: f32 = 0.04;
+const PEDESTRIAN_GAP_APPROACH: f32 = 3.0;
+const PEDESTRIAN_GAP_AGE: u64 = game_secs_to_ticks(12);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum EntryOwner {
@@ -270,18 +273,35 @@ struct Sweep<'a> {
     owner: MovingOwner,
     crossing: Crossing,
     remaining: Option<(Vec3, &'a [Vec3])>,
+    footprint: Option<Segment3>,
+    speed: f32,
+    waiting_at_curb: bool,
 }
 
 impl<'a> Sweep<'a> {
+    fn pending(owner: MovingOwner, crossing: Crossing, speed: f32) -> Self {
+        Self {
+            owner,
+            crossing,
+            speed,
+            remaining: None,
+            footprint: None,
+            waiting_at_curb: false,
+        }
+    }
+
     fn occupied(map: &Map, crossing: Crossing, actor: &Actor<'a>) -> Self {
-        let remaining = if !map.is_yield_roundabout(crossing.turn.parent) {
-            None
-        } else if matches!(actor.owner.owner, EntryOwner::Vehicle(_)) {
+        let mut sweep = Self::pending(actor.owner, crossing, actor.speed);
+        if !map.is_yield_roundabout(crossing.turn.parent) {
+            return sweep;
+        }
+        if matches!(actor.owner.owner, EntryOwner::Vehicle(_)) {
+            let body = actor.direction * (actor.owner.half_extent - VEHICLE_BODY_RADIUS);
+            sweep.footprint = Some(Segment3::new(actor.position - body, actor.position + body));
             // A circulating vehicle protects the path ahead and its current footprint.
-            match actor.itinerary.get_travers() {
+            sweep.remaining = match actor.itinerary.get_travers() {
                 Some(step)
                     if Some(crossing) == Crossing::from_traversal(*step)
-                        && !actor.itinerary.local_path().is_empty()
                         && actor.itinerary.local_path().len() <= MAX_PATH_POINTS =>
                 {
                     Some((actor.position, actor.itinerary.local_path()))
@@ -290,15 +310,11 @@ impl<'a> Sweep<'a> {
                     Some((actor.position, &[][..]))
                 }
                 _ => None,
-            }
+            };
         } else {
-            walking_suffix(map, crossing, actor)
-        };
-        Self {
-            owner: actor.owner,
-            crossing,
-            remaining,
+            sweep.remaining = walking_suffix(map, crossing, actor);
         }
+        sweep
     }
 }
 
@@ -309,8 +325,9 @@ fn walking_suffix<'a>(
 ) -> Option<(Vec3, &'a [Vec3])> {
     let current = *actor.itinerary.get_travers()?;
     if Crossing::from_traversal(current) != Some(crossing) {
-        return (current.kind == TraverseKind::Lane(crossing.to_lane()))
-            .then_some((actor.position, &[][..]));
+        return (current.kind == TraverseKind::Lane(crossing.to_lane())
+            || follows_crosswalk_onto_corner(map, crossing, current))
+        .then_some((actor.position, &[][..]));
     }
     let turn = map.get(crossing.turn.parent)?.raw_turn(crossing.turn)?;
     let path = actor.itinerary.local_path();
@@ -333,44 +350,45 @@ fn walking_suffix<'a>(
 struct Sweeps<'a> {
     vehicles: Vec<Sweep<'a>>,
     walkers: Vec<Sweep<'a>>,
-    walking_turns: BTreeMap<TurnID, usize>,
+    walking_turns: BTreeSet<(TurnID, bool)>,
 }
 
 impl<'a> Sweeps<'a> {
     fn insert(&mut self, sweep: Sweep<'a>, roundabout: bool) {
         if matches!(sweep.owner.owner, EntryOwner::Vehicle(_)) {
             self.vehicles.push(sweep);
-        } else if !roundabout {
+        } else if !roundabout || sweep.remaining.is_some() {
             self.walkers.push(sweep);
-        } else if let Some(&index) = self.walking_turns.get(&sweep.crossing.turn) {
-            let existing = &mut self.walkers[index];
-            if existing.remaining.is_none() {
-                return;
-            }
-            match (existing.remaining, sweep.remaining) {
-                (Some((previous, [exit])), Some((position, [end])))
-                    if existing.crossing == sweep.crossing && exit == end =>
-                {
-                    if position.distance2(*exit) > previous.distance2(*exit) {
-                        *existing = sweep;
-                    }
-                }
-                // Opposing directions, curb tails and pending grants conservatively
-                // share one full sweep, keeping the comparison count bounded.
-                _ => existing.remaining = None,
-            }
         } else {
-            self.walking_turns
-                .insert(sweep.crossing.turn, self.walkers.len());
-            self.walkers.push(sweep);
+            if self.walking_turns.insert((
+                sweep.crossing.turn,
+                sweep.waiting_at_curb && sweep.crossing.backwards,
+            )) {
+                self.walkers.push(sweep);
+            }
         }
     }
 
-    fn conflicts(&self, map: &Map, sweep: Sweep<'_>, roundabout: bool, work: &mut usize) -> bool {
-        let mut conflicts_with = |other: &Sweep<'_>| conflicts(map, sweep, *other, work);
-        self.vehicles.iter().any(&mut conflicts_with)
-            || ((!roundabout || matches!(sweep.owner.owner, EntryOwner::Vehicle(_)))
-                && self.walkers.iter().any(conflicts_with))
+    fn conflict_owner(
+        &self,
+        map: &Map,
+        sweep: Sweep<'_>,
+        roundabout: bool,
+        work: &mut usize,
+    ) -> Option<EntryOwner> {
+        let mut conflicts_with = |other: &&Sweep<'_>| {
+            if roundabout {
+                roundabout_conflicts(map, sweep, **other, work)
+            } else {
+                conflicts(map, sweep, **other, work)
+            }
+        };
+        let consider_walkers = !roundabout || matches!(sweep.owner.owner, EntryOwner::Vehicle(_));
+        self.vehicles
+            .iter()
+            .chain(self.walkers.iter().filter(|_| consider_walkers))
+            .find(&mut conflicts_with)
+            .map(|other| other.owner.owner)
     }
 }
 
@@ -427,11 +445,24 @@ impl<'a> Actor<'a> {
     }
 
     fn boundary(&self, map: &Map) -> Option<EntryBoundary> {
+        let mut travel = self.speed * DELTA;
+        if matches!(self.owner.owner, EntryOwner::Vehicle(_))
+            && self
+                .itinerary
+                .get_route()
+                .and_then(|route| route.reversed_route.last())
+                .is_some_and(|next| {
+                    matches!(next.kind, TraverseKind::Turn(turn)
+                    if map.is_yield_roundabout(turn.parent))
+                })
+        {
+            travel += PEDESTRIAN_GAP_APPROACH;
+        }
         entry_boundary(
             map,
             self.itinerary,
             self.position,
-            self.speed * DELTA,
+            travel,
             self.owner.half_extent,
         )
     }
@@ -825,12 +856,42 @@ impl JunctionFrame {
         eligible
             .sort_unstable_by_key(|&(unaged, role, since, owner, _)| (unaged, role, since, owner));
         let mut aged_holds = Sweeps::default();
+        let mut pedestrian_gaps = Vec::new();
+        if roundabout {
+            pedestrian_gaps.extend(occupied.vehicles.iter().copied().filter(|vehicle| {
+                vehicle.footprint.is_some_and(|body| {
+                    map.get(junction)
+                        .and_then(|inter| inter.raw_turn(vehicle.crossing.turn))
+                        .is_some_and(|turn| {
+                            body.middle()
+                                .is_close(turn.points.first(), vehicle.owner.half_extent + GAP)
+                        })
+                })
+            }));
+        }
+        if roundabout {
+            // While a crossing group is on the zebra, close it to new starts
+            // once a vehicle is waiting nearby. The group keeps moving, and
+            // the next driver can use the first gap it leaves.
+            for &(_, _, since, owner, ref request) in &eligible {
+                if !matches!(owner, EntryOwner::Vehicle(_))
+                    || request.speed > 0.2
+                    || request.boundary.distance > PEDESTRIAN_GAP_APPROACH
+                    || tick - since < PEDESTRIAN_GAP_AGE
+                {
+                    continue;
+                }
+                let sweep = Sweep::pending(request.user, request.crossing, request.speed);
+                if occupied.walkers.iter().any(|&walker| {
+                    !matches!(walker.remaining, Some((_, [])))
+                        && crosswalk_gap_conflicts(map, walker, sweep, &mut work)
+                }) {
+                    pedestrian_gaps.push(sweep);
+                }
+            }
+        }
         for (unaged, _, _, owner, request) in eligible {
-            let sweep = Sweep {
-                owner: request.user,
-                crossing: request.crossing,
-                remaining: None,
-            };
+            let sweep = Sweep::pending(request.user, request.crossing, request.speed);
             if matches!(owner, EntryOwner::Vehicle(_)) {
                 match receiving_room(map, &request, vehicles, &mut work) {
                     Some(true) => {}
@@ -844,10 +905,28 @@ impl JunctionFrame {
                     }
                 }
             }
+            if roundabout
+                && matches!(owner, EntryOwner::Vehicle(_))
+                && request.speed <= 0.2
+                && request.boundary.distance <= PEDESTRIAN_GAP_APPROACH
+                && tick - waiting[&owner].eligible_since >= PEDESTRIAN_GAP_AGE
+            {
+                // A queued driver gets a gap between crossing groups.
+                // Walkers already on the crossing keep their protection.
+                pedestrian_gaps.push(sweep);
+            }
             if !request.boundary.reached_by(request.speed * DELTA) {
                 continue;
             }
-            if aged_holds.conflicts(map, sweep, roundabout, &mut work) {
+            if aged_holds
+                .conflict_owner(map, sweep, roundabout, &mut work)
+                .is_some()
+                || (roundabout
+                    && matches!(owner, EntryOwner::Human(_))
+                    && pedestrian_gaps
+                        .iter()
+                        .any(|&vehicle| crosswalk_gap_conflicts(map, sweep, vehicle, &mut work)))
+            {
                 self.denied.insert(owner, HoldReason::Conflict);
                 continue;
             }
@@ -855,10 +934,23 @@ impl JunctionFrame {
                 && recoveries
                     .iter()
                     .any(|recovery| recovery_conflicts(map, sweep, recovery, &mut work));
-            if recovery_conflict || occupied.conflicts(map, sweep, roundabout, &mut work) {
+            let conflict = if recovery_conflict {
+                None
+            } else {
+                occupied.conflict_owner(map, sweep, roundabout, &mut work)
+            };
+            if recovery_conflict || conflict.is_some() {
                 self.denied.insert(owner, HoldReason::Conflict);
                 if !unaged {
-                    aged_holds.insert(sweep, roundabout);
+                    if !roundabout || matches!(owner, EntryOwner::Human(_)) {
+                        aged_holds.insert(
+                            Sweep {
+                                waiting_at_curb: roundabout,
+                                ..sweep
+                            },
+                            roundabout,
+                        );
+                    }
                 }
             } else {
                 occupied.insert(sweep, roundabout);
@@ -927,6 +1019,11 @@ fn receiving_room(
     for actor in vehicles {
         *work = work.checked_sub(1)?;
         if actor.owner.owner == request.user.owner
+            || (map.is_yield_roundabout(request.crossing.turn.parent)
+                && (actor.speed > 0.5
+                    || actor.itinerary.get_travers().is_none_or(|step| {
+                        step.kind != TraverseKind::Lane(request.crossing.to_lane())
+                    })))
             || !start
                 .xy()
                 .is_close(actor.position.xy(), needed + actor.owner.half_extent + 3.0)
@@ -935,7 +1032,7 @@ fn receiving_room(
         }
         // Model the footprint as an oriented capsule. Sweep only the storage
         // needed from the lane entrance and retain the deck separation.
-        let body = actor.direction.xy().z0() * (actor.owner.half_extent - 1.0);
+        let body = actor.direction.xy().z0() * (actor.owner.half_extent - VEHICLE_BODY_RADIUS);
         let scale = |p: Vec3| p.xy().z(p.z * 2.0);
         let vehicle = Segment3::new(scale(actor.position - body), scale(actor.position + body));
         let mut remaining = needed;
@@ -948,13 +1045,17 @@ fn receiving_room(
             let tangent = segment.vec() / length;
             let storage_length = remaining.min(length);
             let center = (actor.position - segment.src).dot(tangent);
-            let extent = body.dot(tangent).abs() + 1.0;
+            let extent = body.dot(tangent).abs() + VEHICLE_BODY_RADIUS;
             // The entrance and its far edge are transverse cuts. Side
             // clearance must not inflate a bumper's longitudinal extent.
             if center + extent >= 0.0 && center - extent < storage_length {
                 let end = segment.src + tangent * storage_length;
                 let storage = Segment3::new(scale(segment.src), scale(end));
-                if segments_close(vehicle, storage, (1.0 + lane.kind.width() * 0.5).powi(2)) {
+                if segments_close(
+                    vehicle,
+                    storage,
+                    (VEHICLE_BODY_RADIUS + lane.kind.width() * 0.5).powi(2),
+                ) {
                     return Some(false);
                 }
             }
@@ -1026,12 +1127,8 @@ fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
     if Crossing::from_traversal(current) == Some(crossing) {
         return turn.points.project(position).distance(position) <= half_extent + GAP;
     }
-    let after_crosswalk = turn.kind == TurnKind::Crosswalk
-        && Crossing::from_traversal(current).is_some_and(|corner| {
-            corner.turn.parent == crossing.turn.parent
-                && corner.from_lane() == crossing.to_lane()
-                && turn_kind(map, corner.turn) == Some(TurnKind::WalkingCorner)
-        });
+    let after_crosswalk =
+        turn.kind == TurnKind::Crosswalk && follows_crosswalk_onto_corner(map, crossing, current);
     if !current.kind.is_lane() && !after_crosswalk && !follows_walking_turn(map, current, crossing)
     {
         return false;
@@ -1062,6 +1159,14 @@ fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
     exit.distance(position) <= half_extent + GAP
 }
 
+fn follows_crosswalk_onto_corner(map: &Map, crossing: Crossing, current: Traversable) -> bool {
+    Crossing::from_traversal(current).is_some_and(|corner| {
+        corner.turn.parent == crossing.turn.parent
+            && corner.from_lane() == crossing.to_lane()
+            && turn_kind(map, corner.turn) == Some(TurnKind::WalkingCorner)
+    })
+}
+
 fn recovery_can_move(
     map: &Map,
     junction: IntersectionID,
@@ -1079,11 +1184,11 @@ fn recovery_can_move(
                 return false;
             }
             *work -= 1;
-            let body = vehicle.direction * (vehicle.owner.half_extent - 1.0);
+            let body = vehicle.direction * (vehicle.owner.half_extent - VEHICLE_BODY_RADIUS);
             let footprint = Segment3::new(vehicle.position - body, vehicle.position + body);
             // Pad the current footprint by the distance the car could move
             // before the next barrier, even if its path bends.
-            let radius = recovery.owner.half_extent + 1.0;
+            let radius = recovery.owner.half_extent + VEHICLE_BODY_RADIUS;
             let mut travel = vehicle.speed.max(0.0) * DELTA;
             if !segments_close(movement, footprint, (radius + travel).powi(2)) {
                 continue;
@@ -1095,11 +1200,7 @@ fn recovery_can_move(
                     && boundary.crossing.turn.parent == junction
                     && boundary.reached_by(travel)
             }) {
-                let sweep = Sweep {
-                    owner: vehicle.owner,
-                    crossing: boundary.crossing,
-                    remaining: None,
-                };
+                let sweep = Sweep::pending(vehicle.owner, boundary.crossing, vehicle.speed);
                 if recovery_conflicts(map, sweep, recovery, work) {
                     // The same recovery sweep will stop this approach at its hold point.
                     travel = boundary.distance;
@@ -1152,13 +1253,295 @@ fn recovery_conflicts(
     else {
         return true;
     };
-    let clearance2 = (vehicle.owner.half_extent + recovery.owner.half_extent + GAP).powi(2);
+    if !map.is_yield_roundabout(vehicle.crossing.turn.parent) {
+        return sweep_conflicts(
+            turn.points.segments(),
+            || remaining_segments(recovery.position, recovery.path),
+            (vehicle.owner.half_extent + recovery.owner.half_extent + GAP).powi(2),
+            work,
+        );
+    }
+    let clearance2 = (VEHICLE_BODY_RADIUS + recovery.owner.half_extent + GAP).powi(2);
+    let reach = vehicle.owner.half_extent * 2.0 + GAP + vehicle.speed.powi(2) / 12.0;
     sweep_conflicts(
-        turn.points.segments(),
+        prefix(turn.points.segments(), reach),
         || remaining_segments(recovery.position, recovery.path),
         clearance2,
         work,
     )
+}
+
+fn prefix(
+    segments: impl Iterator<Item = Segment3>,
+    mut distance: f32,
+) -> impl Iterator<Item = Segment3> {
+    segments.map_while(move |segment| {
+        if distance <= 0.0 {
+            return None;
+        }
+        let offset = segment.vec();
+        let dst = segment.src + offset.cap_magnitude(distance);
+        distance -= offset.mag();
+        Some(Segment3::new(segment.src, dst))
+    })
+}
+
+pub(super) fn roundabout_merge_index(
+    turn: &crate::map::Turn,
+    ring: crate::map::RoundaboutGeometry,
+) -> usize {
+    let points = turn.points.as_slice();
+    (1..points.len())
+        .find(|&i| (points[i].xy().distance(ring.center.xy()) - ring.radius).abs() < 0.025)
+        .unwrap_or(points.len() - 1)
+}
+
+struct SweepCursor<I: Iterator<Item = Vec3>> {
+    points: std::iter::Peekable<I>,
+    position: Vec3,
+    direction: Vec3,
+}
+
+impl<I: Iterator<Item = Vec3>> SweepCursor<I> {
+    fn new(points: I, position: Vec3, direction: Vec3) -> Self {
+        Self {
+            points: points.peekable(),
+            position,
+            direction,
+        }
+    }
+
+    fn advance(&mut self, mut distance: f32, body: f32) -> Segment3 {
+        let rear = self.position - self.direction * body;
+        while let Some(&point) = self.points.peek() {
+            let offset = point - self.position;
+            let length = offset.mag();
+            if length > 0.0 {
+                self.direction = offset / length;
+            }
+            if length > distance {
+                self.position += self.direction * distance;
+                break;
+            }
+            self.position = point;
+            self.points.next();
+            distance -= length;
+        }
+        Segment3::new(rear, self.position + self.direction * body)
+    }
+}
+
+fn roundabout_apron_conflict(
+    entry: &crate::map::Turn,
+    other: &crate::map::Turn,
+    first: Sweep<'_>,
+    second: Sweep<'_>,
+    work: &mut usize,
+) -> bool {
+    const APRON_SECONDS: f32 = 0.25;
+    if *work == 0 {
+        return true;
+    }
+    *work -= 1;
+    let Some(direction) = entry.points.first_dir() else {
+        return true;
+    };
+    let Some(other_direction) = other.points.first_dir() else {
+        return true;
+    };
+    let position = entry.points.first() - direction * first.owner.half_extent;
+    let (other_position, other_direction) = second.footprint.map_or(
+        (
+            other.points.first() - other_direction * second.owner.half_extent,
+            other_direction,
+        ),
+        |body| {
+            (
+                body.middle(),
+                body.vec().try_normalize().unwrap_or(other_direction),
+            )
+        },
+    );
+    let entry_path = entry.points.as_slice();
+    let other_path = second
+        .remaining
+        .map_or(other.points.as_slice(), |(_, path)| path);
+    let other_points = (0..other_path.len()).map(|index| {
+        if second.remaining.is_some() {
+            other_path[other_path.len() - 1 - index]
+        } else {
+            other_path[index]
+        }
+    });
+    let mut entry_cursor = SweepCursor::new(entry_path.iter().copied(), position, direction);
+    let mut other_cursor = SweepCursor::new(other_points, other_position, other_direction);
+    let advance_speed = |speed: f32, extent: f32| {
+        let target = if extent > super::VehicleKind::Car.width() * 0.5 {
+            7.2
+        } else {
+            9.0
+        };
+        speed + (target - speed).clamp(-6.0 * APRON_SECONDS, 2.5 * APRON_SECONDS)
+    };
+    let first_body = first.owner.half_extent - VEHICLE_BODY_RADIUS;
+    let second_body = second.owner.half_extent - VEHICLE_BODY_RADIUS;
+    let clearance2 = (VEHICLE_BODY_RADIUS * 2.0 + GAP).powi(2);
+    if second.remaining.is_none() && first.crossing.from_lane() == second.crossing.from_lane() {
+        return true;
+    }
+    // The entry reservation covers the immediate movement across the
+    // zebra. The road controller arbitrates the later merge at the ring.
+    let speed = advance_speed(first.speed, first.owner.half_extent);
+    let other_speed = if second.footprint.is_none() {
+        advance_speed(second.speed, second.owner.half_extent)
+    } else {
+        second.speed
+    };
+    let first_segment = entry_cursor.advance(speed * APRON_SECONDS, first_body);
+    let second_segment = other_cursor.advance(other_speed * APRON_SECONDS, second_body);
+    segments_close(first_segment, second_segment, clearance2)
+}
+
+fn crosswalk_gap_conflicts(
+    map: &Map,
+    walker: Sweep<'_>,
+    vehicle: Sweep<'_>,
+    work: &mut usize,
+) -> bool {
+    let Some(intersection) = map.get(walker.crossing.turn.parent) else {
+        return true;
+    };
+    let Some((walk, drive)) = intersection
+        .raw_turn(walker.crossing.turn)
+        .zip(intersection.raw_turn(vehicle.crossing.turn))
+    else {
+        return true;
+    };
+    let clearance = walker.owner.half_extent + VEHICLE_BODY_RADIUS + GAP;
+    sweep_conflicts(
+        walk.points.segments(),
+        || {
+            prefix(
+                drive.points.segments(),
+                vehicle.owner.half_extent * 2.0 + GAP,
+            )
+        },
+        clearance.powi(2),
+        work,
+    )
+}
+
+fn crosswalk_launch(turn: &crate::map::Turn, crossing: Crossing) -> Segment3 {
+    const LAUNCH_DISTANCE: f32 = 2.0;
+    let (from, to) = if crossing.backwards {
+        (turn.points.last(), turn.points.first())
+    } else {
+        (turn.points.first(), turn.points.last())
+    };
+    Segment3::new(from, from + (to - from).cap_magnitude(LAUNCH_DISTANCE))
+}
+
+fn roundabout_conflicts(map: &Map, first: Sweep<'_>, second: Sweep<'_>, work: &mut usize) -> bool {
+    if *work == 0 {
+        return true;
+    }
+    *work -= 1;
+    if first.owner.owner == second.owner.owner {
+        return false;
+    }
+    let Some(intersection) = map.get(first.crossing.turn.parent) else {
+        return true;
+    };
+    let Some((a, b)) = intersection
+        .raw_turn(first.crossing.turn)
+        .zip(intersection.raw_turn(second.crossing.turn))
+    else {
+        return true;
+    };
+    let first_is_vehicle = matches!(first.owner.owner, EntryOwner::Vehicle(_));
+    let second_is_vehicle = matches!(second.owner.owner, EntryOwner::Vehicle(_));
+    match (first_is_vehicle, second_is_vehicle) {
+        (true, true) => {
+            if first.speed * DELTA > first.owner.half_extent {
+                return conflicts(map, first, second, work);
+            }
+            roundabout_apron_conflict(a, b, first, second, work)
+        }
+        (true, false) => {
+            let margin = GAP * (first.speed / 3.0).clamp(0.25, 1.0);
+            let reach = first.owner.half_extent * 2.0 + margin;
+            let clearance2 = (VEHICLE_BODY_RADIUS + second.owner.half_extent + margin).powi(2);
+            if let Some((position, path)) = second.remaining {
+                use super::VehicleKind;
+                let kind = if first.owner.half_extent == VehicleKind::Car.width() * 0.5 {
+                    VehicleKind::Car
+                } else if first.owner.half_extent == VehicleKind::Truck.width() * 0.5 {
+                    VehicleKind::Truck
+                } else {
+                    VehicleKind::Bus
+                };
+                let speed = first.speed;
+                let duration = 2.0 * reach
+                    / (speed + (speed * speed + 2.0 * kind.acceleration() * reach).sqrt());
+                return sweep_conflicts(
+                    prefix(a.points.segments(), reach),
+                    || {
+                        prefix(
+                            remaining_segments(position, path),
+                            (second.speed * duration).max(0.01),
+                        )
+                    },
+                    clearance2,
+                    work,
+                );
+            }
+            if second.waiting_at_curb {
+                return sweep_conflicts(
+                    prefix(a.points.segments(), reach),
+                    || std::iter::once(crosswalk_launch(b, second.crossing)),
+                    clearance2,
+                    work,
+                );
+            }
+            sweep_conflicts(
+                prefix(a.points.segments(), reach),
+                || b.points.segments(),
+                clearance2,
+                work,
+            )
+        }
+        (false, true) => {
+            let launch = crosswalk_launch(a, first.crossing);
+            let clearance2 = (first.owner.half_extent + VEHICLE_BODY_RADIUS + GAP).powi(2);
+            if let Some(footprint) = second.footprint {
+                if sweep_conflicts(
+                    std::iter::once(launch),
+                    || std::iter::once(footprint),
+                    clearance2,
+                    work,
+                ) {
+                    return true;
+                }
+            }
+            if let Some((position, path)) = second.remaining {
+                let reach = second.speed.powi(2) / 12.0 + second.owner.half_extent + GAP;
+                return sweep_conflicts(
+                    std::iter::once(launch),
+                    || prefix(remaining_segments(position, path), reach),
+                    clearance2,
+                    work,
+                );
+            }
+            let reach = second.owner.half_extent * 2.0 + GAP;
+            sweep_conflicts(
+                std::iter::once(launch),
+                || prefix(b.points.segments(), reach),
+                clearance2,
+                work,
+            )
+        }
+        (false, false) => false,
+    }
 }
 
 fn conflicts(map: &Map, first: Sweep<'_>, second: Sweep<'_>, work: &mut usize) -> bool {
