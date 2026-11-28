@@ -9,7 +9,7 @@ use crate::{
     STOCK_PRE_FIRE_REGISTRY,
 };
 
-fn pre_fire_snapshot(test: &TestCtx, replay: &str) -> SimulationDeser {
+pub(super) fn pre_fire_snapshot(test: &TestCtx, replay: &str) -> SimulationDeser {
     let mut snapshot: SimulationDeser =
         Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
     snapshot._header.version = PRE_FIRE_VERSION.to_owned();

@@ -528,17 +528,24 @@ fn pathpark_snapshot_rejects_vehicle_stage_without_matching_claim() {
 #[test]
 fn pathpark_stock_snapshot_imports_without_driveway_resource() {
     let ctx = TestCtx::new();
-    let mut res = ctx.g.snapshot_resources(true, usize::MAX).unwrap();
-    res.remove("driveway_traffic").unwrap();
+    let mut stock = super::p9_fire::pre_fire_snapshot(
+        &ctx,
+        r#"{"version":"0.13.1+commands.2","enabled":false,"commands":[]}"#,
+    );
+    stock._header.version = "0.13.1".into();
+    stock.res.remove("driveway_traffic").unwrap();
     let bytes = Bincode::encode(&crate::SimulationSer {
-        header: crate::SaveHeader {
-            version: crate::VERSION.to_owned(),
-        },
-        world: &ctx.g.world,
-        res,
+        header: stock._header,
+        world: &stock.world,
+        res: stock.res,
     })
     .unwrap();
-    let imported: Simulation = Bincode::decode(&bytes).unwrap();
+    let imported = Simulation::decode_snapshot(&bytes).unwrap();
     assert!(imported.read::<DrivewayTraffic>().is_empty());
-    assert_eq!(ctx.g.hashes(), imported.hashes());
+    assert!(imported.read::<crate::Replay>().migrated_city());
+    let mut expected = ctx.g.hashes();
+    let mut actual = imported.hashes();
+    expected.remove("replay");
+    actual.remove("replay");
+    assert_eq!(expected, actual);
 }
