@@ -24,7 +24,7 @@ use simulation::souls::{
     freight_station::train_stop, goods_company::company_soul, growth::check_growable_lot, human,
     lifecycle, residence::Residences,
 };
-use simulation::world_command::{CommandOutcomes, WorldCommand};
+use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
 use simulation::{
     CompanyID, GrowableSummary, MapPreset, SavePhase, Simulation, SimulationOptions, SlotId,
     SnapshotRevision, SoulID,
@@ -75,7 +75,8 @@ const ORIGIN: Vec2 = vec2(640.0, 640.0);
 const BLOCK: f32 = 120.0;
 const BOOTSTRAP_END: u64 = TICKS_PER_DAY;
 const COMMISSION_END: u64 = 5 * TICKS_PER_DAY;
-const STAFFED_TEARDOWN_SETUP_STEP: u64 = 672_004;
+const STAFFED_TEARDOWN_SETUP_STEP: u64 = 3 * TICKS_PER_DAY + 22 * TICKS_PER_HOUR + 4;
+const REHOUSING_LEAD_TICKS: u64 = 2;
 const OBSERVATION_DAYS: u64 = 2;
 const PERF_POPULATION: usize = 10_000;
 
@@ -725,17 +726,19 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 }
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
-    // Give property users time to drive out before the staffed frontage cut.
-    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 18 * TICKS_PER_HOUR)?;
-    let close = frontage_closures(&live.sim);
-    if !close.is_empty() {
-        prepare_draining_parking(live)?;
-        run_teardown_batch(live, &close, 1)?;
-    }
-    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
-    let close = frontage_closures(&live.sim);
-    if !close.is_empty() {
-        run_teardown_batch(live, &close, 1)?;
+    // Stage the cut from the core-paint checkpoint. Close incoming parking
+    // as properties grow so the drain does not start with a full district.
+    prepare_draining_parking(live)?;
+    let now = elapsed(&live.sim);
+    let next_growth = now + DEMAND_INTERVAL_TICKS - live.sim.get_tick() % DEMAND_INTERVAL_TICKS;
+    for step in std::iter::once(now).chain(
+        (next_growth..STAFFED_TEARDOWN_SETUP_STEP).step_by(DEMAND_INTERVAL_TICKS as usize),
+    ) {
+        advance_to(live, step)?;
+        let close = frontage_closures(&live.sim);
+        if !close.is_empty() {
+            run_teardown_batch(live, &close, 1)?;
+        }
     }
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
     let mut next_stage = elapsed(&live.sim);
@@ -798,7 +801,14 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                 roads.len(),
             ));
         }
-        if staged < 4 && now >= next_stage {
+        if live.sim.get_tick() % DEMAND_INTERVAL_TICKS == 0 {
+            let close = frontage_closures(&live.sim);
+            if !close.is_empty() {
+                run_teardown_batch(live, &close, 1)?;
+                continue;
+            }
+        }
+        if staged < 4 && now >= next_stage && removable_frontage_has_basket(&live.sim) {
             // A match can appear on the same tick as demolition or after the
             // replacement house submits its first applications.
             let changed = stage_teardown_hires(live)?;
@@ -859,14 +869,17 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     let mut resumed = ScenarioCtx::from_sim(loaded);
 
     let cuts: Vec<_> = roads.into_iter().map(WorldCommand::MapRemoveRoad).collect();
-    let before_growth = DEMAND_INTERVAL_TICKS - (live.sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS;
+    // The hourly residence update can settle orphans two ticks before growth.
+    let before_rehousing = DEMAND_INTERVAL_TICKS
+        - (live.sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS
+        - REHOUSING_LEAD_TICKS;
     for run in [&mut *live, &mut resumed] {
         run_teardown_batch(run, &cuts, 1)?;
-        run.run_ticks(before_growth - 1);
+        run.run_ticks(before_rehousing - 1);
     }
 
-    // Provide vacancies for every home on the cut roads before growth settles
-    // the disconnection. Ordinary homes can be processed before Mixed Use sites.
+    // Provide vacancies for every home on the cut roads. Ordinary homes can be
+    // processed before Mixed Use sites.
     let registry = prototypes::prototypes();
     let house = registry
         .legacy_residence(Low, 1)
@@ -895,8 +908,9 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                 .then_with(|| a.id.cmp(&b.id))
         });
         lots.into_iter()
-            .take(homes_needed)
             .map(|lot| WorldCommand::MapBuildHouse(lot.id))
+            .filter(|command| command.validate_and_price(&live.sim).is_ok())
+            .take(homes_needed)
             .collect::<Vec<_>>()
     };
     if replacement_homes.len() != homes_needed {
@@ -906,7 +920,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         ));
     }
     for run in [&mut *live, &mut resumed] {
-        run_teardown_batch(run, &replacement_homes, TICKS_PER_HOUR - before_growth)?;
+        run_teardown_batch(run, &replacement_homes, TICKS_PER_HOUR - before_rehousing)?;
         let map = run.sim.map();
         let infos = run.sim.read::<BuildingInfos>();
         let cargo = run.sim.read::<CargoBook>();
@@ -1005,6 +1019,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         }));
     }
     for run in [&mut *live, &mut resumed] {
+        clear_parking_at_reconnections(run, &repairs)?;
         run_teardown_batch(run, &repairs, 13 * TICKS_PER_HOUR)?;
         clear_decline_ruins(run, parcels.iter().map(|&(site, _, _)| site))?;
         let map = run.sim.map();
@@ -1052,6 +1067,50 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
 }
 
+fn clear_parking_at_reconnections(
+    ctx: &mut ScenarioCtx,
+    repairs: &[WorldCommand],
+) -> Result<(), String> {
+    let clearance = {
+        let map = ctx.sim.map();
+        let roads: BTreeSet<_> = repairs
+            .iter()
+            .filter_map(|command| match command {
+                WorldCommand::MapMakeConnection { from, to, .. }
+                    if command.validate_and_price(&ctx.sim) == Err(Rejection::BusyConflict) =>
+                {
+                    Some([from.kind, to.kind])
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|kind| match kind {
+                ProjectKind::Intersection(id) => map.get(id),
+                _ => None,
+            })
+            .flat_map(|joint| joint.roads.iter().copied())
+            .collect();
+        map.buildings()
+            .keys()
+            .filter(|&site| {
+                ctx.sim
+                    .building_parking(site)
+                    .is_some_and(|parking| roads.contains(&parking.entrance.road))
+            })
+            .map(|site| {
+                let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, site)
+                    .map_err(|error| format!("reconnection clearance for {site:?} failed: {error:?}"))?
+                    .quote;
+                Ok(WorldCommand::MapStartDemolition { site, quote })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    if !clearance.is_empty() {
+        run_teardown_batch(ctx, &clearance, 1)?;
+    }
+    Ok(())
+}
+
 fn clear_decline_ruins(
     ctx: &mut ScenarioCtx,
     sites: impl IntoIterator<Item = BuildingID>,
@@ -1077,11 +1136,18 @@ fn clear_decline_ruins(
 
 fn frontage_closures(sim: &Simulation) -> Vec<WorldCommand> {
     let map = sim.map();
+    let zones = sim.read::<ZoneGrid>();
     let frontage = map
         .buildings()
         .values()
         .filter(|building| building.is_mixed_use())
-        .filter_map(|building| building.connected_road);
+        .filter_map(|building| building.connected_road)
+        .chain(map.lots().values().filter_map(|lot| {
+            zones
+                .lot_zone(&lot.shape)
+                .is_some_and(|zone| zone.kind == MixedUse)
+                .then_some(lot.parent)
+        }));
     let adjacent = frontage_and_adjacent(&map, frontage);
     map.buildings()
         .keys()
@@ -1331,11 +1397,28 @@ fn run_teardown_batch(
 
 type StaffedFrontage = (BTreeSet<RoadID>, Vec<(BuildingID, CompanyID)>);
 
+fn removable_frontage_has_basket(sim: &Simulation) -> bool {
+    let map = sim.map();
+    sim.world().humans.values().any(|human| {
+        let Some(SoulID::GoodsCompany(seller)) = human.household.basket_seller() else {
+            return false;
+        };
+        let Some(company) = sim.world().companies.get(seller) else {
+            return false;
+        };
+        map.get(company.comp.building)
+            .filter(|site| site.is_mixed_use())
+            .and_then(|site| site.connected_road)
+            .is_some_and(|road| WorldCommand::MapRemoveRoad(road).validate_and_price(sim).is_ok())
+    })
+}
+
 fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String> {
     let step = elapsed(sim);
     let failure = |claim| format!("staffed teardown at step {step} is missing {claim}");
-    if (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS == 0 {
-        return Err(failure("a tick between growth passes"));
+    let next_phase = (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS;
+    if next_phase == 0 || next_phase >= DEMAND_INTERVAL_TICKS - REHOUSING_LEAD_TICKS {
+        return Err(failure("enough ticks before the next residence or growth pass"));
     }
     let job = ItemID::new("job-opening");
     let hires: BTreeSet<_> = sim
