@@ -1,4 +1,6 @@
-use crate::map::{Map, TrafficBehavior, Traversable, TraverseDirection, TraverseKind};
+use crate::map::{
+    Map, RoundaboutGeometry, TrafficBehavior, Traversable, TraverseDirection, TraverseKind,
+};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
 use crate::transportation::junction_admission::{self, segments_close, GAP, VEHICLE_BODY_RADIUS};
 use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
@@ -62,6 +64,7 @@ pub fn vehicle_hold_reason(
         &vehicle.trans,
         own_state,
         &vehicle.it,
+        RoundaboutArea::at(map, &vehicle.it, vehicle.trans.pos),
         neighbours,
         0.8,
     );
@@ -130,6 +133,7 @@ pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>>
             &vehicle.trans,
             state,
             &vehicle.it,
+            RoundaboutArea::at(&map, &vehicle.it, vehicle.trans.pos),
             neighbours,
             (0.8 + stop_dist).min(STOPPED_BLOCK_DISTANCE),
         );
@@ -235,23 +239,32 @@ fn roundabout_merge_limits(
     map: &Map,
     grid: &TransportGrid,
 ) -> BTreeMap<VehicleID, (f32, GridHandle)> {
-    if !map
+    let entering = map
         .configured_junctions()
-        .any(|junction| map.is_yield_roundabout(junction))
-    {
-        return BTreeMap::new();
-    }
+        .filter_map(|junction| {
+            if !map.is_yield_roundabout(junction) {
+                return None;
+            }
+            let intersection = map.get(junction)?;
+            Some((junction, intersection.pos.xy(), intersection.radius + 36.0))
+        })
+        .flat_map(|(junction, center, reach)| {
+            grid.query_around(center, reach)
+                .filter_map(move |(handle, _)| {
+                    let ColliderOwnerLookup::Owned(TraversalOwner::Vehicle(id)) =
+                        grid.collider_owner(world, handle)
+                    else {
+                        return None;
+                    };
+                    let vehicle = world.vehicles.get(id)?;
+                    let TraverseKind::Turn(turn) = vehicle.it.get_travers()?.kind else {
+                        return None;
+                    };
+                    (turn.parent == junction).then_some((id, vehicle, turn))
+                })
+        });
     let mut limits = BTreeMap::new();
-    for (id, vehicle) in world.vehicles.iter() {
-        let Some(step) = vehicle.it.get_travers() else {
-            continue;
-        };
-        let TraverseKind::Turn(turn) = step.kind else {
-            continue;
-        };
-        if !map.is_yield_roundabout(turn.parent) {
-            continue;
-        }
+    for (id, vehicle, turn) in entering {
         let half = vehicle.vehicle.kind.width() * 0.5;
         let braking = vehicle.speed.0.powi(2) / (2.0 * vehicle.vehicle.kind.deceleration());
         let staging_space = 2.0 * half + GAP;
@@ -460,19 +473,12 @@ fn vehicle_decision_traced<const OBSERVE: bool>(
     ) {
         let danger_length =
             (own_state.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
-        let roundabout_margin = if matches!(it.get_travers().map(|step| step.kind),
-            Some(TraverseKind::Turn(turn)) if map.is_yield_roundabout(turn.parent))
-        {
-            8.0
-        } else {
-            0.0
-        };
-        let neighbours = grid
-            .query_around(trans.pos.xy(), 12.0 + danger_length + roundabout_margin)
-            .map(|(handle, pos)| {
-                let state = grid.get(handle).expect("Handle not in transport grid").1;
-                (OBSERVE.then_some(handle), pos, state)
-            });
+        let neighbours =
+            grid.query_around(trans.pos.xy(), 12.0 + danger_length)
+                .map(|(handle, pos)| {
+                    let state = grid.get(handle).expect("Handle not in transport grid").1;
+                    (OBSERVE.then_some(handle), pos, state)
+                });
         calc_decision_traced(id, vehicle, map, time, trans, own_state, it, neighbours)
     } else {
         ((0.0, Vec3::ZERO), None)
@@ -710,7 +716,8 @@ fn calc_decision_traced<'a>(
         vehicle.state = VehicleState::Driving;
         vehicle.flag = 0;
     }
-    let roundabout = on_roundabout_arm(map, it, trans.pos, trans.pos);
+    let area = RoundaboutArea::at(map, it, trans.pos);
+    let roundabout = area.contains(trans.pos);
     let stopped_gap = if roundabout {
         GAP
     } else {
@@ -723,6 +730,7 @@ fn calc_decision_traced<'a>(
         trans,
         self_obj,
         it,
+        area,
         neighs,
         stopping_threshold.min(stopped_gap),
     );
@@ -823,28 +831,78 @@ fn calc_decision_traced<'a>(
     )
 }
 
-// Classify the encounter using the pedestrian's end of the arm. A driver's
-// braking distance can reach the ordinary junction on a short outbound lane.
-fn on_roundabout_arm(map: &Map, it: &Itinerary, position: Vec3, pedestrian: Vec3) -> bool {
-    const ARM_REACH: f32 = 24.0;
-    if !map.needs_junction_entry_checks() {
-        return false;
+const ROUNDABOUT_ARM_REACH: f32 = 24.0;
+
+#[derive(Clone, Copy)]
+enum RoundaboutArea {
+    Ordinary,
+    Ring(RoundaboutGeometry),
+    Arm {
+        start: Vec3,
+        end: Vec3,
+        near_start: bool,
+        near_end: bool,
+    },
+}
+
+impl RoundaboutArea {
+    fn at(map: &Map, itinerary: &Itinerary, position: Vec3) -> Self {
+        let Some(step) = itinerary.get_travers() else {
+            return Self::Ordinary;
+        };
+        if !map.needs_junction_entry_checks() {
+            return Self::Ordinary;
+        }
+        match step.kind {
+            TraverseKind::Turn(turn) if map.is_yield_roundabout(turn.parent) => map
+                .get(turn.parent)
+                .and_then(|junction| junction.roundabout_geometry())
+                .map_or(Self::Ordinary, Self::Ring),
+            TraverseKind::Lane(id) => {
+                let Some(lane) = map.get(id) else {
+                    return Self::Ordinary;
+                };
+                let start = lane.points.first();
+                let end = lane.points.last();
+                let near_start = start.is_close(position, ROUNDABOUT_ARM_REACH)
+                    && map.is_yield_roundabout(lane.src);
+                let near_end = end.is_close(position, ROUNDABOUT_ARM_REACH)
+                    && map.is_yield_roundabout(lane.dst);
+                if near_start || near_end {
+                    Self::Arm {
+                        start,
+                        end,
+                        near_start,
+                        near_end,
+                    }
+                } else {
+                    Self::Ordinary
+                }
+            }
+            _ => Self::Ordinary,
+        }
     }
-    match it.get_travers().map(|step| step.kind) {
-        Some(TraverseKind::Turn(turn)) => map.is_yield_roundabout(turn.parent),
-        Some(TraverseKind::Lane(id)) => map.get(id).is_some_and(|lane| {
-            let (mouth, junction) = if pedestrian.distance2(lane.points.first())
-                < pedestrian.distance2(lane.points.last())
-            {
-                (lane.points.first(), lane.src)
-            } else {
-                (lane.points.last(), lane.dst)
-            };
-            map.is_yield_roundabout(junction)
-                && mouth.is_close(position, ARM_REACH)
-                && mouth.is_close(pedestrian, ARM_REACH)
-        }),
-        None => false,
+
+    // The encounter can be at the far end of a short outbound lane.
+    fn contains(self, position: Vec3) -> bool {
+        match self {
+            Self::Ordinary => false,
+            Self::Ring(_) => true,
+            Self::Arm {
+                start,
+                end,
+                near_start,
+                near_end,
+            } => {
+                let from_start = position.distance2(start);
+                let from_end = position.distance2(end);
+                if from_start < from_end {
+                    near_start && from_start < ROUNDABOUT_ARM_REACH.powi(2)
+                } else {
+                    near_end && from_end < ROUNDABOUT_ARM_REACH.powi(2)
+                }
+            }
+        }
     }
 }
 
@@ -868,16 +926,16 @@ impl RingEntry {
         };
         let intersection = map.get(id.parent)?;
         let ring = intersection.roundabout_geometry()?;
+        let keep_clear = ring.radius + 4.6;
+        let nose = trans.pos + trans.dir * bumper;
+        if nose.xy().distance(ring.center.xy()) < keep_clear - 0.03 {
+            return None;
+        }
         let turn = intersection.raw_turn(id)?;
         let merge = turn.points.as_slice()[junction_admission::roundabout_merge_index(turn, ring)];
         let path = it.local_path();
         // The arc join disappears from the itinerary once the driver has merged.
         if !path.contains(&merge) {
-            return None;
-        }
-        let keep_clear = ring.radius + 4.6;
-        let nose = trans.pos + trans.dir * bumper;
-        if nose.xy().distance(ring.center.xy()) < keep_clear - 0.03 {
             return None;
         }
         let mut distance = 0.0;
@@ -967,6 +1025,15 @@ fn braking_path_conflicts(
 ) -> bool {
     const DECK_TOLERANCE: f32 = 0.65;
     const MAX_LOOKAHEAD_POINTS: usize = 256;
+    let mut reach = braking_distance + bumper + GAP;
+    let obstacle_xy = obstacle.flatten();
+    let origin = trans.pos.xy();
+    if !obstacle_xy
+        .project(origin)
+        .is_close(origin, reach.max(bumper) + clearance + 0.01)
+    {
+        return false;
+    }
     let overlaps = |from: Vec3, to: Vec3| {
         let height = obstacle.src.z;
         from.z.min(to.z) <= height + DECK_TOLERANCE
@@ -992,7 +1059,6 @@ fn braking_path_conflicts(
         })
     });
     let mut from = trans.pos;
-    let mut reach = braking_distance + bumper + GAP;
     for (i, to) in it
         .local_path()
         .iter()
@@ -1026,6 +1092,24 @@ fn calc_front_dist<'a>(
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
+    area: RoundaboutArea,
+    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
+    cutoff: f32,
+) -> (f32, u64, QueueHoldReason) {
+    if matches!(area, RoundaboutArea::Ordinary) {
+        calc_front_dist_in_area::<false>(vehicle, map, trans, self_obj, it, area, neighs, cutoff)
+    } else {
+        calc_front_dist_in_area::<true>(vehicle, map, trans, self_obj, it, area, neighs, cutoff)
+    }
+}
+
+fn calc_front_dist_in_area<'a, const ROUNDABOUT: bool>(
+    vehicle: &Vehicle,
+    map: &Map,
+    trans: &Transform,
+    self_obj: &TransportState,
+    it: &Itinerary,
+    area: RoundaboutArea,
     neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
     cutoff: f32,
 ) -> (f32, u64, QueueHoldReason) {
@@ -1047,22 +1131,12 @@ fn calc_front_dist<'a>(
     let on_lane = it.get_travers().map_or(false, |t| t.kind.is_lane());
     let mut flag = 0;
     let mut blocker = QueueHoldReason::Unknown;
-    let configured = map.needs_junction_entry_checks();
-    let ring = configured
-        .then(|| {
-            let TraverseKind::Turn(turn) = it.get_travers()?.kind else {
-                return None;
-            };
-            map.get(turn.parent)?.roundabout_geometry()
-        })
-        .flatten();
+    let ring = match area {
+        RoundaboutArea::Ring(ring) if ROUNDABOUT => Some(ring),
+        _ => None,
+    };
     let circulating = ring.is_some();
-    let on_arm = configured
-        && matches!(it.get_travers().map(|step| step.kind),
-        Some(TraverseKind::Lane(id)) if map.get(id).is_some_and(|lane| {
-            (map.is_yield_roundabout(lane.src) && position.is_close(lane.points.first(), 24.0))
-                || (map.is_yield_roundabout(lane.dst) && position.is_close(lane.points.last(), 24.0))
-        }));
+    let on_arm = ROUNDABOUT && matches!(area, RoundaboutArea::Arm { .. });
     let braking_distance = speed.powi(2) / (2.0 * vehicle.kind.deceleration());
     let bumper = my_radius - VEHICLE_BODY_RADIUS;
     // Collision avoidance
@@ -1093,7 +1167,7 @@ fn calc_front_dist<'a>(
         let cos_direction_angle = nei_physics_obj.dir.dot(dir2);
 
         let pedestrian = his_pos.z(nei_physics_obj.height);
-        let local_arm = on_arm && on_roundabout_arm(map, it, position, pedestrian);
+        let local_arm = on_arm && area.contains(pedestrian);
         let lateral_limit = if local_arm && is_vehicle {
             2.0 * VEHICLE_BODY_RADIUS + GAP
         } else {
@@ -1102,9 +1176,9 @@ fn calc_front_dist<'a>(
         let in_front_cone = cos_angle > 0.85 - 0.015 * speed.min(10.0)
             && (!is_vehicle || cos_direction_angle > 0.0)
             && (!on_lane || dist_to_side < lateral_limit);
-        let front_distance = if nei_physics_obj.group == TransportationGroup::Pedestrians
-            && configured
-            && on_roundabout_arm(map, it, position, pedestrian)
+        let front_distance = if ROUNDABOUT
+            && nei_physics_obj.group == TransportationGroup::Pedestrians
+            && (circulating || local_arm)
         {
             let time = speed / vehicle.kind.deceleration() + 0.25;
             let swept = Segment3::new(
